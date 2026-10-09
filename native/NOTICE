@@ -1,0 +1,14 @@
+ht_trellis.cpp is an unchanged copy of
+../../halogen-v2-abliteration/ht_trellis.cpp from this repository.
+SHA-256: f26bd639825009dad7ab29ef5cffa3f56c619ba5ac415a8941347c8ccbc5cd67
+License: Apache-2.0; the complete source license accompanies this file.
+
+It implements the existing CPU cyclic trellis beam/Viterbi encoder through
+ht_encode_bits and ht_search_fixed_bits. The Rust caller uses the existing
+C ABI, with no dependency on an installed Python module or shared object.
+
+The Rust storage layouts and golden test vectors follow jtsylve/hgn-spec
+1.1.0 at commit 79e75fd4ae7642478823525b0a3212951f584af5:
+https://github.com/jtsylve/hgn-spec/tree/79e75fd4ae7642478823525b0a3212951f584af5
+The codec defines its own uncalibrated deterministic quantization policy;
+it does not reproduce peonist's unpublished encoder recipe.
