@@ -101,10 +101,12 @@ BIN=deployments/frame/bf16-to-hgn/target/release/bf16-to-hgn
 ```
 
 `build.rs` compiles `native/ht_trellis.cpp` with C++17, `-O3`, OpenMP and
-`-ffp-contract=off`, without `-march=native`. The native encoder is an exact
-vendored copy of the existing proven trellis implementation; its notices
-and license are under `native/`. The conversion manifest records an
-aggregate SHA-256 of the compiled tool's source files, lockfile and helper.
+`-ffp-contract=off`, without `-march=native`. The vendored encoder has local
+byte-preserving optimizations: runtime-dispatched AVX2 transition expansion
+and a guarded packed cost/state comparator. Portable arithmetic/comparison
+fallbacks remain. Notices and the original source attribution are under
+`native/`. The conversion manifest records an aggregate SHA-256 of the
+compiled tool's source files, lockfile and helper.
 
 ## Commands
 
@@ -330,6 +332,80 @@ Conversion reserves an additional 5% plus 64 MiB of free disk space; copied
 assets need their small additional space. No full-model HT43 timing or
 throughput measurement is available.
 
+## Encoder performance and byte fidelity
+
+The optimized paths retain the same beam, scales, codebooks, divisions,
+floating-point operation order and strict tie rules. HT transition expansion
+uses runtime AVX2 without FMA; candidate selection keeps `nth_element` and
+its original ordering through an exact packed comparator. I4R/Q6/Q8 use
+bounded binary32 bias rounding instead of general round-to-even calls.
+This is not a precision/profile change. NF4 and FP8 algorithms are unchanged;
+a slower NF4 lookup rewrite was measured and rejected.
+
+`examples/encoder_bench.rs` emits JSONL with input fingerprints, complete
+output/metadata/rotation/padding fingerprints, and per-sample timings.
+Timing includes public encoding, validation, codec allocations and rotation,
+but excludes input loading, sign/row-RMS preparation, hashing and destruction.
+It caps input bands and retained outputs, reads only selected HF BF16 bands,
+and checks equality across iterations, samples and worker counts.
+
+```sh
+CARGO_BUILD_JOBS=1 cargo build --release --locked --example encoder_bench
+BENCH=target/release/examples/encoder_bench
+$BENCH --suite corpus --threads 1,2
+$BENCH --cases ht4,ht3,ht4-pair,ht3-pair --cols 256 \
+  --threads 1,2 --iterations 1 --repetitions 3 --warmup 1
+$BENCH --cases i4r,nf4,q6g64,q8g64,fp8g128 --cols 2560 \
+  --threads 1 --iterations 32 --repetitions 3 --warmup 1
+
+# One real expert: gate rows 0..128, up rows 640..768.
+$BENCH --hf /path/to/hf-bf16 \
+  --tensor model.language_model.layers.0.mlp.experts.gate_up_proj \
+  --up-tensor model.language_model.layers.0.mlp.experts.gate_up_proj \
+  --up-row-start 640 --cases ht4,ht3,ht4-pair,ht3-pair \
+  --threads 2 --iterations 1 --repetitions 2 --warmup 0
+```
+
+For A/B comparisons, build the **same harness source** against both revisions
+with identical compiler/options, use fixed physical cores with idle SMT
+siblings, and alternate baseline/candidate/candidate/baseline. Compare all
+input and output fingerprints before interpreting medians and ranges.
+The harness itself does not compare separate processes/revisions.
+
+Measured against `a0157bf` on Frame's Ryzen AI MAX+ 395, Rust 1.98.1,
+GCC 16.2.1, normal release flags, CPUs 10/11, beam 128:
+
+| Case | Baseline median ms (range) | Optimized median ms (range) | Throughput ratio |
+| --- | ---: | ---: | ---: |
+| Real Blackfrost HT4 | 6790 (5948–7682) | 4529 (3936–4928) | 1.50× |
+| Real Blackfrost HT3 | 3800 (3399–5286) | 2802 (2625–3561) | 1.36× |
+| Real Blackfrost HT4 gate/up | 12773 (11439–13919) | 9333 (8676–9695) | 1.37× |
+| Real Blackfrost HT3 gate/up | 7121 (6728–7708) | 5728 (5098–6448) | 1.24× |
+| Synthetic I4R | 15.681 (13.378–17.842) | 6.754 (5.994–7.653) | 2.32× |
+| Synthetic Q6G64 | 2.426 (2.340–2.782) | 2.320 (2.040–2.636) | 1.05× |
+| Synthetic Q8G64 | 2.053 (1.935–3.983) | 1.820 (1.696–2.420) | 1.13× |
+
+Real bands are 128×2560 per projection, two HT workers, four samples per
+revision, from Blackfrost revision `3e30d25ddb0e802389d62e55e9ff31ad05f0c96e`.
+Synthetic quantizers use 128×2560, one worker, six samples per revision,
+32 calls/sample. All measured output fingerprints matched. Independent native
+checks also matched 216 baseline/AVX2/forced-scalar cases across HT3/4,
+beams 0/1/8/64/128/256, one/two workers, repeated ties and subnormals.
+The scalar override tests arithmetic, not the packed comparator's fallback.
+The final rebuilt candidate matched all 238 baseline corpus samples across
+nine codec cases. The integrated suite passed 124 tests (one optional stock
+probe ignored), and all four tiny conversion/publication/verifier executables
+passed after the optimizations.
+
+This was a **shared, non-idle host**, not an isolated performance lab.
+Earlier samples suffered severe contention; even unchanged NF4/FP8 controls
+varied, and the small Q6/Q8 differences overlap noise. Do not extrapolate
+these encoding-only results into whole-model throughput or an ETA.
+Baseline profiling attributed about 66% of HT4 cycles to candidate selection
+and 26% of I4R cycles to general rounding; selection, rotation, input decoding
+and output I/O remain costs. Full-model conversion/inference was not run,
+and no active conversion or serving process was replaced.
+
 ## Bounded structural checks
 
 The public CLI has no fixture mode or architecture bypass. Library examples
@@ -366,10 +442,15 @@ The HGN/GGUF metadata smokes used structurally compatible config/assets;
 they do not endorse checkpoint provenance or quality.
 
 These checks do **not** include full-model HT43 conversion, GPU/engine
-loading, full-model inference, inference-quality comparisons or performance
-benchmarks. A running full v2 conversion is not evidence for HT43 qualification.
+loading, full-model inference, inference-quality comparisons or full-model
+throughput. A running full v2 conversion is not evidence for HT43 qualification.
 
 ## Changes
+
+- Added byte-preserving AVX2 HT transitions, exact packed candidate ordering
+  and bounded I4R/Q6/Q8 rounding, with scalar/portable fallbacks.
+- Added bounded encoder benchmarks, complete byte fingerprints and numerical
+  boundary coverage; measured gains and shared-host limitations are above.
 
 - Added bounded native HGN and GGUF inputs with explicit auxiliary weights
   and matching assets; HF BF16 input and default v2 quantization remain.

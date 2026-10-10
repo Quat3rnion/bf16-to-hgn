@@ -465,6 +465,15 @@ fn unrotate_in_place(values: &mut [f32], rows: usize, cols: usize, meta: &QuantM
     }
 }
 
+// Callers clamp to integral code bounds inside [-8, 255]. Adding this exact
+// bias puts every value in the f32 binade with unit spacing, so the addition
+// performs RNE; conversion and bias removal are then exact integer operations.
+// Clamping before rounding is equivalent here because both bounds are integers.
+#[inline]
+fn round_small_code(value: f32, lower: f32, upper: f32) -> i32 {
+    (value.clamp(lower, upper) + 12_582_912.0) as i32 - 12_582_912
+}
+
 fn encode_q4(input: &[f32], rows: usize, cols: usize, cb: &[f32; 16]) -> Result<EncodedBlock> {
     validate_codebook(cb)?;
     let stride = pad((cols / 16) as u64, 16)? as usize;
@@ -530,7 +539,7 @@ fn encode_affine(input: &[f32], rows: usize, cols: usize, bits: u32) -> Result<E
                 let code = if sf == 0.0 {
                     0
                 } else {
-                    ((value - bf) / sf).round_ties_even().clamp(0.0, max_code) as u8
+                    round_small_code((value - bf) / sf, 0.0, max_code) as u8
                 };
                 let k = 64 * g + i;
                 if bits == 8 {
@@ -571,7 +580,7 @@ fn encode_i4r_rotated(input: &[f32]) -> Result<EncodedBlock> {
             let mut candidate = [0u8; 128];
             let mut error = 0.0f64;
             for (i, &value) in group.iter().enumerate() {
-                let code = (value / divisor).round_ties_even().clamp(-8.0, 7.0) as i32;
+                let code = round_small_code(value / divisor, -8.0, 7.0);
                 candidate[i] = (code + 8) as u8;
                 let delta = code as f64 * sf as f64 - value as f64;
                 error += delta * delta;
@@ -1200,6 +1209,138 @@ mod tests {
         }
         assert!(encode_rows(Encoding::I64, &[16_777_216.0], 1, 1, &QuantMeta::default()).is_err());
         assert!(encode_rows(Encoding::F16, &[70_000.0], 1, 1, &QuantMeta::default()).is_err());
+    }
+
+    fn f32_neighbors(value: f32) -> [f32; 3] {
+        let bits = value.to_bits();
+        let (below, above) = if value == 0.0 {
+            (0x80000001, 1)
+        } else if value > 0.0 {
+            (bits - 1, bits + 1)
+        } else {
+            (bits + 1, bits - 1)
+        };
+        [f32::from_bits(below), value, f32::from_bits(above)]
+    }
+
+    #[test]
+    fn q4_partition_preserves_all_midpoint_ties_and_neighbors() {
+        let codebooks = [
+            NF4_CODEBOOK,
+            std::array::from_fn(|i| i as f32 - 8.0),
+            std::array::from_fn(|i| (i as f32 - 8.0) * f32::from_bits(1)),
+            // Adjacent entries produce repeated, rounded midpoints.
+            std::array::from_fn(|i| f32::from_bits(0x3f800000 + i as u32)),
+            std::array::from_fn(|i| f32::from_bits(0x7f7ffff0 + i as u32)),
+            std::array::from_fn(|i| f32::from_bits(0xff7fffff - i as u32)),
+        ];
+        for cb in codebooks {
+            let mids: [f32; 15] =
+                std::array::from_fn(|i| (cb[i] as f64 * 0.5 + cb[i + 1] as f64 * 0.5) as f32);
+            for value in mids
+                .iter()
+                .flat_map(|&mid| f32_neighbors(mid))
+                .chain(cb)
+                .chain([
+                    f32::NEG_INFINITY,
+                    -f32::MAX,
+                    -f32::from_bits(1),
+                    -0.0,
+                    0.0,
+                    f32::from_bits(1),
+                    f32::MAX,
+                    f32::INFINITY,
+                ])
+            {
+                // Check the encoder's strict partition against a linear lower
+                // bound, including ties at repeated, rounded midpoints.
+                let expected = mids.iter().filter(|&&mid| mid < value).count();
+                assert_eq!(
+                    mids.partition_point(|mid| *mid < value),
+                    expected,
+                    "value bits {:08x}, codebook {cb:?}",
+                    value.to_bits()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn small_code_rounding_matches_rne_at_every_boundary() {
+        for (lower, upper) in [(-8.0, 7.0), (0.0, 63.0), (0.0, 255.0)] {
+            let check = |value: f32| {
+                assert_eq!(
+                    round_small_code(value, lower, upper),
+                    value.round_ties_even().clamp(lower, upper) as i32,
+                    "value bits {:08x}, bounds [{lower}, {upper}]",
+                    value.to_bits()
+                );
+            };
+            for code in lower as i32 - 1..=upper as i32 + 1 {
+                for value in f32_neighbors(code as f32)
+                    .into_iter()
+                    .chain(f32_neighbors(code as f32 + 0.5))
+                {
+                    check(value);
+                }
+            }
+            for value in [
+                f32::NEG_INFINITY,
+                -f32::MAX,
+                -f32::MIN_POSITIVE,
+                -f32::from_bits(1),
+                -0.0,
+                0.0,
+                f32::from_bits(1),
+                f32::MIN_POSITIVE,
+                f32::MAX,
+                f32::INFINITY,
+            ] {
+                check(value);
+            }
+            let mut bits = 0x9e3779b9u32;
+            for _ in 0..65_536 {
+                bits ^= bits << 13;
+                bits ^= bits >> 17;
+                bits ^= bits << 5;
+                let value = f32::from_bits(bits);
+                if !value.is_nan() {
+                    check(value);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn affine_halfway_neighbors_preserve_metadata_and_planes() {
+        for (encoding, max_code) in [(Encoding::Q6G64, 63), (Encoding::Q8G64, 255)] {
+            let mut input = Vec::new();
+            let mut expected = Vec::new();
+            for code in 0..max_code {
+                for value in f32_neighbors(code as f32 + 0.5) {
+                    // Endpoints fix the stored half scale/bias at exactly 1/0.
+                    input.extend_from_slice(&[0.0, max_code as f32]);
+                    input.extend([value; 62]);
+                    expected.extend_from_slice(&[0.0, max_code as f32]);
+                    expected.extend([value.round_ties_even(); 62]);
+                }
+            }
+            let rows = input.len() / 64;
+            let meta = QuantMeta::default();
+            let encoded = encode_rows(encoding, &input, rows, 64, &meta).unwrap();
+            assert!(encoded.scales.is_empty());
+            let record = if encoding == Encoding::Q8G64 { 64 } else { 48 };
+            for row in encoded.codes.chunks_exact(encoded.codes.len() / rows) {
+                assert_eq!(&row[record..record + 4], &[0x00, 0x3c, 0x00, 0x00]);
+                assert!(row[record + 4..].iter().all(|&byte| byte == 0));
+            }
+            // At scale 1/bias 0 the decoded integer uniquely identifies every
+            // packed code, including all six-bit high planes.
+            assert_eq!(
+                decode_rows(encoding, &encoded, rows, 64, &meta).unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]
