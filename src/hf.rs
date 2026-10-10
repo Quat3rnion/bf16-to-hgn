@@ -46,10 +46,11 @@ impl Dtype {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TensorInfo {
     pub name: String,
+    /// A format-defined dependency label; never an absolute physical source path.
     pub shard: String,
     pub dtype: Dtype,
     pub shape: Vec<u64>,
-    /// Absolute byte offset in the shard, including its prefix and JSON header.
+    /// Physical shard byte offset for HF; a source-defined logical offset for imports.
     pub offset: u64,
     pub size: u64,
 }
@@ -332,6 +333,121 @@ impl Snapshot {
         ensure_file_unchanged(&file, &path, signature)?;
         self.check_root()
     }
+}
+
+impl crate::source::TensorSource for Snapshot {
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn tensors(&self) -> &BTreeMap<String, TensorInfo> {
+        &self.tensors
+    }
+
+    fn config(&self) -> &Value {
+        &self.config
+    }
+
+    fn kind(&self) -> crate::source::SourceKind {
+        crate::source::SourceKind::Hf
+    }
+
+    fn asset_path(&self, name: &str) -> Result<PathBuf> {
+        ensure!(
+            safe_filename(name) && (crate::source::ASSET_NAMES.contains(&name) || name == INDEX),
+            "unrecognized or unsafe source asset: {name}"
+        );
+        self.check_root()?;
+        Ok(self.root.join(name))
+    }
+
+    fn read_bytes(&self, name: &str, byte_offset: u64, len: usize) -> Result<Vec<u8>> {
+        Snapshot::read_bytes(self, name, byte_offset, len)
+    }
+
+    fn read_f32(&self, name: &str, element_offset: u64, len: usize) -> Result<Vec<f32>> {
+        Snapshot::read_f32(self, name, element_offset, len)
+    }
+
+    fn hash_tensor(&self, name: &str) -> Result<String> {
+        Snapshot::hash_tensor(self, name)
+    }
+
+    fn check_unchanged(&self) -> Result<()> {
+        Snapshot::check_unchanged(self)
+    }
+
+    fn provenance(&self) -> Result<Value> {
+        self.check_unchanged()?;
+        let mut shard_header_ends = BTreeMap::<&str, u64>::new();
+        for tensor in self.tensors.values() {
+            shard_header_ends
+                .entry(tensor.shard.as_str())
+                .and_modify(|end| *end = (*end).min(tensor.offset))
+                .or_insert(tensor.offset);
+        }
+        let largest_file = self
+            .signatures
+            .values()
+            .map(|signature| signature.len)
+            .max()
+            .unwrap_or(0);
+        let mut buffer = vec![0u8; usize::try_from(largest_file.min(WINDOW_BYTES as u64))?];
+        let mut dependencies = Vec::new();
+        for (relative, signature) in &self.signatures {
+            let name = relative.to_str().context("non-UTF-8 source dependency")?;
+            if is_safetensors(relative) {
+                let header_end = *shard_header_ends
+                    .get(name)
+                    .context("source shard has no tensors")?;
+                dependencies.push(serde_json::json!({
+                    "file": name,
+                    "size": signature.len,
+                    "header_bytes": header_end,
+                    "header_sha256": hash_checked_prefix(&self.root.join(relative), signature, header_end, &mut buffer)?,
+                    "payload_hashes": "manifest.sources raw tensor byte streams"
+                }));
+            } else if name == INDEX || crate::source::ASSET_NAMES.contains(&name) {
+                dependencies.push(serde_json::json!({
+                    "file": name,
+                    "size": signature.len,
+                    "sha256": hash_checked_prefix(&self.root.join(relative), signature, signature.len, &mut buffer)?
+                }));
+            }
+        }
+        self.check_unchanged()?;
+        Ok(serde_json::json!({
+            "format": "huggingface-safetensors",
+            "tensor_hash_domain": "raw little-endian tensor dtype bytes",
+            "dependencies": dependencies
+        }))
+    }
+
+    fn input_paths(&self) -> Vec<PathBuf> {
+        vec![self.root.clone()]
+    }
+}
+
+fn hash_checked_prefix(
+    path: &Path,
+    signature: &FileSignature,
+    len: u64,
+    buffer: &mut [u8],
+) -> Result<String> {
+    ensure!(len <= signature.len, "dependency hash range exceeds file");
+    let mut file = open_checked(path, signature)?;
+    let mut hash = Sha256::new();
+    let mut remaining = len;
+    while remaining != 0 {
+        let take = usize::try_from(remaining.min(buffer.len() as u64))?;
+        file.read_exact(&mut buffer[..take])
+            .with_context(|| format!("hashing source dependency {}", path.display()))?;
+        hash.update(&buffer[..take]);
+        remaining -= take as u64;
+        ensure_file_unchanged(&file, path, signature)?;
+    }
+    ensure_file_unchanged(&file, path, signature)?;
+    Ok(format!("{:x}", hash.finalize()))
 }
 
 fn safe_filename(name: &str) -> bool {

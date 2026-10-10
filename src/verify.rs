@@ -2,9 +2,11 @@ use crate::{
     codec::{self, EncodedBlock, Encoding, PayloadLayout, QuantMeta},
     container::{self, Entry, Layout, Reader},
     conversion,
-    hf::{self, Dtype, Snapshot, TensorInfo},
+    hf::{self, Dtype, TensorInfo},
     manifest::{AssetRecord, ErrorTotals, Manifest, Options, SourceRecord, VerifyReport},
-    numel, rows_cols, ConversionPlan, Origin, TensorPlan, POLICY, SPEC_COMMIT, SPEC_VERSION,
+    numel, rows_cols,
+    source::{SourceKind, TensorSource},
+    ConversionPlan, Origin, TensorPlan, SPEC_COMMIT, SPEC_VERSION,
 };
 use anyhow::{bail, ensure, Context, Result};
 use serde::Deserialize;
@@ -21,7 +23,11 @@ const RAW_CHUNK: usize = 8 * 1024 * 1024;
 
 /// Verify every source byte and every output payload without retaining matrices.
 /// Error totals describe the decoded result; they are not a quality threshold.
-pub fn verify(snapshot: &Snapshot, plan: &ConversionPlan, output: &Path) -> Result<VerifyReport> {
+pub fn verify(
+    snapshot: &dyn TensorSource,
+    plan: &ConversionPlan,
+    output: &Path,
+) -> Result<VerifyReport> {
     snapshot.check_unchanged()?;
     let expected_sources = conversion::validate_plan(snapshot, plan)?;
     for tensor in plan.files.iter().flat_map(|file| &file.tensors) {
@@ -38,9 +44,16 @@ pub fn verify(snapshot: &Snapshot, plan: &ConversionPlan, output: &Path) -> Resu
         "manifest container set mismatch"
     );
 
-    let (_, config_hash) = conversion::hash_file(&snapshot.root.join("config.json"))?;
-    let (_, index_hash) =
-        conversion::hash_file(&snapshot.root.join("model.safetensors.index.json"))?;
+    ensure!(
+        manifest.source_kind == snapshot.kind(),
+        "manifest source format mismatch"
+    );
+    let (_, config_hash) = conversion::hash_file(&snapshot.asset_path("config.json")?)?;
+    let index_hash = if snapshot.kind() == SourceKind::Hf {
+        Some(conversion::hash_file(&snapshot.asset_path("model.safetensors.index.json")?)?.1)
+    } else {
+        None
+    };
     ensure!(
         config_hash == manifest.config_sha256,
         "source config SHA-256 mismatch"
@@ -146,6 +159,10 @@ pub fn verify(snapshot: &Snapshot, plan: &ConversionPlan, output: &Path) -> Resu
         }
     }
     report.source_tensors = payloads.sources.finish()?;
+    ensure!(
+        snapshot.provenance()? == manifest.source_provenance,
+        "source physical provenance mismatch"
+    );
     snapshot.check_unchanged()?;
     Ok(report)
 }
@@ -159,7 +176,7 @@ fn read_manifest(path: &Path, plan: &ConversionPlan) -> Result<Manifest> {
         serde_json::to_value(&manifest)? == json,
         "unknown or noncanonical manifest fields"
     );
-    ensure!(manifest.schema == 1, "unsupported manifest schema");
+    ensure!(manifest.schema == 2, "unsupported manifest schema");
     ensure!(manifest.tool == "bf16-to-hgn", "unexpected manifest tool");
     ensure!(
         manifest.tool_version == env!("CARGO_PKG_VERSION"),
@@ -170,14 +187,20 @@ fn read_manifest(path: &Path, plan: &ConversionPlan) -> Result<Manifest> {
         "manifest specification mismatch"
     );
     ensure!(
-        manifest.policy == POLICY,
+        manifest.policy == manifest.options.profile.policy(),
         "manifest quantization policy mismatch"
     );
     // The encoder digest records provenance, not authorization. An unchanged
     // format/policy remains verifiable after rebuilding the converter.
     check_sha256(&manifest.encoder_sha256)?;
     check_sha256(&manifest.config_sha256)?;
-    check_sha256(&manifest.index_sha256)?;
+    if let Some(hash) = &manifest.index_sha256 {
+        check_sha256(hash)?;
+    }
+    ensure!(
+        manifest.index_sha256.is_some() == (manifest.source_kind == SourceKind::Hf),
+        "source index provenance does not match source format"
+    );
     manifest.options.validate()?;
     ensure!(
         &manifest.plan == plan,
@@ -319,7 +342,7 @@ fn check_inventory(
 }
 
 fn verify_assets(
-    snapshot: &Snapshot,
+    snapshot: &dyn TensorSource,
     output: &Path,
     destinations: &[(String, String)],
     records: &[AssetRecord],
@@ -350,7 +373,7 @@ fn verify_assets(
         let source_digest = match source_hashes.entry(source.as_str()) {
             std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(conversion::hash_file(&snapshot.root.join(source))?)
+                entry.insert(conversion::hash_file(&snapshot.asset_path(source)?)?)
             }
         };
         ensure!(
@@ -373,7 +396,7 @@ struct SourceCoverage<'a> {
 
 impl<'a> SourceCoverage<'a> {
     fn new(
-        snapshot: &Snapshot,
+        snapshot: &dyn TensorSource,
         expected: &BTreeSet<String>,
         records: &'a [SourceRecord],
     ) -> Result<Self> {
@@ -390,7 +413,7 @@ impl<'a> SourceCoverage<'a> {
                 "unexpected manifest source tensor: {name}"
             );
             let actual = snapshot
-                .tensors
+                .tensors()
                 .get(name)
                 .context("manifest source absent from snapshot")?;
             ensure!(
@@ -449,7 +472,7 @@ impl<'a> SourceCoverage<'a> {
 }
 
 struct PayloadVerifier<'a> {
-    snapshot: &'a Snapshot,
+    snapshot: &'a dyn TensorSource,
     options: &'a Options,
     rotations: BTreeMap<String, Vec<f32>>,
     sources: SourceCoverage<'a>,
@@ -470,13 +493,10 @@ impl PayloadVerifier<'_> {
             Origin::Tensor { name } => {
                 let info = self
                     .snapshot
-                    .tensors
+                    .tensors()
                     .get(name)
                     .context("missing planned source")?;
-                let totals = if matches!(
-                    tensor.encoding,
-                    Encoding::Bf16 | Encoding::F32 | Encoding::I64
-                ) {
+                let totals = if conversion::direct_copy(tensor.encoding, info.dtype) {
                     self.verify_direct(reader, index, info)?
                 } else {
                     self.verify_matrix(reader, index, tensor, info)?
@@ -558,9 +578,17 @@ impl PayloadVerifier<'_> {
         tensor: &TensorPlan,
         info: &TensorInfo,
     ) -> Result<ErrorTotals> {
+        if tensor.encoding.ht_bits().is_some()
+            && tensor.shape.len() == 3
+            && tensor.name.ends_with(".gate_up_proj.weight")
+        {
+            return self.verify_gate_up(reader, index, tensor, info);
+        }
         let (rows, cols) = rows_cols(&tensor.shape)?;
         let layout = codec::payload_layout(tensor.encoding, rows, cols)?;
-        check_quant_metadata(reader, index, tensor.encoding, rows, cols, &layout)?;
+        if tensor.encoding != Encoding::Bf16 {
+            check_quant_metadata(reader, index, tensor.encoding, rows, cols, &layout)?;
+        }
         let mut hash = Sha256::new();
         let mut consumed = 0u64;
         let mut totals = ErrorTotals::default();
@@ -581,7 +609,7 @@ impl PayloadVerifier<'_> {
                 .checked_add(raw.len() as u64)
                 .context("source coverage overflow")?;
             let block = read_block(reader, index, tensor.encoding, &layout, row, take, cols)?;
-            let (su, sv) = conversion::rotation_slice(tensor, &self.rotations, row, take)?;
+            let (su, sv) = verification_rotation_slice(tensor, &self.rotations, row, take)?;
             let meta = QuantMeta {
                 su,
                 sv,
@@ -589,9 +617,86 @@ impl PayloadVerifier<'_> {
                 ht_beam: self.options.ht_beam,
                 ..QuantMeta::default()
             };
-            let decoded = codec::decode_rows(tensor.encoding, &block, take, cols, &meta)?;
+            let decoded = if let Some(bits) = tensor.encoding.ht_bits() {
+                decode_ht_independent(&block.codes, bits, cols, None, su, sv)?
+            } else {
+                codec::decode_rows(tensor.encoding, &block, take, cols, &meta)?
+            };
+            if tensor.encoding == Encoding::Bf16 {
+                for (&value, bytes) in source.iter().zip(block.codes.chunks_exact(2)) {
+                    ensure!(
+                        bytes == half::bf16::from_f32(value).to_le_bytes(),
+                        "BF16 output differs from rounded canonical source"
+                    );
+                }
+            }
             accumulate_errors(&mut totals, &source, &decoded)?;
             row += take;
+        }
+        self.sources.record(info, hash, consumed)?;
+        Ok(totals)
+    }
+
+    fn verify_gate_up(
+        &mut self,
+        reader: &mut Reader,
+        index: usize,
+        tensor: &TensorPlan,
+        info: &TensorInfo,
+    ) -> Result<ErrorTotals> {
+        let bits = tensor
+            .encoding
+            .ht_bits()
+            .context("paired experts require HT")?;
+        let [experts, expert_rows, cols]: [u64; 3] = tensor.shape.as_slice().try_into()?;
+        let (experts, expert_rows, cols) = (
+            usize::try_from(experts)?,
+            usize::try_from(expert_rows)?,
+            usize::try_from(cols)?,
+        );
+        ensure!(expert_rows % 256 == 0, "invalid paired expert rows");
+        let projection_rows = expert_rows / 2;
+        let paired_bytes = 256usize
+            .checked_mul(cols)
+            .and_then(|n| n.checked_mul(bits))
+            .context("paired verification size overflow")?
+            / 8;
+        let buffer_bytes = projection_rows
+            .checked_mul(cols)
+            .and_then(|n| n.checked_mul(info.dtype.byte_width() as usize))
+            .context("expert source buffer overflow")?;
+        let mut pending_up = Vec::with_capacity(buffer_bytes);
+        let mut totals = ErrorTotals::default();
+        let mut hash = Sha256::new();
+        let mut consumed = 0u64;
+        for expert in 0..experts {
+            pending_up.clear();
+            for band in 0..projection_rows / 128 {
+                let offset = (expert * (projection_rows / 128) + band) as u64 * paired_bytes as u64;
+                let bytes = reader.read_at(index, offset, paired_bytes)?;
+                for is_up in [false, true] {
+                    let row =
+                        expert * expert_rows + band * 128 + if is_up { projection_rows } else { 0 };
+                    let (raw, source) = conversion::read_source_values(
+                        self.snapshot,
+                        info,
+                        (row * cols) as u64,
+                        128 * cols,
+                    )?;
+                    if is_up {
+                        pending_up.extend_from_slice(&raw);
+                    } else {
+                        hash.update(&raw);
+                    }
+                    consumed = consumed
+                        .checked_add(raw.len() as u64)
+                        .context("source coverage overflow")?;
+                    let (su, sv) = verification_rotation_slice(tensor, &self.rotations, row, 128)?;
+                    let decoded = decode_ht_independent(&bytes, bits, cols, Some(is_up), su, sv)?;
+                    accumulate_errors(&mut totals, &source, &decoded)?;
+                }
+            }
+            hash.update(&pending_up);
         }
         self.sources.record(info, hash, consumed)?;
         Ok(totals)
@@ -619,7 +724,7 @@ impl PayloadVerifier<'_> {
         for name in shards {
             let info = self
                 .snapshot
-                .tensors
+                .tensors()
                 .get(name)
                 .context("missing n-gram source")?;
             let (shard_rows, shard_cols) = rows_cols(&info.shape)?;
@@ -678,6 +783,147 @@ impl PayloadVerifier<'_> {
         );
         Ok(totals)
     }
+}
+
+// Deliberately separate from the encoder's rotation slicing: a per-expert down
+// input vector and a full per-expert output vector must not silently restart.
+fn verification_rotation_slice<'a>(
+    tensor: &TensorPlan,
+    vectors: &'a BTreeMap<String, Vec<f32>>,
+    row: usize,
+    take: usize,
+) -> Result<(&'a [f32], &'a [f32])> {
+    let Some(rotation) = &tensor.rotation else {
+        return Ok((&[], &[]));
+    };
+    let (rows, cols) = rows_cols(&tensor.shape)?;
+    let end = row.checked_add(take).context("verification row overflow")?;
+    ensure!(take > 0 && end <= rows, "verification band exceeds matrix");
+    let expert_rows = if tensor.shape.len() == 3 {
+        usize::try_from(tensor.shape[1])?
+    } else {
+        rows
+    };
+    ensure!(
+        row / expert_rows == (end - 1) / expert_rows,
+        "verification band crosses expert"
+    );
+    let input = vectors
+        .get(&rotation.su)
+        .context("missing verification input vector")?;
+    let output = vectors
+        .get(&rotation.sv)
+        .context("missing verification output vector")?;
+    let input_first = if tensor.shape.len() == 3
+        && tensor.encoding.ht_bits().is_some()
+        && tensor.name.ends_with(".down_proj.weight")
+    {
+        row / expert_rows * cols
+    } else {
+        0
+    };
+    let output_first = if tensor.encoding == Encoding::I4r {
+        row % expert_rows
+    } else {
+        row
+    };
+    Ok((
+        input
+            .get(input_first..input_first + cols)
+            .context("short verification input vector")?,
+        output
+            .get(output_first..output_first + take)
+            .context("short verification output vector")?,
+    ))
+}
+
+static VERIFICATION_HT_CODEBOOK: std::sync::LazyLock<Vec<f32>> = std::sync::LazyLock::new(|| {
+    (0..=u16::MAX)
+        .map(|state| {
+            let mixed = u32::from(state).wrapping_mul(0x83dcd12d);
+            let sum = (mixed & 255) + ((mixed >> 8) & 255) + ((mixed >> 16) & 255) + (mixed >> 24);
+            let exact = (1774i64 * i64::from(sum) - 905216) as f64 / 262144.0;
+            half::f16::from_f64(exact).to_f32()
+        })
+        .collect()
+});
+
+/// Independent output oracle: addresses each (row,column) directly, extracts
+/// its circular 16-bit state from a two-word window, and performs an FP64
+/// inverse transform. It does not reuse the codec's tile mapping or decoder.
+fn decode_ht_independent(
+    bytes: &[u8],
+    bits: usize,
+    cols: usize,
+    paired: Option<bool>,
+    su: &[f32],
+    sv: &[f32],
+) -> Result<Vec<f32>> {
+    ensure!(bits == 3 || bits == 4, "invalid HT verifier width");
+    ensure!(
+        cols > 0 && cols % 128 == 0 && su.len() == cols && sv.len() == 128,
+        "invalid HT verifier geometry"
+    );
+    let row_tiles = if paired.is_some() { 16 } else { 8 };
+    let tile_bytes = 32 * bits;
+    let expected = (cols / 16)
+        .checked_mul(row_tiles)
+        .and_then(|n| n.checked_mul(tile_bytes))
+        .context("HT verifier payload overflow")?;
+    ensure!(bytes.len() == expected, "invalid HT verifier band size");
+    ensure!(
+        su.iter().chain(sv).all(|v| v.is_finite()),
+        "nonfinite HT verifier rotation"
+    );
+    let mut stored = vec![0.0f64; 128 * cols];
+    for row in 0..128 {
+        for col in 0..cols {
+            let tile = col / 16 * row_tiles + row / 16 + if paired == Some(true) { 8 } else { 0 };
+            let value = (col % 16 / 8) * 128 + row % 16 * 8 + col % 8;
+            let start = (bits * (value + 1) + 256 * bits - 16) % (256 * bits);
+            let word = start / 32;
+            let next = (word + 1) % (8 * bits);
+            let base = tile * tile_bytes;
+            let first = u32::from_le_bytes(bytes[base + 4 * word..base + 4 * word + 4].try_into()?);
+            let second =
+                u32::from_le_bytes(bytes[base + 4 * next..base + 4 * next + 4].try_into()?);
+            let state =
+                (((u64::from(first) << 32) | u64::from(second)) >> (48 - start % 32)) as u16;
+            stored[row * cols + col] = f64::from(VERIFICATION_HT_CODEBOOK[state as usize]);
+        }
+    }
+    // Sylvester H * M * H, normalized once by 128. Alternate axis passes
+    // rather than the codec's block-local transform to retain an independent
+    // implementation while keeping O(N K log 128) work and one band of scratch.
+    for axis in [0, 1] {
+        for step in [1, 2, 4, 8, 16, 32, 64] {
+            for row in 0..128 {
+                for col in 0..cols {
+                    let coordinate = if axis == 0 { col } else { row };
+                    if coordinate & step == 0 {
+                        let a = row * cols + col;
+                        let b = a + if axis == 0 { step } else { step * cols };
+                        let first = stored[a];
+                        let second = stored[b];
+                        stored[a] = first + second;
+                        stored[b] = first - second;
+                    }
+                }
+            }
+        }
+    }
+    let values: Vec<f32> = stored
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            (value / 128.0 * f64::from(sv[index / cols]) * f64::from(su[index % cols])) as f32
+        })
+        .collect();
+    ensure!(
+        values.iter().all(|v| v.is_finite()),
+        "nonfinite HT verifier value"
+    );
+    Ok(values)
 }
 
 fn check_ngram_order(shards: &[String]) -> Result<()> {
@@ -768,7 +1014,7 @@ fn check_quant_metadata(
             );
             Ok(scale)
         }
-        Encoding::Q8G64 | Encoding::Q6G64 | Encoding::Ht | Encoding::I4r => Ok(1.0),
+        Encoding::Q8G64 | Encoding::Q6G64 | Encoding::Ht | Encoding::Ht3 | Encoding::I4r => Ok(1.0),
         _ => bail!("not a quantized matrix encoding"),
     }
 }
@@ -820,6 +1066,18 @@ fn read_block(
                 .context("scale size overflow")?,
         ),
         Encoding::Ht => (first / 2, count / 2, 0, 0),
+        Encoding::Ht3 => (
+            first.checked_mul(3).context("HT3 offset overflow")? / 8,
+            count.checked_mul(3).context("HT3 size overflow")? / 8,
+            0,
+            0,
+        ),
+        Encoding::Bf16 => (
+            first.checked_mul(2).context("BF16 offset overflow")?,
+            count.checked_mul(2).context("BF16 size overflow")?,
+            0,
+            0,
+        ),
         Encoding::Fp8G128 => (first, count, 0, 0),
         Encoding::Q8G64 | Encoding::Q6G64 => {
             let stride = codec::payload_layout(encoding, 1, cols)?.len;
@@ -899,6 +1157,7 @@ fn accumulate_exact(totals: &mut ErrorTotals, raw: &[u8], dtype: Dtype) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hf::Snapshot;
     use crate::ContainerPlan;
     use serde_json::{json, Value};
     use std::{
@@ -1310,4 +1569,55 @@ mod tests {
         .unwrap();
         assert_rejected(&fixture, "manifest container layout mismatch");
     }
+}
+
+#[cfg(test)]
+#[path = "ht43_verify_tests.rs"]
+mod ht43_tests;
+
+// Internal bridge for the combined paired-stream regression. Its canonical
+// 2-D byte sink deliberately does not relax the public reader's fixed expert
+// shapes; production dispatch, source coverage and independent decoding run
+// unchanged against the logical expert tensor.
+#[cfg(test)]
+pub(crate) fn verify_tensor_fixture(
+    snapshot: &dyn TensorSource,
+    tensor: &TensorPlan,
+    reader: &mut Reader,
+    options: &Options,
+    rotations: BTreeMap<String, Vec<f32>>,
+    source_hash: String,
+) -> Result<ErrorTotals> {
+    let Origin::Tensor { name } = &tensor.origin else {
+        bail!("fixture must consume one source tensor");
+    };
+    let records = [SourceRecord {
+        tensor: snapshot
+            .tensors()
+            .get(name)
+            .context("missing fixture source")?
+            .clone(),
+        sha256: source_hash,
+    }];
+    let expected = BTreeSet::from([name.clone()]);
+    let sources = SourceCoverage::new(snapshot, &expected, &records)?;
+    let mut verifier = PayloadVerifier {
+        snapshot,
+        options,
+        rotations,
+        sources,
+    };
+    let totals = verifier
+        .verify_tensor(reader, 0, tensor)?
+        .context("missing fixture error totals")?;
+    ensure!(
+        verifier.sources.finish()? == 1,
+        "fixture source coverage mismatch"
+    );
+    let fingerprint = reader.fingerprint(0)?;
+    ensure!(
+        fingerprint.xor32 == reader.layout.entries[0].checksum,
+        "fixture payload checksum mismatch"
+    );
+    Ok(totals)
 }

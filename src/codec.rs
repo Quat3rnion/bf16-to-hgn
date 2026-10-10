@@ -1,4 +1,4 @@
-//! Bounded codecs for the native Flash-Next v2 storage profile.
+//! Bounded codecs for the native Flash-Next v2 and HT43 storage profiles.
 //!
 //! Layouts and golden vectors: jtsylve/hgn-spec 1.1.0, commit
 //! 79e75fd4ae7642478823525b0a3212951f584af5 (STORAGE.md, TEST-VECTORS.md).
@@ -25,6 +25,7 @@ pub enum Encoding {
     Q6G64,
     Fp8G128,
     Ht,
+    Ht3,
     I4r,
 }
 
@@ -38,7 +39,7 @@ impl Encoding {
             Self::Q4Cp => 5,
             Self::Q8G64 => 7,
             Self::Fp8G128 => 10,
-            Self::Ht => 16,
+            Self::Ht | Self::Ht3 => 16,
             Self::I4r => 23,
             Self::Q6G64 => 24,
         }
@@ -49,8 +50,17 @@ impl Encoding {
             Self::Q4Cp => 2,
             Self::Q6G64 => 64,
             Self::Ht => 0x1208,
+            Self::Ht3 => 0x1206,
             Self::I4r => 128,
             _ => 0,
+        }
+    }
+
+    pub fn ht_bits(self) -> Option<usize> {
+        match self {
+            Self::Ht => Some(4),
+            Self::Ht3 => Some(3),
+            _ => None,
         }
     }
 }
@@ -177,7 +187,7 @@ pub fn payload_layout(encoding: Encoding, rows: usize, cols: usize) -> Result<Pa
             layout.scales_offset = pad(values, 64)?;
             add(layout.scales_offset, 4)?
         }
-        Encoding::Ht | Encoding::I4r => {
+        Encoding::Ht | Encoding::Ht3 | Encoding::I4r => {
             ensure!(
                 rows % 128 == 0 && cols % 128 == 0,
                 "rotated matrices require rows and columns divisible by 128"
@@ -187,7 +197,7 @@ pub fn payload_layout(encoding: Encoding, rows: usize, cols: usize) -> Result<Pa
                 layout.scale_row_stride = k / 64;
                 add(values / 2, values / 64)?
             } else {
-                values / 2
+                mul(values, encoding.ht_bits().expect("HT width") as u64)? / 8
             }
         }
     };
@@ -305,6 +315,21 @@ fn validate_rotation(rows: usize, cols: usize, meta: &QuantMeta<'_>, i4r: bool) 
             "I4R output vector must contain only +/-1"
         );
     }
+    Ok(())
+}
+
+fn validate_decode_rotation(rows: usize, cols: usize, meta: &QuantMeta<'_>) -> Result<()> {
+    ensure!(
+        rows % 128 == 0 && cols % 128 == 0 && meta.su.len() == cols && meta.sv.len() == rows,
+        "rotation vector dimensions do not match band"
+    );
+    ensure!(
+        meta.su
+            .iter()
+            .chain(meta.sv)
+            .all(|&value| { value.is_finite() && f16::from_f32(value).to_f32() == value }),
+        "rotation vectors must contain finite, exactly representable f16 values"
+    );
     Ok(())
 }
 
@@ -615,16 +640,31 @@ unsafe extern "C" {
         beam: c_int,
         bits: c_int,
     ) -> c_int;
+    #[cfg(test)]
+    fn ht_search_fixed_bits(
+        values: *const f32,
+        codebook: *const f32,
+        count: c_int,
+        boundary: c_int,
+        codes: *mut u8,
+        bits: c_int,
+    ) -> f32;
 }
 
-fn pack_ht4_symbols(symbols: &[u8]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(symbols.len() / 2);
-    for group in symbols.chunks_exact(8) {
-        let word = group
-            .iter()
-            .fold(0u32, |word, &symbol| (word << 4) | u32::from(symbol));
-        bytes.extend_from_slice(&word.to_le_bytes());
+fn pack_ht_symbols(symbols: &[u8], bits: usize) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(symbols.len() / 8 * bits);
+    let mut word = 0u64;
+    let mut filled = 0;
+    for &symbol in symbols {
+        word = (word << bits) | u64::from(symbol);
+        filled += bits;
+        if filled >= 32 {
+            filled -= 32;
+            bytes.extend_from_slice(&((word >> filled) as u32).to_le_bytes());
+            word &= (1u64 << filled) - 1;
+        }
     }
+    debug_assert_eq!(filled, 0);
     bytes
 }
 
@@ -663,15 +703,16 @@ fn ht_band_value_count(rows: usize, cols: usize, paired: bool) -> Result<usize> 
     Ok(count)
 }
 
-fn encode_ht_tiles(tiles: &[f32], meta: &QuantMeta<'_>) -> Result<Vec<u8>> {
+fn encode_ht_tiles(tiles: &[f32], meta: &QuantMeta<'_>, bits: usize) -> Result<Vec<u8>> {
     let count = native_ht_tile_count(tiles.len())?;
+    ensure!(bits == 3 || bits == 4, "unsupported HT code width");
     ensure!(
         tiles.iter().all(|x| x.is_finite() && x.abs() <= 1.0e17),
         "HT values exceed finite cost range"
     );
     ensure!(
         meta.ht_beam <= 4096,
-        "HT4 beam must be in 0..=4096 (0 is full-state search)"
+        "HT beam must be in 0..=4096 (0 is full-state search)"
     );
     ensure!(meta.threads > 0, "HT thread count must be positive");
     let threads = c_int::try_from(meta.threads).context("HT thread count exceeds C ABI range")?;
@@ -687,11 +728,17 @@ fn encode_ht_tiles(tiles: &[f32], meta: &QuantMeta<'_>) -> Result<Vec<u8>> {
             count,
             threads,
             meta.ht_beam as c_int,
-            4,
+            bits as c_int,
         )
     };
     ensure!(result == 0, "native HT trellis encoder rejected parameters");
-    Ok(pack_ht4_symbols(&symbols))
+    ensure!(
+        symbols
+            .iter()
+            .all(|&symbol| usize::from(symbol) < 1 << bits),
+        "native HT encoder returned an invalid symbol"
+    );
+    Ok(pack_ht_symbols(&symbols, bits))
 }
 
 /// Encode a bounded block from ORIGINAL (not already rotated) source values.
@@ -705,7 +752,7 @@ pub fn encode_rows(
     cols: usize,
     meta: &QuantMeta<'_>,
 ) -> Result<EncodedBlock> {
-    if encoding == Encoding::Ht {
+    if encoding.ht_bits().is_some() {
         ht_band_value_count(rows, cols, false)?;
     }
     let count = element_count(input, rows, cols)?;
@@ -749,14 +796,14 @@ pub fn encode_rows(
                 scales: Vec::new(),
             })
         }
-        Encoding::Ht | Encoding::I4r => {
+        Encoding::Ht | Encoding::Ht3 | Encoding::I4r => {
             ensure!(
                 rows == 128,
                 "HT/I4R encoding consumes one 128-row band at a time"
             );
             validate_rotation(rows, cols, meta, encoding == Encoding::I4r)?;
             let mut rotated = vec![0.0; count];
-            let order = if encoding == Encoding::Ht {
+            let order = if encoding.ht_bits().is_some() {
                 RotationOrder::Tiles {
                     row_tiles: 8,
                     row_tile_offset: 0,
@@ -765,9 +812,9 @@ pub fn encode_rows(
                 RotationOrder::Rows
             };
             rotate_into(input, rows, cols, meta, order, &mut rotated)?;
-            if encoding == Encoding::Ht {
+            if let Some(bits) = encoding.ht_bits() {
                 Ok(EncodedBlock {
-                    codes: encode_ht_tiles(&rotated, meta)?,
+                    codes: encode_ht_tiles(&rotated, meta, bits)?,
                     scales: Vec::new(),
                 })
             } else {
@@ -786,18 +833,20 @@ pub fn encode_i64(values: &[i64]) -> Vec<u8> {
     bytes
 }
 
-/// HT4 expert gate/up requires paired bands: gate rows [128p,128p+128),
+/// HT expert gate/up requires paired bands: gate rows [128p,128p+128),
 /// up rows [640+128p,768+128p). Append the five returned pairs for one expert,
 /// then concatenate experts. Within each column tile, 8 gate tiles precede
 /// 8 up tiles; neither concatenating complete projections nor row interleaving
 /// is the on-disk layout. Down experts use ordinary encode_rows bands.
 pub fn encode_ht_gate_up_bands(
+    encoding: Encoding,
     gate: &[f32],
     up: &[f32],
     cols: usize,
     gate_meta: &QuantMeta<'_>,
     up_meta: &QuantMeta<'_>,
 ) -> Result<Vec<u8>> {
+    let bits = encoding.ht_bits().context("gate/up bands require HT")?;
     let paired_count = ht_band_value_count(128, cols, true)?;
     element_count(gate, 128, cols)?;
     element_count(up, 128, cols)?;
@@ -834,32 +883,35 @@ pub fn encode_ht_gate_up_bands(
         },
         &mut tiles,
     )?;
-    encode_ht_tiles(&tiles, gate_meta)
+    encode_ht_tiles(&tiles, gate_meta, bits)
 }
 
 fn read_half(bytes: &[u8]) -> f32 {
     f16::from_le_bytes([bytes[0], bytes[1]]).to_f32()
 }
 
-fn decode_ht_tile(bytes: &[u8], out: &mut [f32; 256]) {
-    let mut symbols = [0u8; 256];
-    for (w, bytes) in bytes.chunks_exact(4).enumerate() {
-        let word = u32::from_le_bytes(bytes.try_into().expect("four-byte word"));
-        for i in 0..8 {
-            symbols[8 * w + i] = ((word >> (28 - 4 * i)) & 15) as u8;
-        }
-    }
-    let mut state =
-        (u16::from(symbols[253]) << 8) | (u16::from(symbols[254]) << 4) | u16::from(symbols[255]);
+fn decode_ht_tile(bytes: &[u8], bits: usize, out: &mut [f32; 256]) {
+    let words = bytes.len() / 4;
     let codebook = ht_codebook();
-    for (i, &symbol) in symbols.iter().enumerate() {
-        state = (state << 4) | u16::from(symbol);
-        out[i] = codebook[usize::from(state)];
+    for (i, value) in out.iter_mut().enumerate() {
+        let end = bits * (i + 1) - 1;
+        let w = end / 32;
+        let bit = end % 32;
+        let word = u32::from_le_bytes(bytes[4 * w..4 * w + 4].try_into().unwrap());
+        let mut state = word >> (31 - bit);
+        if bit < 15 {
+            let previous = (w + words - 1) % words;
+            let previous =
+                u32::from_le_bytes(bytes[4 * previous..4 * previous + 4].try_into().unwrap());
+            state |= previous << (bit + 1);
+        }
+        *value = codebook[(state & 0xffff) as usize];
     }
 }
 
 fn decode_ht_rotated(
     bytes: &[u8],
+    bits: usize,
     rows: usize,
     cols: usize,
     row_tiles: usize,
@@ -871,7 +923,12 @@ fn decode_ht_rotated(
         for col_tile in 0..cols / 16 {
             for row_tile in 0..8 {
                 let t = (band * (cols / 16) + col_tile) * row_tiles + row_tile + offset;
-                decode_ht_tile(&bytes[t * 128..(t + 1) * 128], &mut tile);
+                let tile_bytes = 32 * bits;
+                decode_ht_tile(
+                    &bytes[t * tile_bytes..(t + 1) * tile_bytes],
+                    bits,
+                    &mut tile,
+                );
                 for (i, &value) in tile.iter().enumerate() {
                     let row = band * 128 + row_tile * 16 + (i / 8) % 16;
                     let col = col_tile * 16 + 8 * (i / 128) + i % 8;
@@ -881,6 +938,31 @@ fn decode_ht_rotated(
         }
     }
     values
+}
+
+/// Decode one projection of a complete paired gate/up 128-row band. The bytes
+/// contain 8 gate tiles then 8 up tiles for each column tile, not two matrices.
+pub fn decode_ht_gate_up_band(
+    encoding: Encoding,
+    bytes: &[u8],
+    cols: usize,
+    up: bool,
+    meta: &QuantMeta<'_>,
+) -> Result<Vec<f32>> {
+    let bits = encoding.ht_bits().context("gate/up bands require HT")?;
+    let expected = payload_layout(encoding, 256, cols)?.len;
+    ensure!(
+        bytes.len() as u64 == expected,
+        "paired HT band size mismatch"
+    );
+    validate_decode_rotation(128, cols, meta)?;
+    let mut values = decode_ht_rotated(bytes, bits, 128, cols, 16, if up { 8 } else { 0 });
+    unrotate_in_place(&mut values, 128, cols, meta);
+    ensure!(
+        values.iter().all(|v| v.is_finite()),
+        "decoded HT band is nonfinite"
+    );
+    Ok(values)
 }
 
 /// Decode the SAME separated block representation returned by encode_rows,
@@ -912,12 +994,12 @@ pub fn decode_rows(
     if encoding == Encoding::I64 {
         bail!("I64 cannot be decoded losslessly to f32; compare source integer bytes");
     }
-    if encoding == Encoding::Ht || encoding == Encoding::I4r {
+    if encoding.ht_bits().is_some() || encoding == Encoding::I4r {
         ensure!(
             rows == 128,
             "HT/I4R decoding consumes one 128-row band at a time"
         );
-        validate_rotation(rows, cols, meta, encoding == Encoding::I4r)?;
+        validate_decode_rotation(rows, cols, meta)?;
     }
     if encoding == Encoding::Q4Cp {
         ensure!(
@@ -931,9 +1013,9 @@ pub fn decode_rows(
             "fp8g needs a positive finite global scale"
         );
     }
-    let mut values = match encoding {
-        Encoding::Ht => decode_ht_rotated(&block.codes, rows, cols, 8, 0),
-        _ => vec![0.0; count],
+    let mut values = match encoding.ht_bits() {
+        Some(bits) => decode_ht_rotated(&block.codes, bits, rows, cols, 8, 0),
+        None => vec![0.0; count],
     };
     match encoding {
         Encoding::Bf16 | Encoding::F16 => {
@@ -1013,10 +1095,10 @@ pub fn decode_rows(
                 *value = fp8_decode(code) * meta.fp8_scale;
             }
         }
-        Encoding::Ht => {}
+        Encoding::Ht | Encoding::Ht3 => {}
         Encoding::I64 => unreachable!(),
     }
-    if encoding == Encoding::Ht || encoding == Encoding::I4r {
+    if encoding.ht_bits().is_some() || encoding == Encoding::I4r {
         unrotate_in_place(&mut values, rows, cols, meta);
     }
     ensure!(
@@ -1333,7 +1415,7 @@ mod tests {
         let bytes = spec_words(32);
         assert_eq!(&bytes[..16], &hex("b979379e72f36e3c2b6da6dae4e6dd78"));
         let mut tile = [0.0; 256];
-        decode_ht_tile(&bytes, &mut tile);
+        decode_ht_tile(&bytes, 4, &mut tile);
         let decoded_bits: Vec<u8> = tile
             .iter()
             .flat_map(|&v| f16::from_f32(v).to_le_bytes())
@@ -1345,7 +1427,7 @@ mod tests {
         assert_eq!(tile[0], 1.48046875);
         assert_eq!(tile[128], -1.341796875);
         let symbols: Vec<u8> = (0..256).map(|i| (i % 16) as u8).collect();
-        assert_eq!(&pack_ht4_symbols(&symbols)[..8], &hex("67452301efcdab89"));
+        assert_eq!(&pack_ht_symbols(&symbols, 4)[..8], &hex("67452301efcdab89"));
     }
 
     #[test]
@@ -1486,12 +1568,12 @@ mod tests {
             }
         }
         let bytes = spec_words(128 * cols / 4);
-        let gate_decoded = decode_ht_rotated(&bytes, 128, cols, 16, 0);
-        let up_decoded = decode_ht_rotated(&bytes, 128, cols, 16, 8);
+        let gate_decoded = decode_ht_rotated(&bytes, 4, 128, cols, 16, 0);
+        let up_decoded = decode_ht_rotated(&bytes, 4, 128, cols, 16, 8);
         let mut first_gate = [0.0; 256];
         let mut first_up = [0.0; 256];
-        decode_ht_tile(&bytes[..128], &mut first_gate);
-        decode_ht_tile(&bytes[1024..1152], &mut first_up);
+        decode_ht_tile(&bytes[..128], 4, &mut first_gate);
+        decode_ht_tile(&bytes[1024..1152], 4, &mut first_up);
         assert_eq!(gate_decoded[0], first_gate[0]);
         assert_eq!(up_decoded[0], first_up[0]);
         assert_eq!(gate_decoded[8], first_gate[128]);
@@ -1523,6 +1605,7 @@ mod tests {
             .to_string();
         assert!(error.contains("signed-int element offset"));
         let error = encode_ht_gate_up_bands(
+            Encoding::Ht,
             &[],
             &[],
             1 << 23,
@@ -1550,7 +1633,7 @@ mod tests {
         let gate_block = encode_rows(Encoding::Ht, &gate, 128, 128, &meta).unwrap();
         let up_block = encode_rows(Encoding::Ht, &up, 128, 128, &meta).unwrap();
         assert_ne!(gate_block.codes, up_block.codes);
-        let paired = encode_ht_gate_up_bands(&gate, &up, 128, &meta, &meta).unwrap();
+        let paired = encode_ht_gate_up_bands(Encoding::Ht, &gate, &up, 128, &meta, &meta).unwrap();
         assert_eq!(paired.len(), 16_384);
         for c in 0..8 {
             assert_eq!(
@@ -1574,12 +1657,12 @@ mod tests {
             threads: 1,
             ..QuantMeta::default()
         };
-        let encoded = encode_ht_tiles(&source, &meta).unwrap();
+        let encoded = encode_ht_tiles(&source, &meta, 4).unwrap();
         assert_eq!(encoded, vec![0u8; 128]);
-        let encoded_two = encode_ht_tiles(&source, &QuantMeta { threads: 2, ..meta }).unwrap();
+        let encoded_two = encode_ht_tiles(&source, &QuantMeta { threads: 2, ..meta }, 4).unwrap();
         assert_eq!(encoded, encoded_two);
         let mut decoded = [0.0; 256];
-        decode_ht_tile(&encoded, &mut decoded);
+        decode_ht_tile(&encoded, 4, &mut decoded);
         assert_eq!(decoded, source);
     }
 
@@ -1611,14 +1694,176 @@ mod tests {
         revived[0] = 1.0;
         assert!(rotate_into(&revived, 128, 128, &meta, RotationOrder::Rows, &mut out).is_err());
         assert!(encode_rows(Encoding::I4r, &revived, 128, 128, &meta).is_err());
-        assert!(encode_ht_tiles(&[f32::NAN; 256], &QuantMeta::default()).is_err());
+        assert!(encode_ht_tiles(&[f32::NAN; 256], &QuantMeta::default(), 4).is_err());
         assert!(encode_ht_tiles(
             &[0.0; 256],
             &QuantMeta {
                 ht_beam: 4097,
                 ..QuantMeta::default()
-            }
+            },
+            4
         )
         .is_err());
+    }
+
+    #[test]
+    fn ht3_published_tile_golden_covers_word_crossings_and_wraparound() {
+        let bytes = spec_words(24);
+        let mut tile = [0.0; 256];
+        decode_ht_tile(&bytes, 3, &mut tile);
+        let halves: Vec<u8> = tile
+            .iter()
+            .flat_map(|&v| f16::from_f32(v).to_le_bytes())
+            .collect();
+        assert_eq!(
+            digest(&halves),
+            "415420d5d59d5f2b288f563473b597b207e94852290120291887286c5f00555b"
+        );
+        for (index, bits) in [
+            (0, 0xafea),
+            (1, 0x3f08),
+            (2, 0xb8e3),
+            (7, 0xb257),
+            (8, 0xafea),
+            (127, 0xb7ef),
+            (128, 0x3cf9),
+            (255, 0x39f1),
+        ] {
+            assert_eq!(f16::from_f32(tile[index]).to_bits(), bits);
+        }
+        let symbols: Vec<u8> = (0..512).map(|i| (i % 8) as u8).collect();
+        let packed = pack_ht_symbols(&symbols, 3);
+        assert_eq!(packed.len(), 192);
+        assert_eq!(&packed[..12], &hex("057739053905773977390577"));
+        // A bit-at-a-time, word-MSB-first oracle includes symbols straddling
+        // every word boundary; it does not call the trellis decoder.
+        for (i, &symbol) in symbols.iter().enumerate() {
+            let mut actual = 0;
+            for bit in 0..3 {
+                let position = i * 3 + bit;
+                let word = u32::from_le_bytes(
+                    packed[position / 32 * 4..position / 32 * 4 + 4]
+                        .try_into()
+                        .unwrap(),
+                );
+                actual = (actual << 1) | ((word >> (31 - position % 32)) & 1) as u8;
+            }
+            assert_eq!(actual, symbol);
+        }
+        assert_eq!(
+            payload_layout(Encoding::Ht3, 512 * 1280, 2560).unwrap().len,
+            629_145_600
+        );
+        assert_eq!(
+            payload_layout(Encoding::Ht3, 512 * 2560, 640).unwrap().len,
+            314_572_800
+        );
+    }
+
+    #[test]
+    fn ht3_fixed_search_closes_thirteen_bits_not_five_whole_symbols() {
+        let mut source = [0.0; 256];
+        decode_ht_tile(&spec_words(24), 3, &mut source);
+        let boundary = 0x6958 & 0x1fff;
+        let mut symbols = [0u8; 256];
+        // SAFETY: native search receives complete 256-value input/output and
+        // its immutable 65536-state codebook, with a valid 13-bit boundary.
+        let cost = unsafe {
+            ht_search_fixed_bits(
+                source.as_ptr(),
+                ht_codebook().as_ptr(),
+                256,
+                boundary,
+                symbols.as_mut_ptr(),
+                3,
+            )
+        };
+        assert_eq!(cost, 0.0);
+        let tail = symbols[251..]
+            .iter()
+            .fold(0u16, |state, &symbol| (state << 3) | u16::from(symbol));
+        assert_eq!(tail & 0x1fff, boundary as u16);
+        let packed = pack_ht_symbols(&symbols, 3);
+        let mut decoded = [0.0; 256];
+        decode_ht_tile(&packed, 3, &mut decoded);
+        assert_eq!(decoded, source);
+        for beam in [1, 7, 128] {
+            let meta = QuantMeta {
+                ht_beam: beam,
+                ..QuantMeta::default()
+            };
+            let encoded = encode_ht_tiles(&[-3.453125; 256], &meta, 3).unwrap();
+            assert_eq!(encoded, vec![0; 96]);
+            assert_eq!(
+                encoded,
+                encode_ht_tiles(&[-3.453125; 256], &QuantMeta { threads: 2, ..meta }, 3).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn ht3_pairing_has_distinct_gate_up_tiles_and_inverse_scales() {
+        let cols = 256;
+        let su = vec![1.0; cols];
+        let gate_sv = vec![0.5; 128];
+        let up_sv = vec![-0.25; 128];
+        let gate_meta = QuantMeta {
+            su: &su,
+            sv: &gate_sv,
+            ht_beam: 1,
+            ..QuantMeta::default()
+        };
+        let up_meta = QuantMeta {
+            sv: &up_sv,
+            ..gate_meta
+        };
+        let mut gate = vec![0.0; 128 * cols];
+        let mut up = vec![0.0; 128 * cols];
+        gate[0] = -221.0;
+        gate[128] = -221.0;
+        up[0] = 110.5;
+        up[128] = 110.5;
+        let bytes =
+            encode_ht_gate_up_bands(Encoding::Ht3, &gate, &up, cols, &gate_meta, &up_meta).unwrap();
+        assert_eq!(bytes, vec![0; 256 * cols * 3 / 8]);
+        assert_eq!(
+            decode_ht_gate_up_band(Encoding::Ht3, &bytes, cols, false, &gate_meta).unwrap(),
+            gate
+        );
+        assert_eq!(
+            decode_ht_gate_up_band(Encoding::Ht3, &bytes, cols, true, &up_meta).unwrap(),
+            up
+        );
+        // Constant stored gate codebook[0] and up codebook[65535] give known
+        // original-basis impulses. Fill up tiles directly, without an encoder.
+        let mut mixed = vec![0; bytes.len()];
+        for column in 0..cols / 16 {
+            mixed[column * 16 * 96 + 8 * 96..(column + 1) * 16 * 96].fill(255);
+        }
+        let decoded_gate =
+            decode_ht_gate_up_band(Encoding::Ht3, &mixed, cols, false, &gate_meta).unwrap();
+        let decoded_up =
+            decode_ht_gate_up_band(Encoding::Ht3, &mixed, cols, true, &up_meta).unwrap();
+        assert_eq!(decoded_gate, gate);
+        assert_eq!(decoded_up[0], 20.84375);
+        assert_eq!(decoded_up[128], 20.84375);
+        assert_eq!(decoded_up.iter().filter(|&&value| value != 0.0).count(), 2);
+        assert!(decode_ht_gate_up_band(
+            Encoding::Ht3,
+            &mixed[..mixed.len() - 1],
+            cols,
+            true,
+            &up_meta
+        )
+        .is_err());
+        let nonunit = vec![2.0; cols];
+        let nonunit_meta = QuantMeta {
+            su: &nonunit,
+            ..gate_meta
+        };
+        let decoded =
+            decode_ht_gate_up_band(Encoding::Ht3, &mixed, cols, false, &nonunit_meta).unwrap();
+        assert_eq!(decoded[0], -442.0); // Decoder permits legal non-unit f16 vectors.
+        assert!(encode_rows(Encoding::Ht3, &gate, 128, cols, &nonunit_meta).is_err());
     }
 }

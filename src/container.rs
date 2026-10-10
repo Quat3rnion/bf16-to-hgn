@@ -84,11 +84,8 @@ pub fn layout(plan: &ContainerPlan) -> Result<Layout> {
             tensor.name
         );
         let (rows, cols) = rows_cols(&tensor.shape)?;
-        if tensor.encoding == Encoding::Ht {
-            ensure!(
-                tensor.shape.len() == 2 && rows % 128 == 0 && cols % 128 == 0,
-                "HT needs a 2-D 128-aligned matrix"
-            );
+        if tensor.encoding.ht_bits().is_some() {
+            validate_ht_shape(&tensor.shape)?;
         }
         if tensor.encoding == Encoding::I4r {
             ensure!(
@@ -125,6 +122,19 @@ pub fn layout(plan: &ContainerPlan) -> Result<Layout> {
         file_size,
         entries,
     })
+}
+
+fn validate_ht_shape(shape: &[u64]) -> Result<()> {
+    ensure!(
+        (shape.len() == 2
+            && shape
+                .iter()
+                .all(|&n| n >= 128 && n <= 1 << 24 && n % 128 == 0))
+            || shape == [512, 1280, 2560]
+            || shape == [512, 2560, 640],
+        "HT requires a 128-aligned 2-D matrix or a Flash-Next fused expert shape"
+    );
+    Ok(())
 }
 
 fn check_ascii(text: &str, limit: usize, kind: &str) -> Result<()> {
@@ -307,6 +317,18 @@ impl Reader {
                 "HGN payload exceeds file"
             );
             let (rows, cols) = rows_cols(&shape)?;
+            if encoding.ht_bits().is_some() {
+                validate_ht_shape(&shape)?;
+            }
+            if encoding == Encoding::I4r {
+                ensure!(
+                    shape.len() == 3 && shape[1] % 128 == 0 && cols % 128 == 0,
+                    "invalid I4R expert shape"
+                );
+            }
+            if encoding == Encoding::Fp8G128 {
+                ensure!(shape.len() == 3 && cols == 160, "invalid FP8G table shape");
+            }
             ensure!(
                 size == payload_layout(encoding, rows, cols)?.len,
                 "HGN payload size mismatch: {name}"
@@ -382,6 +404,7 @@ fn encoding_from_code(code: u32, variant: u32) -> Result<Encoding> {
         5 => Encoding::Q4Cp,
         7 => Encoding::Q8G64,
         10 => Encoding::Fp8G128,
+        16 if variant == 0x1206 => Encoding::Ht3,
         16 => Encoding::Ht,
         23 => Encoding::I4r,
         24 => Encoding::Q6G64,

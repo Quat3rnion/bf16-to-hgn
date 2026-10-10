@@ -1,13 +1,15 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
-use std::path::Path;
+use std::path::PathBuf;
 
 use anyhow::{ensure, Context, Result};
 use serde_json::Value;
 
 use crate::codec::Encoding;
-use crate::hf::{Dtype, Snapshot, TensorInfo};
+use crate::hf::{Dtype, TensorInfo};
+use crate::manifest::{Options, OutputProfile};
+use crate::source::{SourceKind, TensorSource};
 use crate::{ContainerPlan, ConversionPlan, Origin, Rotation, TensorPlan};
 
 // hgn-spec 1.1.0, 79e75fd4ae7642478823525b0a3212951f584af5:
@@ -143,9 +145,14 @@ const FLOAT_CONFIG: &[(&str, f64)] = &[
     ("/vision_config/initializer_range", 0.02),
 ];
 
-pub fn plan(snapshot: &Snapshot) -> Result<ConversionPlan> {
-    let mut result = plan_contract(&snapshot.config, &snapshot.tensors)?;
-    result.assets = plan_assets(&snapshot.root)?;
+pub fn plan(snapshot: &dyn TensorSource, options: &Options) -> Result<ConversionPlan> {
+    let mut result = plan_contract(
+        snapshot.config(),
+        snapshot.tensors(),
+        snapshot.kind(),
+        options.profile,
+    )?;
+    result.assets = plan_assets(|name| snapshot.asset_path(name))?;
     Ok(result)
 }
 
@@ -257,11 +264,11 @@ fn require_integers(config: &Value, path: &str, expected: &[u64]) -> Result<()> 
     Ok(())
 }
 
-fn plan_assets(root: &Path) -> Result<Vec<String>> {
+fn plan_assets(asset_path: impl Fn(&str) -> Result<PathBuf>) -> Result<Vec<String>> {
     let mut assets = Vec::with_capacity(REQUIRED_ASSETS.len() + OPTIONAL_ASSETS.len());
     for (names, required) in [(REQUIRED_ASSETS, true), (OPTIONAL_ASSETS, false)] {
         for &name in names {
-            match fs::symlink_metadata(root.join(name)) {
+            match fs::symlink_metadata(asset_path(name)?) {
                 Ok(metadata) => {
                     ensure!(
                         metadata.file_type().is_file(),
@@ -295,6 +302,7 @@ struct Contract {
     main: Vec<TensorPlan>,
     vision: Vec<TensorPlan>,
     ngram_shards: Vec<String>,
+    profile: OutputProfile,
 }
 
 impl Contract {
@@ -334,25 +342,35 @@ impl Contract {
         };
         self.add_source(source.clone(), shape, dtype);
         let rotation = match encoding {
-            Encoding::Ht | Encoding::I4r => {
+            Encoding::Ht | Encoding::Ht3 | Encoding::I4r => {
                 let base = name.strip_suffix(".weight").unwrap();
-                let su = if encoding == Encoding::I4r {
-                    match base.strip_suffix(".gate_up_proj") {
-                        Some(experts) => format!("{experts}.su"),
-                        None => format!("{base}.suh"),
-                    }
+                let experts = shape.len() == 3;
+                let su = if experts && base.ends_with(".gate_up_proj") {
+                    format!("{}.su", base.strip_suffix(".gate_up_proj").unwrap())
                 } else {
                     format!("{base}.suh")
                 };
                 let sv = format!("{base}.svh");
                 let rows = shape[shape.len() - 2];
                 let cols = shape[shape.len() - 1];
-                self.main.push(signs(&su, cols));
+                let per_expert = experts && encoding.ht_bits().is_some();
+                let su_shape = if per_expert && base.ends_with(".down_proj") {
+                    vec![shape[0], cols]
+                } else {
+                    vec![cols]
+                };
+                let mut input_signs = signs(&su, su_shape.iter().product());
+                input_signs.shape = su_shape;
+                self.main.push(input_signs);
                 self.main.push(TensorPlan {
                     name: sv.clone(),
-                    shape: vec![rows],
+                    shape: if per_expert {
+                        vec![shape[0], rows]
+                    } else {
+                        vec![rows]
+                    },
                     encoding: Encoding::F16,
-                    origin: if encoding == Encoding::Ht {
+                    origin: if encoding.ht_bits().is_some() {
                         Origin::HtScales {
                             tensor: source.clone(),
                             signs_key: sv.clone(),
@@ -403,9 +421,9 @@ impl Contract {
         }
     }
 
-    fn add_layer(&mut self, prefix: &str, full_attention: bool, mtp: bool) {
+    fn add_layer(&mut self, prefix: &str, full_attention: bool, mtp: bool, layer: u64) {
         let dense = if mtp { Encoding::Q8G64 } else { Encoding::Ht };
-        let hyper = if mtp {
+        let hyper = if mtp || self.profile == OutputProfile::Ht43 {
             Encoding::Q8G64
         } else {
             Encoding::Q6G64
@@ -443,7 +461,15 @@ impl Contract {
                 ],
             );
         }
-        let expert = if mtp { Encoding::Q4Cp } else { Encoding::I4r };
+        let expert = if mtp {
+            Encoding::Q4Cp
+        } else if self.profile == OutputProfile::V2 {
+            Encoding::I4r
+        } else if layer % 2 == 0 {
+            Encoding::Ht
+        } else {
+            Encoding::Ht3
+        };
         self.add_main_group(
             &format!("{prefix}mlp."),
             &[
@@ -509,12 +535,13 @@ fn signs(name: &str, count: u64) -> TensorPlan {
 }
 
 // Construct from model constants only, never from the input's names or count.
-fn expected_contract() -> Contract {
+fn expected_contract(profile: OutputProfile) -> Contract {
     let mut contract = Contract {
         sources: BTreeMap::new(),
         main: Vec::with_capacity(MAIN_COUNT),
         vision: Vec::with_capacity(VISION_COUNT),
         ngram_shards: Vec::with_capacity(NGRAM_PARTS as usize),
+        profile,
     };
     contract.add_main(
         "embed_tokens.weight".into(),
@@ -522,9 +549,14 @@ fn expected_contract() -> Contract {
         Encoding::Q4Cp,
     );
     contract.add_main("lm_head.weight".into(), &[VOCAB, HIDDEN], Encoding::Ht);
-    contract.add_mixer("hyper_connection_mixer.", Encoding::Q6G64, false);
+    let hyper = if profile == OutputProfile::Ht43 {
+        Encoding::Q8G64
+    } else {
+        Encoding::Q6G64
+    };
+    contract.add_mixer("hyper_connection_mixer.", hyper, false);
     for layer in 0..LAYERS {
-        contract.add_layer(&format!("layers.{layer}."), layer % 4 == 3, false);
+        contract.add_layer(&format!("layers.{layer}."), layer % 4 == 3, false, layer);
     }
     contract.add_main_group(
         "layers.1.ple.",
@@ -563,7 +595,7 @@ fn expected_contract() -> Contract {
         ],
     );
     contract.add_mixer("mtp.hyper_connection_mixer.", Encoding::Q8G64, false);
-    contract.add_layer("mtp.layers.0.", true, true);
+    contract.add_layer("mtp.layers.0.", true, true, 0);
     for (name, shape) in [
         ("visual.patch_embed.proj.weight", &[VISION_WIDTH, 1536][..]),
         ("visual.patch_embed.proj.bias", &[VISION_WIDTH][..]),
@@ -610,9 +642,14 @@ fn expected_contract() -> Contract {
     contract
 }
 
-fn plan_contract(config: &Value, tensors: &BTreeMap<String, TensorInfo>) -> Result<ConversionPlan> {
+fn plan_contract(
+    config: &Value,
+    tensors: &BTreeMap<String, TensorInfo>,
+    kind: SourceKind,
+    profile: OutputProfile,
+) -> Result<ConversionPlan> {
     validate_config(config)?;
-    let mut contract = expected_contract();
+    let mut contract = expected_contract(profile);
     ensure!(
         contract.sources.len() == SOURCE_COUNT
             && contract.main.len() == MAIN_COUNT
@@ -641,7 +678,10 @@ fn plan_contract(config: &Value, tensors: &BTreeMap<String, TensorInfo>) -> Resu
             expected.shape
         );
         let allowed = match expected.dtype {
-            SourceDtype::Bf16 => actual.dtype == Dtype::Bf16,
+            SourceDtype::Bf16 => {
+                actual.dtype == Dtype::Bf16
+                    || (kind != SourceKind::Hf && actual.dtype == Dtype::F32)
+            }
             SourceDtype::Bf16OrF32 => matches!(actual.dtype, Dtype::Bf16 | Dtype::F32),
             SourceDtype::I64 => actual.dtype == Dtype::I64,
         };
@@ -664,7 +704,9 @@ fn plan_contract(config: &Value, tensors: &BTreeMap<String, TensorInfo>) -> Resu
     // (including hash bounds) are checked during conversion, not metadata planning.
     for tensor in &mut contract.main {
         if let Origin::Tensor { name } = &tensor.origin {
-            if tensors[name].dtype == Dtype::F32 {
+            if tensors[name].dtype == Dtype::F32
+                && (name.ends_with(".linear_attn.A_log") || name.ends_with(".linear_attn.dt_bias"))
+            {
                 tensor.encoding = Encoding::F32;
             }
         }
@@ -676,7 +718,11 @@ fn plan_contract(config: &Value, tensors: &BTreeMap<String, TensorInfo>) -> Resu
         files: vec![
             ContainerPlan {
                 filename: "model.hgn".into(),
-                identity: "qwen3.8-flash-next-v2".into(),
+                identity: match profile {
+                    OutputProfile::V2 => "qwen3.8-flash-next-v2",
+                    OutputProfile::Ht43 => "qwen3.8-flash-next-ht43",
+                }
+                .into(),
                 tensors: contract.main,
             },
             ContainerPlan {
@@ -825,7 +871,7 @@ mod tests {
     }
 
     fn metadata() -> BTreeMap<String, TensorInfo> {
-        expected_contract()
+        expected_contract(OutputProfile::V2)
             .sources
             .into_iter()
             .map(|(name, expected)| {
@@ -862,7 +908,7 @@ mod tests {
     fn exact_source_and_v2_store_contract() {
         let source = metadata();
         assert_eq!(source.len(), 1658);
-        let result = plan_contract(&config(), &source).unwrap();
+        let result = plan_contract(&config(), &source, SourceKind::Hf, OutputProfile::V2).unwrap();
         assert_eq!(result.architecture, "qwen4_exp");
         assert_eq!(result.files.len(), 3);
         let main = &result.files[0];
@@ -939,8 +985,136 @@ mod tests {
     }
 
     #[test]
+    fn ht43_matches_exact_published_profile_and_preserves_mtp() {
+        let source = metadata();
+        let v2 = plan_contract(&config(), &source, SourceKind::Hf, OutputProfile::V2).unwrap();
+        let ht43 = plan_contract(&config(), &source, SourceKind::Hf, OutputProfile::Ht43).unwrap();
+        let main = &ht43.files[0];
+        assert_eq!(main.identity, "qwen3.8-flash-next-ht43");
+        assert_eq!(main.tensors.len(), 2015);
+        for (encoding, expected) in [
+            (Encoding::Ht, 361),
+            (Encoding::Ht3, 48),
+            (Encoding::Q8G64, 308),
+            (Encoding::Q4Cp, 124),
+            (Encoding::Bf16, 353),
+            (Encoding::F16, 818),
+            (Encoding::I64, 3),
+            (Encoding::Q6G64, 0),
+            (Encoding::I4r, 0),
+        ] {
+            assert_eq!(
+                count_store(&main.tensors, encoding),
+                expected,
+                "{encoding:?}"
+            );
+        }
+        for layer in 0..48 {
+            let prefix = format!("layers.{layer}.mlp.experts");
+            let expected = if layer % 2 == 0 {
+                Encoding::Ht
+            } else {
+                Encoding::Ht3
+            };
+            for projection in ["gate_up_proj", "down_proj"] {
+                let weight = tensor(&main.tensors, &format!("{prefix}.{projection}.weight"));
+                assert_eq!(weight.encoding, expected);
+                let rotation = weight.rotation.as_ref().unwrap();
+                assert_eq!(
+                    rotation.su,
+                    if projection == "gate_up_proj" {
+                        format!("{prefix}.su")
+                    } else {
+                        format!("{prefix}.down_proj.suh")
+                    }
+                );
+                let scales = tensor(&main.tensors, &rotation.sv);
+                assert_eq!(scales.shape, [512, weight.shape[1]]);
+                let Origin::HtScales {
+                    tensor: source,
+                    signs_key,
+                } = &scales.origin
+                else {
+                    panic!("HT expert output vectors require row scales");
+                };
+                let Origin::Tensor { name } = &weight.origin else {
+                    unreachable!()
+                };
+                assert_eq!(source, name);
+                assert_eq!(signs_key, &scales.name);
+            }
+            assert_eq!(tensor(&main.tensors, &format!("{prefix}.su")).shape, [2560]);
+            assert_eq!(
+                tensor(&main.tensors, &format!("{prefix}.down_proj.suh")).shape,
+                [512, 640]
+            );
+        }
+        assert_eq!(
+            main.tensors
+                .iter()
+                .filter(|t| t.name.starts_with("mtp."))
+                .collect::<Vec<_>>(),
+            v2.files[0]
+                .tensors
+                .iter()
+                .filter(|t| t.name.starts_with("mtp."))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(ht43.files[1..], v2.files[1..]);
+        // Only profile-defined tensors/rotations change. Every other plan
+        // entry retains the exact V2 encoder policy and source origin.
+        for old in &v2.files[0].tensors {
+            if old.name.contains(".experts.") || old.encoding == Encoding::Q6G64 {
+                continue;
+            }
+            assert_eq!(old, tensor(&main.tensors, &old.name));
+        }
+        crate::container::layout(main).unwrap();
+    }
+
+    #[test]
+    fn imported_float32_keeps_quantization_and_dense_output_boundaries() {
+        let mut imported = metadata();
+        for info in imported
+            .values_mut()
+            .filter(|info| info.dtype != Dtype::I64)
+        {
+            info.dtype = Dtype::F32;
+            info.size = crate::numel(&info.shape).unwrap() * 4;
+        }
+        for kind in [SourceKind::Hgn, SourceKind::Gguf] {
+            let planned = plan_contract(&config(), &imported, kind, OutputProfile::Ht43).unwrap();
+            let main = &planned.files[0].tensors;
+            assert_eq!(tensor(main, "lm_head.weight").encoding, Encoding::Ht);
+            assert_eq!(
+                tensor(main, "layers.1.mlp.experts.gate_up_proj.weight").encoding,
+                Encoding::Ht3
+            );
+            assert_eq!(
+                tensor(main, "layers.0.mlp.gate.weight").encoding,
+                Encoding::Bf16
+            );
+            assert_eq!(
+                tensor(main, "layers.0.linear_attn.A_log").encoding,
+                Encoding::F32
+            );
+            assert_eq!(
+                tensor(main, "layers.0.linear_attn.dt_bias").encoding,
+                Encoding::F32
+            );
+            assert!(planned.files[2]
+                .tensors
+                .iter()
+                .all(|t| t.encoding == Encoding::Bf16));
+            assert_eq!(planned.files[1].tensors[0].encoding, Encoding::Fp8G128);
+        }
+        assert!(plan_contract(&config(), &imported, SourceKind::Hf, OutputProfile::Ht43).is_err());
+    }
+
+    #[test]
     fn expert_origins_and_rotations_are_exact() {
-        let result = plan_contract(&config(), &metadata()).unwrap();
+        let result =
+            plan_contract(&config(), &metadata(), SourceKind::Hf, OutputProfile::V2).unwrap();
         let main = &result.files[0].tensors;
         for layer in 0..48 {
             let prefix = format!("layers.{layer}.mlp.experts");
@@ -1023,7 +1197,7 @@ mod tests {
                 info.size *= 2;
             }
         }
-        let result = plan_contract(&config(), &source).unwrap();
+        let result = plan_contract(&config(), &source, SourceKind::Hf, OutputProfile::V2).unwrap();
         assert_eq!(count_store(&result.files[0].tensors, Encoding::F32), 72);
         assert_eq!(count_store(&result.files[0].tensors, Encoding::Bf16), 281);
         for name in [
@@ -1034,7 +1208,10 @@ mod tests {
         ] {
             let mut invalid = source.clone();
             invalid.get_mut(name).unwrap().dtype = Dtype::F32;
-            assert!(plan_contract(&config(), &invalid).is_err(), "{name}");
+            assert!(
+                plan_contract(&config(), &invalid, SourceKind::Hf, OutputProfile::V2).is_err(),
+                "{name}"
+            );
         }
     }
 
@@ -1051,7 +1228,7 @@ mod tests {
             let mut invalid = source.clone();
             invalid.remove(name);
             assert!(
-                plan_contract(&config(), &invalid).is_err(),
+                plan_contract(&config(), &invalid, SourceKind::Hf, OutputProfile::V2).is_err(),
                 "missing {name}"
             );
         }
@@ -1061,12 +1238,12 @@ mod tests {
         renamed.name = format!("{expert}.weight");
         invalid.insert(renamed.name.clone(), renamed);
         assert_eq!(invalid.len(), 1658);
-        assert!(plan_contract(&config(), &invalid).is_err());
+        assert!(plan_contract(&config(), &invalid, SourceKind::Hf, OutputProfile::V2).is_err());
         let mut invalid = source.clone();
         let mut extra = invalid["lm_head.weight"].clone();
         extra.name = "unmapped.weight".into();
         invalid.insert(extra.name.clone(), extra);
-        assert!(plan_contract(&config(), &invalid).is_err());
+        assert!(plan_contract(&config(), &invalid, SourceKind::Hf, OutputProfile::V2).is_err());
         for name in [
             "model.visual.patch_embed.proj.weight",
             "model.language_model.layers.0.linear_attn.conv1d.weight",
@@ -1075,17 +1252,20 @@ mod tests {
         ] {
             let mut invalid = source.clone();
             invalid.get_mut(name).unwrap().shape[0] += 1;
-            assert!(plan_contract(&config(), &invalid).is_err(), "shape {name}");
+            assert!(
+                plan_contract(&config(), &invalid, SourceKind::Hf, OutputProfile::V2).is_err(),
+                "shape {name}"
+            );
         }
         let mut invalid = source.clone();
         invalid
             .get_mut("model.visual.patch_embed.proj.weight")
             .unwrap()
             .shape = vec![1152, 1536];
-        assert!(plan_contract(&config(), &invalid).is_err());
+        assert!(plan_contract(&config(), &invalid, SourceKind::Hf, OutputProfile::V2).is_err());
         let mut invalid = source;
         invalid.get_mut("lm_head.weight").unwrap().name = "different.weight".into();
-        assert!(plan_contract(&config(), &invalid).is_err());
+        assert!(plan_contract(&config(), &invalid, SourceKind::Hf, OutputProfile::V2).is_err());
     }
 
     #[test]
@@ -1190,16 +1370,16 @@ mod tests {
         fs::write(temp.path().join("vocab.json"), []).unwrap();
         fs::write(temp.path().join("auth.json"), b"do not copy").unwrap();
         fs::create_dir(temp.path().join(".cache")).unwrap();
-        let assets = plan_assets(temp.path()).unwrap();
+        let assets = plan_assets(|name| Ok(temp.path().join(name))).unwrap();
         assert_eq!(assets.len(), 7);
         assert!(assets.iter().any(|name| name == "vocab.json"));
         assert!(!assets
             .iter()
             .any(|name| name == "auth.json" || name == ".cache"));
         fs::remove_file(temp.path().join("merges.txt")).unwrap();
-        assert!(plan_assets(temp.path()).is_err());
+        assert!(plan_assets(|name| Ok(temp.path().join(name))).is_err());
         fs::create_dir(temp.path().join("merges.txt")).unwrap();
-        assert!(plan_assets(temp.path()).is_err());
+        assert!(plan_assets(|name| Ok(temp.path().join(name))).is_err());
     }
 
     #[cfg(unix)]
@@ -1212,10 +1392,10 @@ mod tests {
             fs::write(temp.path().join(name), []).unwrap();
         }
         symlink("not-present", temp.path().join("vocab.json")).unwrap();
-        assert!(plan_assets(temp.path()).is_err());
+        assert!(plan_assets(|name| Ok(temp.path().join(name))).is_err());
         fs::remove_file(temp.path().join("vocab.json")).unwrap();
         fs::remove_file(temp.path().join("tokenizer.json")).unwrap();
         symlink("config.json", temp.path().join("tokenizer.json")).unwrap();
-        assert!(plan_assets(temp.path()).is_err());
+        assert!(plan_assets(|name| Ok(temp.path().join(name))).is_err());
     }
 }

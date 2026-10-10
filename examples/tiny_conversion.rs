@@ -8,6 +8,7 @@ fn main() -> anyhow::Result<()> {
         seed: 7,
         threads: 1,
         ht_beam: 8,
+        ..Default::default()
     };
     let output = temporary.path().join("converted");
     bf16_to_hgn::conversion::convert(&snapshot, &plan, &output, &options)?;

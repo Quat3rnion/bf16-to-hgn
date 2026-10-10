@@ -1,35 +1,89 @@
-# BF16 safetensors → native v2 HGN
+# HF / HGN / GGUF → native v2 or HT43 HGN
 
-A standalone Rust CLI with a vendored C++ trellis encoder. It builds every
-payload from the input HF snapshot; it does **not** copy stock HGN weights,
-rotation vectors, codebooks, an MTP head, or a reference checkpoint.
+A standalone Rust CLI with a vendored C++ trellis encoder. The default
+output profile remains **v2**; `--profile ht43` selects the native HT43
+store/layout contract. All weights come from the supplied inputs: no stock
+checkpoint, MTP head, vision tower, n-gram table, learned codebook, or hidden
+calibration data is substituted.
 
 ## Support boundary
 
-Only a complete **Qwen3.8 Flash-Next** HF safetensors directory is accepted:
+Only complete **Qwen3.8 Flash-Next** weights are accepted:
 `Qwen4ExpForConditionalGeneration`, `model_type=qwen4_exp`, and the fixed
-Flash-Next configuration and tensor shapes. Other architectures, partial
-snapshots, GGUF, quantized safetensors, unexpected tensors, and incompatible
-configuration values are rejected before payload conversion.
+Flash-Next configuration, canonical tensor inventory and shapes. Other
+architectures, missing or unexpected tensors, incompatible configuration,
+and unsupported encodings fail before output publication.
 
-The contract is independently enumerated, not inferred from tensor counts:
-1,658 source tensors → 1,197 trunk/MTP entries, 128 n-gram shards, and 333
-vision entries. The converter generates all 818 rotation planes. Weights
-must be BF16; the three PLE hash vectors must be I64. F32 is also accepted
-and preserved **only** for DeltaNet `A_log` and `dt_bias`. The observed base
-HF metadata uses BF16 for those vectors.
+- **HF:** an indexed safetensors snapshot directory, including all split
+  shards and required assets. Weights must be BF16; the three PLE hash
+  vectors must be exact I64. F32 is accepted only for DeltaNet `A_log` and
+  `dt_bias`. Quantized safetensors are not supported. HF gains and DeltaNet
+  heads are already in canonical training order; no GGUF-style transform
+  is applied. The rank-five vision patch kernel is flattened row-major.
+- **HGN:** a model file or directory containing one model, with identity
+  `qwen3.8-flash-next-v2` or `qwen3.8-flash-next-ht43`, container version
+  1 or 2. Native append-only r2 files are supported: live payloads may be
+  out of table order, with unreachable old payloads/gaps. Live spans must
+  remain valid, aligned, disjoint and within the declared actual file size.
+  Separate overlay application is not supported.
+- **GGUF:** little-endian v2/v3 files with `general.architecture=qwen4exp`
+  and compatible fixed Flash-Next metadata. Split filenames
+  `model-00001-of-00003.gguf` discover all numbered siblings; any shard may
+  be selected, but every shard must exist. Duplicate tensors and inconsistent
+  metadata are rejected. Arbitrary shard naming and other architectures are
+  not supported.
+
+Supported **GGUF tensor types, exhaustively**:
+`F32`, `F16`, `BF16`, `Q4_0`, `Q5_0`, `Q5_1`, `Q8_0`, `Q4_K`, `Q5_K`,
+`Q6_K`, `IQ4_NL`, `IQ3_S`, `IQ4_XS`. All other types fail.
+
+Supported **native HGN store/variant pairs, exhaustively**:
+BF16 `0/0`, F32 `1/0`, F16 `2/0`, I64 `4/0`, Q4C-P `5/2`,
+Q8G64 `7/0`, FP8G `10/0` (stacked n-gram table only), HT3 `16/0x1206`,
+HT4 `16/0x1208`, I4R `23/128`, Q6G64 `24/64`. Other pairs are rejected,
+including I32, Q8S32, Q6_K, IQ4_NL, Q4A/Q5A and GGUF-native n-gram stores
+inside HGN. GGUF type support does **not** imply support for the corresponding
+direct-import HGN store.
+
+HGN/GGUF floats are decoded on demand to canonical F32 without an intermediate
+BF16 rounding; I64 remains exact. HGN decoding undoes native rotations and
+paired expert layouts. GGUF decoding applies norm-minus-one, DeltaNet
+tiled-to-grouped head reorders, strictly negative F32 `ssm_a` → `ln(-A)`,
+indexer Q/K and expert gate/up assembly, and exact PLE integer metadata.
+An embedded GGUF n-gram table is exposed as canonical shards. These decoded
+values, not an unavailable original BF16 checkpoint, are the conversion and
+verification reference.
+
+### Matching assets and auxiliary weights
+
+HF contains its own assets and auxiliary weights; `--assets`, `--mtp`,
+`--vision`, and `--ngram` are rejected for HF input.
+
+For **GGUF**, `--assets`, `--mtp` and `--vision` are mandatory. MTP and vision
+must be matching native HGN sidecars containing only their respective tensor
+categories, not an entire trunk. `--ngram` is required if
+`per_layer_token_embd.weight` is absent, and rejected if it is already embedded.
+
+For **HGN**, `--assets` defaults to the model's parent directory. Categories
+already embedded need no sidecar. Missing categories require explicit
+`--mtp`, `--vision`, `--ngram`, or existing standard-named siblings
+`qwen38-flash-next-{mtp,vision,ngram}.hgn`; duplicate sources fail. No search
+for stock weights or fallback to another checkpoint occurs.
+
+The assets directory must contain matching config/tokenizer files listed
+below. A converter output can be reimported with
+`--assets /path/to/previous-output/tokenizer`; its root is not a flat tokenizer
+assets directory. To retain optional processor configs as well, supply a
+matching flat assets directory containing them. Structure checks cannot prove
+that independently supplied sidecars/assets came from the same checkpoint;
+that provenance is the caller's responsibility.
 
 The binary format is pinned to [hgn-spec 1.1.0](https://github.com/jtsylve/hgn-spec/tree/79e75fd4ae7642478823525b0a3212951f584af5)
-(`79e75fd4ae7642478823525b0a3212951f584af5`). Its canonical v2 store map,
-HF training conventions, and names are used. HF norm gains are already
-zero-centred and DeltaNet heads already grouped: no GGUF-style offset or
-head permutation is applied. The rank-five vision patch kernel is flattened
-row-major, without transposing values.
-
-**Format compatibility is not inference qualification.** No full-model
-conversion, inference validation, quality comparison, or performance
-benchmark is claimed here. The publisher's calibration, learned codebooks,
-and rotation policy are not public; this tool uses its own explicit policy.
+(`79e75fd4ae7642478823525b0a3212951f584af5`).
+**Format compatibility is not inference qualification.** Full-model HT43
+conversion, inference quality, engine loading and performance have not been
+validated here. The publisher's calibration, learned codebooks and rotation
+policy are not public; this tool uses the explicit policy below.
 
 ## Requirements and build
 
@@ -54,46 +108,74 @@ aggregate SHA-256 of the compiled tool's source files, lockfile and helper.
 
 ## Commands
 
+`--source-format hf|hgn|gguf` is optional when the index/file magic is
+unambiguous. `inspect`, `plan` and `convert` accept `--profile v2|ht43`;
+omitting it selects v2. `verify` derives the profile and encoding options
+from `conversion-manifest.json`, not a CLI profile override.
+
 ```sh
-# Metadata only: headers, config, index, shapes/dtypes, required assets.
-$BIN inspect --source /path/to/hf-bf16
-
-# Complete deterministic store/shape/offset/disk plan; writes nothing.
-$BIN plan --source /path/to/hf-bf16 --seed 0 --threads 1 --ht-beam 128
-$BIN convert --source /path/to/hf-bf16 --output /path/to/new-output --dry-run
-
-# Real conversion: the parent directory must exist; output must not exist.
-$BIN convert --source /path/to/hf-bf16 --output /path/to/new-output \
+# HF: metadata inspection and deterministic plan, without tensor payload reads.
+$BIN inspect --source-format hf --source /path/to/hf-bf16 --profile ht43
+$BIN plan --source /path/to/hf-bf16 --profile ht43 \
   --seed 0 --threads 1 --ht-beam 128
+$BIN convert --source /path/to/hf-bf16 --output /path/to/new-hf-v2 --dry-run
 
-# Full file/source verification and streaming decoded-error report.
-$BIN verify --source /path/to/hf-bf16 --output /path/to/new-output
+# HF real conversion: v2 is the default.
+$BIN convert --source /path/to/hf-bf16 --output /path/to/new-hf-v2 \
+  --seed 0 --threads 1 --ht-beam 128
+$BIN verify --source /path/to/hf-bf16 --output /path/to/new-hf-v2
+
+# Native HGN with embedded MTP and explicitly matching assets/ngram/vision.
+$BIN convert --source-format hgn --source /path/to/native/model.hgn \
+  --assets /path/to/matching-assets \
+  --ngram /path/to/matching-ngram.hgn --vision /path/to/matching-vision.hgn \
+  --profile ht43 --output /path/to/new-hgn-ht43
+$BIN verify --source-format hgn --source /path/to/native/model.hgn \
+  --assets /path/to/matching-assets \
+  --ngram /path/to/matching-ngram.hgn --vision /path/to/matching-vision.hgn \
+  --output /path/to/new-hgn-ht43
+# Add --mtp /path/to/matching-mtp.hgn only if MTP is not embedded.
+
+# Split GGUF with embedded ngram: all numbered sibling shards must be present.
+$BIN convert --source-format gguf --source /path/to/model-00001-of-00003.gguf \
+  --assets /path/to/matching-assets --mtp /path/to/matching-mtp.hgn \
+  --vision /path/to/matching-vision.hgn \
+  --profile ht43 --output /path/to/new-gguf-ht43
+$BIN verify --source-format gguf --source /path/to/model-00001-of-00003.gguf \
+  --assets /path/to/matching-assets --mtp /path/to/matching-mtp.hgn \
+  --vision /path/to/matching-vision.hgn --output /path/to/new-gguf-ht43
+# Add --ngram /path/to/matching-ngram.hgn only when the GGUF table is absent.
 ```
 
-`inspect`, `plan`, and `convert --dry-run` never load tensor payloads or
-write output files. `verify` is intentionally a full source/output read,
-not a fast metadata check. It checks real headers, tables, sizes, all
-padding, store variants, SHA-256 and XOR checksums, exact source coverage,
-assets, generated vectors, raw-copy equality, finite quantized scales, and
-decodes every quantized value against the corresponding source. Its F64
-squared-error totals measure quantization error; they are not model quality
-or an acceptance threshold.
+For HGN/GGUF, reuse the same source and auxiliary input flags for inspection,
+planning, conversion and verification. Real conversion requires an existing
+parent directory and a destination that does not exist.
 
-The input must remain immutable during conversion and verification. Header,
-index, file and asset signatures are checked; per-tensor source SHA-256 is
-recorded from the actual consumed bytes. Concurrent external truncation of
-an mmap-backed input cannot be made safe by metadata checks alone.
+`inspect`, `plan`, and `convert --dry-run` do not decode tensor payloads or
+write files. They validate metadata, configuration, inventory, shapes, stores
+and required assets; payload values/integrity are checked during real
+conversion/verification. `verify` is a full source/output read, not a fast
+metadata check. It checks headers, tables, sizes, output padding, variants,
+SHA-256/XOR checksums, source coverage, assets, generated vectors, raw-copy
+equality where applicable, finite quantized scales, and every decoded
+quantized value against canonical source values. F64 squared-error totals
+measure conversion error, not model quality or an acceptance threshold.
+
+All source files, sidecars and assets must remain immutable during conversion
+and verification. Signatures and consumed-byte hashes are checked. Concurrent
+external truncation of an mmap-backed HF input cannot be made safe by metadata
+checks alone; HGN/GGUF use bounded positional reads.
 
 ## Output directory
 
 ```text
 new-output/
-  model.hgn                         # qwen3.8-flash-next-v2, trunk + MTP + rotations
+  model.hgn                         # native v2 or HT43: trunk + MTP + rotations
   qwen38-flash-next-ngram.hgn        # qwen3.8-flash-next-ngram, stacked FP8G table
-  qwen38-flash-next-vision.hgn       # qwen3.8-flash-next-vision, 333 BF16 tensors
-  config.json                       # original source config, unchanged
-  tokenizer/                        # flat HF tokenizer files + unchanged source config
-  conversion-manifest.json
+  qwen38-flash-next-vision.hgn       # qwen3.8-flash-next-vision, BF16 vision tensors
+  config.json                       # supplied source config, unchanged
+  tokenizer/                        # flat tokenizer files + unchanged source config
+  conversion-manifest.json           # schema 2, profile and source provenance
 ```
 
 Required assets are `config.json`, `tokenizer.json`, `tokenizer_config.json`,
@@ -106,13 +188,24 @@ configs stay at the output root; tokenizer assets are flat under
 is invented. HF cache files, credentials and arbitrary unrelated assets
 are never copied.
 
-The manifest records the exact plan, policy/seed/worker/beam settings, format
-pin, encoder source digest, config/index digests, each input tensor's
-relative shard/shape/dtype/bounds/hash, copied asset hashes, and every output
-entry's bounds/type/variant/checksum/SHA-256. It contains no absolute source
-paths, timestamps, credentials, or assumption that weights came from a
-particular upstream repository. The canonical HGN identity denotes the
-engine's format; provenance is the source-byte inventory, not the identity.
+The schema-2 manifest records the exact profile/plan, policy, seed/workers/beam,
+format pin, encoder source digest, config/assets, canonical source tensors and
+every output entry's bounds/type/variant/checksum/SHA-256. The HF index digest
+is present only for HF inputs. `sources[].sha256` hashes canonical
+little-endian dtype bytes: HF's actual BF16/F32/I64 bytes, or decoded/transformed
+F32 and exact I64 for imports. An imported tensor's canonical dtype/size/bounds
+describe its logical stream, not its physical encoded storage.
+
+`source_provenance` separately records physical files, headers/tables,
+encoded payload hashes and HGN rotation dependencies; canonical hashes are
+never presented as raw HGN/GGUF payload hashes. There are no absolute source
+paths, timestamps, credentials or assumed upstream repository. The HGN
+identity denotes the engine format, not the checkpoint's provenance.
+
+**Schema 2 is a clean manifest cutover, not schema-1 compatible.** The new
+verifier rejects schema-1 outputs; use the original preserved schema-1
+executable to verify old/running conversions. It does not migrate old
+manifests or reinterpret their source hashes.
 
 A staging directory is created beside the requested output. Payloads are
 written at preplanned aligned offsets; header/table are finalized only
@@ -120,15 +213,47 @@ once all checksums are known. Files and directories are synced before
 atomic no-clobber publication. An ordinary pre-publication failure removes
 the staging directory; a failed parent-directory sync removes the newly
 published output. Existing destinations and any overlap with the
-source directory are refused. The tool never modifies the input, services,
-or a live checkpoint. A process killed without cleanup may leave an
+source inputs/assets/sidecars are refused. The tool never modifies the input,
+services, or a live checkpoint. A process killed without cleanup may leave an
 unpublished `.bf16-to-hgn-*` staging directory; it is never treated as a
 finished output or resumed automatically.
 
-For serving, point the engine at `model.hgn`, its n-gram file and tokenizer,
-and enable its normal native-v2 trunk pinning. The MTP weights are inside
-`model.hgn`; no stock sidecar is required. Engine startup and inference
-must be qualified separately on a safe host/outage before deployment.
+For serving, select the engine's matching native-v2 or native-HT43 loader for
+`model.hgn`, its n-gram file and tokenizer. MTP weights are inside the output
+`model.hgn`; no stock sidecar is required. Engine startup and inference must
+be qualified separately on a safe host/outage before deployment.
+
+## Output profiles and preservation
+
+| Contract | v2 (default) | HT43 (`--profile ht43`) |
+| --- | --- | --- |
+| Main identity | `qwen3.8-flash-next-v2` | `qwen3.8-flash-next-ht43` |
+| Routed trunk experts | I4R | HT4 in zero-based even layers, HT3 in odd layers; both gate/up and down |
+| Trunk hyper-connection mixers | Q6G64 | Q8G64 |
+| Other trunk codecs | Existing v2 policy | Same as v2 |
+| MTP, n-gram, vision | Existing v2 policy | Same codec/layout policy as v2 |
+
+Both profiles retain Q4C-P embeddings/small projections, HT4 trunk dense
+matrices and LM head, BF16 gates/norms/vision, exact PLE I64, and source F32
+`A_log`/`dt_bias`. MTP uses Q8G64 dense/mixer matrices and Q4C-P routed
+experts. The output layout is selected by the profile, never by reusing a
+source encoding.
+
+HT43 experts use per-expert signed row-RMS scales. Gate/up share one input
+sign vector for the layer; down input signs are per expert. Fused gate/up
+payloads interleave corresponding 128-row gate and up trellis bands within
+each expert, while canonical tensor/hash order remains gate then up per
+expert. Down bands are ordinary expert-major bands. The output includes
+freshly generated sign/scale planes.
+
+“Preserved” means unchanged config/tokenizer bytes, exact integer values,
+HF raw copies where dtype/layout match, and unchanged profile policy for
+MTP/vision/n-gram—not preservation of imported compressed payloads.
+**Every HGN/GGUF input is decoded and encoded anew**, even when input and
+output profiles match. Imported raw BF16 output is rounded from canonical
+F32; quantized output is requantized. Source rotations/codebooks are used
+only to decode, not copied into the new model. Requantization adds error and
+does not recover BF16 originals or promise stock-checkpoint equivalence.
 
 ## Deterministic quantization policy
 
@@ -138,9 +263,10 @@ in the approximate beam search can differ. The manifest pins the source
 implementation; preserve the executable/toolchain as well when that level
 of reproducibility matters.
 
-- **BF16/F32/I64:** exact little-endian copies. Integer values never pass
-  through F32. All floating input values must be finite. PLE hash vectors
-  are checked against the stacked table's row bounds.
+- **BF16/F32/I64:** exact little-endian HF copies when output dtype matches.
+  Imported floats round only as required by the selected output dtype.
+  Integer values never pass through F32. Floating values must be finite;
+  PLE hash vectors are checked against the stacked table's row bounds.
 - **Q4C-P:** one fixed standard NF4 codebook per tensor, rather than an
   unpublished learned codebook. Groups of 32 search scale multipliers
   `[1, .95, .9, .85, .8]`, round scales to F16, and choose the lowest
@@ -151,11 +277,12 @@ of reproducibility matters.
 - **Rotations:** seed + canonical plane name, FNV-1a followed by SplitMix64,
   yields ±1 signs. Both axes use the documented normalized blockwise
   128-point Sylvester Hadamard transform.
-- **HT4:** input signs and signed per-row RMS scales rounded to F16; a
+- **HT4/HT3:** input signs and signed per-row RMS scales rounded to F16; a
   nonzero RMS below F16 range uses the smallest F16 subnormal, and an
   actual zero row has scale zero. The native fixed-codebook two-pass
-  boundary-fixed trellis beam search encodes 128-row bands. The default
-  beam is 128. This is approximate, not a global optimality claim.
+  boundary-fixed trellis beam search encodes 128-row bands with four or
+  three bits respectively. The default beam is 128. This is approximate,
+  not a global optimality claim. HT3 is used only for HT43 odd-layer experts.
 - **I4R:** all routed experts of a layer share its four sign vectors.
   Independently rotated 128-row bands use signed extreme/8 scales and
   multipliers `[1, .97, .94, .91, .88, .85]`, rounded to F16 before
@@ -172,14 +299,20 @@ switching storage formats.
 
 ## Memory and CPU safeguards
 
-Rust processes one tensor and 128 matrix rows at a time, including each
-expert separately in 128-row bands. The table uses 8,192-row chunks and two
-passes; raw copies/hashes use at most 8 MiB chunks. Only small generated
-rotation vectors are retained across tensors. Inputs are mmap-read in
-bounded windows with page-cache eviction hints. Output dirty data is
-synced/evicted every 64 MiB of writes and final hashing is streamed.
-These are working-set bounds, not an exact RSS guarantee for every allocator
-or operating system; native workers each add trellis scratch memory.
+Rust streams one tensor and 128 matrix rows at a time, with experts processed
+individually and paired HT gate/up bands handled separately. The n-gram table
+uses 8,192-row chunks and two passes; raw copies/hashes use at most 8 MiB
+chunks. HGN/GGUF decoding uses bounded source windows, not an intermediate
+decoded HF checkpoint or temporary full model. HF uses windowed mmap reads
+with eviction hints; output dirty data is synced/evicted every 64 MiB and
+final hashing is streamed.
+
+Generated rotations are retained as F32 vectors across conversion/verification.
+They are not all “small”: HT43's per-expert signs/scales require roughly
+**440 MB**, and the full prepared rotation map approximately **450 MB
+(429 MiB)**, once per conversion/verifier, not once per worker. Row buffers,
+import decoder scratch and native per-worker trellis scratch are additional.
+These are working-set bounds, not an exact RSS guarantee for every allocator/OS.
 
 Default `--threads 1` is deliberate. `--threads` only controls native HT
 workers (1–64); there is no parallel whole-tensor/expert queue. Start with
@@ -187,47 +320,61 @@ one or two workers on a memory-constrained machine. The tool does not
 consult or modify production service state. Do not run full conversion on
 a host whose live model already consumes its memory/disk headroom.
 
-The real BF16 inputs are approximately 360 GB; native-v2 output plus the
-FP8G table and vision tower is approximately 119 GB. The plan gives exact
-HGN sizes. Conversion reserves an additional 5% plus 64 MiB of free disk
-space; copied assets require their small additional space. No full-model
-conversion timing or throughput measurement is available.
+The BF16 source is approximately 360 GB. Including n-gram and vision, outputs
+are approximately **119 GB for v2** or **110 GB for HT43** (decimal, excluding
+assets). HT43's main file is about 57.618 GB, n-gram 51.200 GB and vision
+0.898 GB. Imported F32 `A_log`/`dt_bias` add a few kilobytes. Logical decoded
+F32 source sizes reported for imports are not temporary disk requirements.
+`plan` gives exact per-file sizes for the chosen profile/source dtypes.
+Conversion reserves an additional 5% plus 64 MiB of free disk space; copied
+assets need their small additional space. No full-model HT43 timing or
+throughput measurement is available.
 
 ## Bounded structural checks
 
-The public CLI has no fixture mode or architecture bypass. The library
-entry point accepts an explicit structural plan, allowing tiny genuine
-safetensors fixtures that exercise every codec, generated planes, an MTP
-matrix, the stacked table, vision reshape, container writer, assets,
-atomic publication, manifest and full verifier. These fixtures deliberately
-use a non-engine identity/config and cannot be served as Flash-Next.
+The public CLI has no fixture mode or architecture bypass. Library examples
+use tiny genuine safetensors/HGN/GGUF inputs and explicit structural plans
+to perform real encoding, atomic publication and full verification. Their
+non-engine identities/configurations cannot be served as Flash-Next.
+
+From this crate directory:
 
 ```sh
 CARGO_BUILD_JOBS=1 OMP_NUM_THREADS=1 \
-  cargo test --locked --manifest-path deployments/frame/bf16-to-hgn/Cargo.toml \
-  -- --test-threads=1
+  cargo test --locked --all-targets -- --test-threads=1
 
-CARGO_BUILD_JOBS=1 OMP_NUM_THREADS=1 \
-  cargo run --locked --manifest-path deployments/frame/bf16-to-hgn/Cargo.toml \
-  --example tiny_conversion
+# Existing v2 fixture and each new HT43 input path.
+CARGO_BUILD_JOBS=1 OMP_NUM_THREADS=1 cargo run --locked --example tiny_conversion
+CARGO_BUILD_JOBS=1 OMP_NUM_THREADS=1 cargo run --locked --example tiny_hf_to_ht43
+CARGO_BUILD_JOBS=1 OMP_NUM_THREADS=1 cargo run --locked --example tiny_hgn_to_ht43
+CARGO_BUILD_JOBS=1 OMP_NUM_THREADS=1 cargo run --locked --example tiny_gguf_to_ht43
 ```
 
-The example uses one native worker and beam 8, performs real quantization
-and conversion, verifies all payloads/source coverage, prints its report,
-and removes its temporary inputs/output. Golden tests include the pinned
-complete-container SHA-256 and format codec vectors. These checks do not
-load a full model or establish inference quality.
+Examples use one native worker and beam 8, print their conversion/verifier
+reports, and remove temporary inputs/output. Tests include pinned container
+goldens, codec vectors, independent HT3/HT4 paired decoding, source provenance,
+split GGUFs, append-only HGN, input immutability and publication boundaries.
+The optional real-stock HGN probe is ignored by default and requires its
+local fixture; it is not a portable test prerequisite.
 
-Verified on 2026-10-09 with bounded CPU-only checks:
+Bounded CPU-only checks on 2026-10-10 passed the integrated all-target test
+suite, the separately enabled real-stock HT43 probe, and all four executable
+examples (real conversion plus verification). Metadata-only public CLI
+inspection with `--profile ht43` also passed a complete BF16 snapshot,
+appended native r2 HGN with sidecars, and BF16 GGUF with MTP/vision sidecars.
+The HGN/GGUF metadata smokes used structurally compatible config/assets;
+they do not endorse checkpoint provenance or quality.
 
-- **61 tests passed:** 50 unit, 2 container golden, and 9 integration tests.
-- The real tiny conversion example consumed **13 source tensors**, wrote
-  **18 output tensors / 63,604 payload bytes**, and passed full source/hash,
-  layout and decoded-value verification.
-- Metadata-only CLI planning passed against the complete base BF16 snapshot:
-  **1,658 tensors in 131 shards**, **359,999,963,128 source payload bytes**,
-  and output inventories **2,015 + 1 + 333**. The planned trunk size is
-  **66,687,678,432 bytes**. No source tensor payloads were read by that plan.
+These checks do **not** include full-model HT43 conversion, GPU/engine
+loading, full-model inference, inference-quality comparisons or performance
+benchmarks. A running full v2 conversion is not evidence for HT43 qualification.
 
-These results do not include a full-model conversion, GPU/engine loading,
-inference-quality validation, or a conversion-performance benchmark.
+## Changes
+
+- Added bounded native HGN and GGUF inputs with explicit auxiliary weights
+  and matching assets; HF BF16 input and default v2 quantization remain.
+- Added the exact HT43 expert/mixer store and paired-band layout profile.
+- Added schema-2 canonical-source hashes plus separate physical provenance;
+  old schema-1 outputs require their original verifier.
+- Added executable tiny conversions for HF/HGN/GGUF → HT43 and bounded
+  regression coverage; no hidden calibration or stock-weight substitution.

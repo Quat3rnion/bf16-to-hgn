@@ -1,10 +1,11 @@
 use crate::{
     codec::{self, Encoding, QuantMeta},
     container::{self, Writer},
-    hf::{Dtype, Snapshot, TensorInfo},
+    hf::{Dtype, TensorInfo},
     manifest::{AssetRecord, ContainerRecord, Manifest, Options, OutputRecord, SourceRecord},
-    numel, rows_cols, ConversionPlan, Origin, TensorPlan, ENCODER_SHA256, POLICY, SPEC_COMMIT,
-    SPEC_VERSION,
+    numel, rows_cols,
+    source::{SourceKind, TensorSource, ASSET_NAMES},
+    ConversionPlan, Origin, TensorPlan, ENCODER_SHA256, SPEC_COMMIT, SPEC_VERSION,
 };
 use anyhow::{bail, ensure, Context, Result};
 use sha2::{Digest, Sha256};
@@ -19,7 +20,10 @@ const COPY_CHUNK: usize = 8 * 1024 * 1024;
 const MATRIX_ROWS: usize = 128;
 const TABLE_ROWS: usize = 8192;
 
-pub fn validate_plan(snapshot: &Snapshot, plan: &ConversionPlan) -> Result<BTreeSet<String>> {
+pub fn validate_plan(
+    snapshot: &dyn TensorSource,
+    plan: &ConversionPlan,
+) -> Result<BTreeSet<String>> {
     ensure!(!plan.files.is_empty(), "empty conversion plan");
     let mut filenames = BTreeSet::new();
     let mut sources = BTreeSet::new();
@@ -40,7 +44,7 @@ pub fn validate_plan(snapshot: &Snapshot, plan: &ConversionPlan) -> Result<BTree
             match &tensor.origin {
                 Origin::Tensor { name } => {
                     let info = snapshot
-                        .tensors
+                        .tensors()
                         .get(name)
                         .with_context(|| format!("missing source tensor {name}"))?;
                     ensure!(
@@ -52,6 +56,11 @@ pub fn validate_plan(snapshot: &Snapshot, plan: &ConversionPlan) -> Result<BTree
                         "reshape changes element count: {name}"
                     );
                     let expected = match tensor.encoding {
+                        Encoding::Bf16
+                            if snapshot.kind() != SourceKind::Hf && info.dtype == Dtype::F32 =>
+                        {
+                            Dtype::F32
+                        }
                         Encoding::Bf16 => Dtype::Bf16,
                         Encoding::F32 => Dtype::F32,
                         Encoding::I64 => Dtype::I64,
@@ -81,7 +90,7 @@ pub fn validate_plan(snapshot: &Snapshot, plan: &ConversionPlan) -> Result<BTree
                     signs_key,
                 } => {
                     let info = snapshot
-                        .tensors
+                        .tensors()
                         .get(source)
                         .context("missing HT-scale source")?;
                     ensure!(
@@ -112,7 +121,7 @@ pub fn validate_plan(snapshot: &Snapshot, plan: &ConversionPlan) -> Result<BTree
                             "n-gram shards must be in contiguous numeric order"
                         );
                         let info = snapshot
-                            .tensors
+                            .tensors()
                             .get(name)
                             .context("missing n-gram source")?;
                         ensure!(
@@ -120,7 +129,9 @@ pub fn validate_plan(snapshot: &Snapshot, plan: &ConversionPlan) -> Result<BTree
                             "n-gram source mapped more than once"
                         );
                         ensure!(
-                            info.dtype == Dtype::Bf16 && info.shape == tensor.shape[1..],
+                            (info.dtype == Dtype::Bf16
+                                || (snapshot.kind() != SourceKind::Hf && info.dtype == Dtype::F32))
+                                && info.shape == tensor.shape[1..],
                             "n-gram source shape/dtype mismatch"
                         );
                     }
@@ -129,20 +140,31 @@ pub fn validate_plan(snapshot: &Snapshot, plan: &ConversionPlan) -> Result<BTree
         }
     }
     for tensor in outputs.values() {
-        let rotated = matches!(tensor.encoding, Encoding::Ht | Encoding::I4r);
+        let rotated = tensor.encoding.ht_bits().is_some() || tensor.encoding == Encoding::I4r;
         ensure!(
             tensor.rotation.is_some() == rotated,
             "missing/unexpected rotation: {}",
             tensor.name
         );
         if let Some(rotation) = &tensor.rotation {
-            let (_, cols) = rows_cols(&tensor.shape)?;
+            let (total_rows, cols) = rows_cols(&tensor.shape)?;
+            let experts = tensor.shape.len() == 3;
             let rows = if tensor.encoding == Encoding::I4r {
                 tensor.shape[1]
             } else {
-                tensor.shape[0]
+                total_rows as u64
             };
-            for (name, count) in [(&rotation.su, cols as u64), (&rotation.sv, rows)] {
+            let input_count = if experts
+                && tensor.encoding.ht_bits().is_some()
+                && tensor.name.ends_with(".down_proj.weight")
+            {
+                tensor.shape[0]
+                    .checked_mul(cols as u64)
+                    .context("rotation count overflow")?
+            } else {
+                cols as u64
+            };
+            for (name, count) in [(&rotation.su, input_count), (&rotation.sv, rows)] {
                 let vector = outputs.get(name).context("missing rotation plane")?;
                 ensure!(
                     vector.encoding == Encoding::F16
@@ -156,7 +178,7 @@ pub fn validate_plan(snapshot: &Snapshot, plan: &ConversionPlan) -> Result<BTree
             }
         }
     }
-    let actual: BTreeSet<_> = snapshot.tensors.keys().cloned().collect();
+    let actual: BTreeSet<_> = snapshot.tensors().keys().cloned().collect();
     ensure!(
         sources == actual,
         "plan does not cover the exact source tensor set"
@@ -166,7 +188,7 @@ pub fn validate_plan(snapshot: &Snapshot, plan: &ConversionPlan) -> Result<BTree
 }
 
 pub fn prepare_rotations(
-    snapshot: &Snapshot,
+    snapshot: &dyn TensorSource,
     plan: &ConversionPlan,
     options: &Options,
 ) -> Result<BTreeMap<String, Vec<f32>>> {
@@ -185,7 +207,10 @@ pub fn prepare_rotations(
                 tensor: source,
                 signs_key,
             } => {
-                let info = snapshot.tensors.get(source).context("missing HT source")?;
+                let info = snapshot
+                    .tensors()
+                    .get(source)
+                    .context("missing HT source")?;
                 let (rows, cols) = rows_cols(&info.shape)?;
                 let signs = codec::generate_signs(options.seed, signs_key, rows);
                 let mut scales = Vec::with_capacity(rows);
@@ -210,7 +235,7 @@ pub fn prepare_rotations(
 }
 
 pub fn read_source_values(
-    snapshot: &Snapshot,
+    snapshot: &dyn TensorSource,
     info: &TensorInfo,
     element_offset: u64,
     len: usize,
@@ -254,7 +279,7 @@ fn source_float(bytes: &[u8], dtype: Dtype) -> Result<f32> {
     Ok(value)
 }
 
-pub fn validate_ple(snapshot: &Snapshot, plan: &ConversionPlan) -> Result<()> {
+pub fn validate_ple(snapshot: &dyn TensorSource, plan: &ConversionPlan) -> Result<()> {
     let prefix = "model.language_model.layers.1.ple.ple_embedding.";
     let names = [
         format!("{prefix}layer_multipliers"),
@@ -263,7 +288,7 @@ pub fn validate_ple(snapshot: &Snapshot, plan: &ConversionPlan) -> Result<()> {
     ];
     let present = names
         .iter()
-        .filter(|name| snapshot.tensors.contains_key(*name))
+        .filter(|name| snapshot.tensors().contains_key(*name))
         .count();
     if present == 0 {
         return Ok(());
@@ -280,7 +305,7 @@ pub fn validate_ple(snapshot: &Snapshot, plan: &ConversionPlan) -> Result<()> {
         .context("n-gram row count overflow")?;
     let mut vectors = Vec::new();
     for name in &names {
-        let info = &snapshot.tensors[name];
+        let info = &snapshot.tensors()[name];
         ensure!(info.dtype == Dtype::I64, "PLE vectors must be i64");
         let bytes = snapshot.read_bytes(name, 0, usize::try_from(info.size)?)?;
         vectors.push(
@@ -314,7 +339,7 @@ pub fn validate_ple(snapshot: &Snapshot, plan: &ConversionPlan) -> Result<()> {
 
 /// A structural library entry point. The public CLI always uses architecture::plan.
 pub fn convert(
-    snapshot: &Snapshot,
+    snapshot: &dyn TensorSource,
     plan: &ConversionPlan,
     output: &Path,
     options: &Options,
@@ -353,7 +378,7 @@ pub fn convert(
                     writer.write_at(index, 0, &bytes)?;
                 }
                 Origin::Tensor { name } => {
-                    let info = &snapshot.tensors[name];
+                    let info = &snapshot.tensors()[name];
                     let hash = encode_tensor(
                         snapshot,
                         info,
@@ -397,25 +422,32 @@ pub fn convert(
     let sources = source_hashes
         .into_iter()
         .map(|(name, sha256)| SourceRecord {
-            tensor: snapshot.tensors[&name].clone(),
+            tensor: snapshot.tensors()[&name].clone(),
             sha256,
         })
         .collect();
     let assets = copy_assets(snapshot, plan, staging.path())?;
-    let (_, config_sha256) = hash_file(&snapshot.root.join("config.json"))?;
-    let (_, index_sha256) = hash_file(&snapshot.root.join("model.safetensors.index.json"))?;
+    let (_, config_sha256) = hash_file(&snapshot.asset_path("config.json")?)?;
+    let index_sha256 = if snapshot.kind() == SourceKind::Hf {
+        Some(hash_file(&snapshot.asset_path("model.safetensors.index.json")?)?.1)
+    } else {
+        None
+    };
+    let source_provenance = snapshot.provenance()?;
     let manifest = Manifest {
-        schema: 1,
+        schema: 2,
         tool: "bf16-to-hgn".into(),
         tool_version: env!("CARGO_PKG_VERSION").into(),
         encoder_sha256: ENCODER_SHA256.into(),
         spec_version: SPEC_VERSION.into(),
         spec_commit: SPEC_COMMIT.into(),
-        policy: POLICY.into(),
+        policy: options.profile.policy().into(),
         options: options.clone(),
         plan: plan.clone(),
         config_sha256,
         index_sha256,
+        source_kind: snapshot.kind(),
+        source_provenance,
         sources,
         assets,
         containers,
@@ -441,7 +473,7 @@ pub fn convert(
 }
 
 fn encode_tensor(
-    snapshot: &Snapshot,
+    snapshot: &dyn TensorSource,
     info: &TensorInfo,
     tensor: &TensorPlan,
     index: usize,
@@ -450,10 +482,7 @@ fn encode_tensor(
     options: &Options,
 ) -> Result<String> {
     let mut hash = Sha256::new();
-    if matches!(
-        tensor.encoding,
-        Encoding::Bf16 | Encoding::F32 | Encoding::I64
-    ) {
+    if direct_copy(tensor.encoding, info.dtype) {
         let mut offset = 0;
         while offset < info.size {
             let len = (info.size - offset).min(COPY_CHUNK as u64) as usize;
@@ -468,6 +497,12 @@ fn encode_tensor(
             offset += len as u64;
         }
         return Ok(format!("{:x}", hash.finalize()));
+    }
+    if tensor.encoding.ht_bits().is_some()
+        && tensor.shape.len() == 3
+        && tensor.name.ends_with(".gate_up_proj.weight")
+    {
+        return encode_gate_up(snapshot, info, tensor, index, writer, vectors, options);
     }
     let (rows, cols) = rows_cols(&tensor.shape)?;
     let layout = codec::payload_layout(tensor.encoding, rows, cols)?;
@@ -523,6 +558,94 @@ fn encode_tensor(
     Ok(format!("{:x}", hash.finalize()))
 }
 
+pub(crate) fn direct_copy(encoding: Encoding, dtype: Dtype) -> bool {
+    matches!(
+        (encoding, dtype),
+        (Encoding::Bf16, Dtype::Bf16) | (Encoding::F32, Dtype::F32) | (Encoding::I64, Dtype::I64)
+    )
+}
+
+fn encode_gate_up(
+    snapshot: &dyn TensorSource,
+    info: &TensorInfo,
+    tensor: &TensorPlan,
+    index: usize,
+    writer: &mut Writer,
+    vectors: &BTreeMap<String, Vec<f32>>,
+    options: &Options,
+) -> Result<String> {
+    let experts = usize::try_from(tensor.shape[0])?;
+    let expert_rows = usize::try_from(tensor.shape[1])?;
+    let cols = usize::try_from(tensor.shape[2])?;
+    let half_rows = expert_rows / 2;
+    ensure!(
+        expert_rows % 256 == 0,
+        "gate/up requires complete paired bands"
+    );
+    let pair_bytes = codec::payload_layout(tensor.encoding, 256, cols)?.len;
+    let buffered = half_rows
+        .checked_mul(cols)
+        .and_then(|n| n.checked_mul(info.dtype.byte_width() as usize))
+        .context("expert source buffer size overflow")?;
+    // Hash in canonical gate-then-up order, although the encoded payload pairs
+    // corresponding bands. Retain only one expert's up bytes, not the matrix.
+    let mut up_bytes = Vec::with_capacity(buffered);
+    let mut hash = Sha256::new();
+    let mut offset = 0;
+    for expert in 0..experts {
+        up_bytes.clear();
+        for band in (0..half_rows).step_by(MATRIX_ROWS) {
+            let gate_row = expert * expert_rows + band;
+            let up_row = gate_row + half_rows;
+            let (gate_raw, gate) =
+                read_source_values(snapshot, info, (gate_row * cols) as u64, MATRIX_ROWS * cols)?;
+            let (up_raw, up) =
+                read_source_values(snapshot, info, (up_row * cols) as u64, MATRIX_ROWS * cols)?;
+            hash.update(gate_raw);
+            up_bytes.extend_from_slice(&up_raw);
+            let (su, gate_sv) = rotation_slice(tensor, vectors, gate_row, MATRIX_ROWS)?;
+            let (_, up_sv) = rotation_slice(tensor, vectors, up_row, MATRIX_ROWS)?;
+            let gate_meta = QuantMeta {
+                su,
+                sv: gate_sv,
+                threads: options.threads,
+                ht_beam: options.ht_beam,
+                ..QuantMeta::default()
+            };
+            let up_meta = QuantMeta {
+                sv: up_sv,
+                ..gate_meta
+            };
+            let bytes = codec::encode_ht_gate_up_bands(
+                tensor.encoding,
+                &gate,
+                &up,
+                cols,
+                &gate_meta,
+                &up_meta,
+            )?;
+            ensure!(
+                bytes.len() as u64 == pair_bytes,
+                "paired HT encoder size mismatch"
+            );
+            writer.write_at(index, offset, &bytes)?;
+            offset = offset
+                .checked_add(pair_bytes)
+                .context("expert payload offset overflow")?;
+        }
+        ensure!(
+            up_bytes.len() == buffered,
+            "incomplete expert source coverage"
+        );
+        hash.update(&up_bytes);
+    }
+    ensure!(
+        offset == writer.layout.entries[index].size,
+        "incomplete paired HT payload"
+    );
+    Ok(format!("{:x}", hash.finalize()))
+}
+
 pub fn rotation_slice<'a>(
     tensor: &TensorPlan,
     vectors: &'a BTreeMap<String, Vec<f32>>,
@@ -538,8 +661,35 @@ pub fn rotation_slice<'a>(
             let sv = vectors
                 .get(&rotation.sv)
                 .context("missing output rotation")?;
+            let (rows, cols) = rows_cols(&tensor.shape)?;
+            let end = row.checked_add(take).context("rotation row overflow")?;
+            ensure!(take > 0 && end <= rows, "rotation band exceeds matrix");
+            let experts = tensor.shape.len() == 3;
+            let expert_rows = if experts {
+                usize::try_from(tensor.shape[1])?
+            } else {
+                rows
+            };
+            let expert = row / expert_rows;
+            ensure!(
+                (end - 1) / expert_rows == expert,
+                "rotation band crosses expert boundary"
+            );
+            let su_offset = if experts
+                && tensor.encoding.ht_bits().is_some()
+                && tensor.name.ends_with(".down_proj.weight")
+            {
+                expert
+                    .checked_mul(cols)
+                    .context("input rotation offset overflow")?
+            } else {
+                0
+            };
+            let su = su
+                .get(su_offset..su_offset + cols)
+                .context("input rotation exceeds vector")?;
             let local_row = if tensor.encoding == Encoding::I4r {
-                row % usize::try_from(tensor.shape[1])?
+                row % expert_rows
             } else {
                 row
             };
@@ -553,7 +703,7 @@ pub fn rotation_slice<'a>(
 }
 
 fn encode_table(
-    snapshot: &Snapshot,
+    snapshot: &dyn TensorSource,
     tensor: &TensorPlan,
     shards: &[String],
     index: usize,
@@ -565,7 +715,7 @@ fn encode_table(
     let shard_rows = usize::try_from(tensor.shape[1])?;
     let mut absmax = 0.0f32;
     for name in shards {
-        let info = &snapshot.tensors[name];
+        let info = &snapshot.tensors()[name];
         let mut row = 0;
         while row < shard_rows {
             let take = TABLE_ROWS.min(shard_rows - row);
@@ -586,7 +736,7 @@ fn encode_table(
     };
     let mut output_offset = 0;
     for name in shards {
-        let info = &snapshot.tensors[name];
+        let info = &snapshot.tensors()[name];
         let mut hash = Sha256::new();
         let mut row = 0;
         while row < shard_rows {
@@ -632,21 +782,7 @@ pub fn asset_destinations(plan: &ConversionPlan) -> Result<Vec<(String, String)>
         safe_filename(name)?;
         ensure!(names.insert(name), "duplicate source asset");
         ensure!(
-            [
-                "config.json",
-                "tokenizer.json",
-                "tokenizer_config.json",
-                "chat_template.jinja",
-                "merges.txt",
-                "generation_config.json",
-                "vocab.json",
-                "special_tokens_map.json",
-                "added_tokens.json",
-                "preprocessor_config.json",
-                "processor_config.json",
-                "video_preprocessor_config.json"
-            ]
-            .contains(&name.as_str()),
+            ASSET_NAMES.contains(&name.as_str()),
             "unrecognized asset: {name}"
         );
         if name == "config.json"
@@ -664,13 +800,13 @@ pub fn asset_destinations(plan: &ConversionPlan) -> Result<Vec<(String, String)>
 }
 
 fn copy_assets(
-    snapshot: &Snapshot,
+    snapshot: &dyn TensorSource,
     plan: &ConversionPlan,
     staging: &Path,
 ) -> Result<Vec<AssetRecord>> {
     let mut records = Vec::new();
     for (source, destination) in asset_destinations(plan)? {
-        let path = snapshot.root.join(&source);
+        let path = snapshot.asset_path(&source)?;
         ensure!(
             fs::symlink_metadata(&path)?.is_file()
                 && !fs::symlink_metadata(&path)?.file_type().is_symlink(),
@@ -757,7 +893,7 @@ fn open_no_follow(path: &Path) -> Result<File> {
     Ok(options.open(path)?)
 }
 
-pub fn destination_path(snapshot: &Snapshot, output: &Path) -> Result<PathBuf> {
+pub fn destination_path(snapshot: &dyn TensorSource, output: &Path) -> Result<PathBuf> {
     ensure!(
         fs::symlink_metadata(output).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
         "output already exists or cannot be inspected"
@@ -775,10 +911,19 @@ pub fn destination_path(snapshot: &Snapshot, output: &Path) -> Result<PathBuf> {
         .unwrap_or_else(|| Path::new("."));
     let parent = fs::canonicalize(parent).context("output parent must already exist")?;
     let destination = parent.join(name);
-    ensure!(
-        !destination.starts_with(&snapshot.root) && !snapshot.root.starts_with(&destination),
-        "source and output directories must not overlap"
-    );
+    let inputs = snapshot.input_paths();
+    for input in inputs
+        .iter()
+        .map(PathBuf::as_path)
+        .chain(std::iter::once(snapshot.root()))
+    {
+        let input =
+            fs::canonicalize(input).context("source input protection path is unavailable")?;
+        ensure!(
+            !destination.starts_with(&input) && !input.starts_with(&destination),
+            "source and output paths must not overlap"
+        );
+    }
     Ok(destination)
 }
 
@@ -862,3 +1007,7 @@ fn publish_no_clobber(source: &Path, destination: &Path) -> Result<()> {
         bail!("this platform has no implemented atomic no-clobber directory publication");
     }
 }
+
+#[cfg(test)]
+#[path = "core_profile_tests.rs"]
+mod tests;

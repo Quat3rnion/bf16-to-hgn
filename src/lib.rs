@@ -2,8 +2,12 @@ pub mod architecture;
 pub mod codec;
 pub mod container;
 pub mod conversion;
+mod gguf_decode;
+pub mod gguf_source;
 pub mod hf;
+pub mod hgn_source;
 pub mod manifest;
+pub mod source;
 pub mod verify;
 
 use codec::Encoding;

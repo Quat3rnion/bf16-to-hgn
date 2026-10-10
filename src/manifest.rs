@@ -1,12 +1,31 @@
 use crate::{
     container::{Entry, Fingerprint, Layout},
     hf::TensorInfo,
+    source::SourceKind,
     ConversionPlan,
 };
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputProfile {
+    #[default]
+    V2,
+    Ht43,
+}
+impl OutputProfile {
+    pub fn policy(self) -> &'static str {
+        match self {
+            Self::V2 => crate::POLICY,
+            Self::Ht43 => "bf16-hgn-ht43-rtn-nf4-signed-rms-trellis-v1",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Options {
+    #[serde(default)]
+    pub profile: OutputProfile,
     pub seed: u64,
     pub threads: usize,
     pub ht_beam: usize,
@@ -14,6 +33,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            profile: OutputProfile::V2,
             seed: 0,
             threads: 1,
             ht_beam: 128,
@@ -37,6 +57,7 @@ impl Options {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SourceRecord {
     pub tensor: TensorInfo,
+    /// SHA-256 of canonical little-endian dtype bytes, not encoded import bytes.
     pub sha256: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -69,7 +90,11 @@ pub struct Manifest {
     pub options: Options,
     pub plan: ConversionPlan,
     pub config_sha256: String,
-    pub index_sha256: String,
+    pub source_kind: SourceKind,
+    /// Physical dependency metadata/checksums; never canonical hashes posing as raw hashes.
+    pub source_provenance: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_sha256: Option<String>,
     pub sources: Vec<SourceRecord>,
     pub assets: Vec<AssetRecord>,
     pub containers: Vec<ContainerRecord>,
