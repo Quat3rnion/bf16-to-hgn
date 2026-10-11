@@ -8,6 +8,7 @@ use crate::{
     progress::{Progress, Stage, Unit},
     rows_cols,
     source::{SourceKind, TensorSource},
+    tensor_progress,
     verification_manifest::read_manifest,
     verify_gpu::{self, DecodeBackend},
     ConversionPlan, Origin, TensorPlan,
@@ -77,13 +78,12 @@ pub fn verify(
     verify_assets(snapshot, output, &destinations, &manifest.assets)?;
     conversion::validate_ple(snapshot, plan)?;
 
+    let rotations = conversion::prepare_rotations(snapshot, plan, &manifest.options, progress)?;
     let stage = progress.stage(
         "Verify payloads",
         conversion::progress_values(plan, progress, false)?,
         Unit::Values,
     );
-    stage.set_item("Preparing rotations");
-    let rotations = conversion::prepare_rotations(snapshot, plan, &manifest.options)?;
     let mut payloads = PayloadVerifier {
         snapshot,
         options: &manifest.options,
@@ -127,7 +127,16 @@ pub fn verify(
         {
             let entry = &reader.layout.entries[index];
             if stage.is_enabled() {
-                stage.set_item(&format!("decode/check {}", tensor.name));
+                tensor_progress::item(
+                    &stage,
+                    tensor,
+                    "decode/check",
+                    "CPU",
+                    0,
+                    numel(&tensor.shape)?,
+                    "values",
+                    None,
+                );
             }
             ensure!(
                 output_record.entry == *entry,
@@ -491,7 +500,7 @@ impl PayloadVerifier<'_> {
                     .get(name)
                     .context("missing planned source")?;
                 let totals = if conversion::direct_copy(tensor.encoding, info.dtype) {
-                    self.verify_direct(reader, index, info)?
+                    self.verify_direct(reader, index, tensor, info)?
                 } else {
                     self.verify_matrix(reader, index, tensor, info)?
                 };
@@ -515,7 +524,18 @@ impl PayloadVerifier<'_> {
             "generated vector length mismatch"
         );
         let mut offset = 0u64;
+        let total = values.len() as u64;
         for values in values.chunks(RAW_CHUNK / 2) {
+            tensor_progress::item(
+                self.stage,
+                tensor,
+                "check rotation",
+                "CPU",
+                offset / 2,
+                total,
+                "values",
+                None,
+            );
             let bytes = reader.read_at(index, offset, values.len() * 2)?;
             for (actual, &value) in bytes.chunks_exact(2).zip(values) {
                 let expected = half::f16::from_f32(value);
@@ -529,6 +549,16 @@ impl PayloadVerifier<'_> {
                 );
             }
             offset += bytes.len() as u64;
+            tensor_progress::item(
+                self.stage,
+                tensor,
+                "check rotation",
+                "CPU",
+                offset / 2,
+                total,
+                "values",
+                None,
+            );
             self.stage.advance(values.len() as u64);
         }
         ensure!(
@@ -542,6 +572,7 @@ impl PayloadVerifier<'_> {
         &mut self,
         reader: &mut Reader,
         index: usize,
+        tensor: &TensorPlan,
         info: &TensorInfo,
     ) -> Result<ErrorTotals> {
         let mut hash = Sha256::new();
@@ -549,6 +580,16 @@ impl PayloadVerifier<'_> {
         let mut totals = ErrorTotals::default();
         while offset < info.size {
             let take = (info.size - offset).min(RAW_CHUNK as u64) as usize;
+            tensor_progress::item(
+                self.stage,
+                tensor,
+                "check copy",
+                "CPU",
+                offset,
+                info.size,
+                "bytes",
+                None,
+            );
             let raw = self.snapshot.read_bytes(&info.name, offset, take)?;
             let actual = reader.read_at(index, offset, take)?;
             ensure!(
@@ -561,6 +602,16 @@ impl PayloadVerifier<'_> {
             offset = offset
                 .checked_add(raw.len() as u64)
                 .context("source coverage overflow")?;
+            tensor_progress::item(
+                self.stage,
+                tensor,
+                "check copy",
+                "CPU",
+                offset,
+                info.size,
+                "bytes",
+                None,
+            );
             self.stage
                 .advance((raw.len() as u64) / info.dtype.byte_width());
         }
@@ -592,6 +643,18 @@ impl PayloadVerifier<'_> {
         let mut row = 0;
         while row < rows {
             let take = BLOCK_ROWS.min(rows - row);
+            if self.stage.is_enabled() {
+                tensor_progress::rows(
+                    self.stage,
+                    tensor,
+                    "decode/check",
+                    self.backend(tensor),
+                    row,
+                    take,
+                    false,
+                    false,
+                );
+            }
             let elements = take
                 .checked_mul(cols)
                 .context("decode block size overflow")?;
@@ -639,6 +702,18 @@ impl PayloadVerifier<'_> {
                 }
             }
             accumulate_errors(&mut totals, &source, &decoded)?;
+            if self.stage.is_enabled() {
+                tensor_progress::rows(
+                    self.stage,
+                    tensor,
+                    "decode/check",
+                    self.backend(tensor),
+                    row,
+                    take,
+                    true,
+                    false,
+                );
+            }
             row += take;
             self.stage.advance(elements as u64);
         }
@@ -686,6 +761,18 @@ impl PayloadVerifier<'_> {
                 for is_up in [false, true] {
                     let row =
                         expert * expert_rows + band * 128 + if is_up { projection_rows } else { 0 };
+                    if self.stage.is_enabled() {
+                        tensor_progress::rows(
+                            self.stage,
+                            tensor,
+                            "decode/check",
+                            self.backend(tensor),
+                            row,
+                            128,
+                            false,
+                            false,
+                        );
+                    }
                     let (raw, source) = conversion::read_source_values(
                         self.snapshot,
                         info,
@@ -711,6 +798,18 @@ impl PayloadVerifier<'_> {
                         sv,
                     )?;
                     accumulate_errors(&mut totals, &source, &decoded)?;
+                    if self.stage.is_enabled() {
+                        tensor_progress::rows(
+                            self.stage,
+                            tensor,
+                            "decode/check",
+                            self.backend(tensor),
+                            row,
+                            128,
+                            true,
+                            false,
+                        );
+                    }
                     self.stage.advance((128 * cols) as u64);
                 }
             }
@@ -752,6 +851,16 @@ impl PayloadVerifier<'_> {
             let mut row = 0;
             while row < shard_rows {
                 let take = BLOCK_ROWS.min(shard_rows - row);
+                tensor_progress::rows(
+                    self.stage,
+                    tensor,
+                    "decode/check",
+                    "CPU",
+                    output_row,
+                    take,
+                    false,
+                    false,
+                );
                 let elements = take
                     .checked_mul(cols)
                     .context("table block size overflow")?;
@@ -784,6 +893,16 @@ impl PayloadVerifier<'_> {
                 );
                 let decoded = codec::decode_rows(tensor.encoding, &block, take, cols, &meta)?;
                 accumulate_errors(&mut totals, &source, &decoded)?;
+                tensor_progress::rows(
+                    self.stage,
+                    tensor,
+                    "decode/check",
+                    "CPU",
+                    output_row,
+                    take,
+                    true,
+                    false,
+                );
                 row += take;
                 output_row = output_row
                     .checked_add(take)
@@ -801,6 +920,15 @@ impl PayloadVerifier<'_> {
             "FP8 global scale differs from source absmax policy"
         );
         Ok(totals)
+    }
+    fn backend(&self, tensor: &TensorPlan) -> &'static str {
+        if self.decode_backend == DecodeBackend::Hip
+            && (tensor.encoding.ht_bits().is_some() || tensor.encoding == Encoding::I4r)
+        {
+            "HIP"
+        } else {
+            "CPU"
+        }
     }
 }
 

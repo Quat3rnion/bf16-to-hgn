@@ -17,7 +17,7 @@ fn main() -> anyhow::Result<()> {
         ..Options::default()
     };
     let output = temporary.path().join("ht43");
-    let progress = bf16_to_hgn::progress::Progress::disabled();
+    let progress = bf16_to_hgn::progress::Progress::stderr();
     conversion::convert(&source, &plan, &output, &options, &progress)?;
     let report = verify::verify(
         &source,

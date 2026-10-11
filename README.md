@@ -143,11 +143,21 @@ rotations, including paired HT bands. Other codecs, SHA-256/XOR checks,
 layout/padding/metadata validation and sequential F64 error accumulation
 stay on CPU. GPU verification does not re-encode the weights or skip checks.
 
-Conversion and verification show indicatif stage progress on terminal stderr:
-completed work, throughput, stage ETA and the current tensor. Updates happen
-at streaming chunk/band boundaries, including within large expert tensors.
-JSON stdout is unchanged; redirected stderr has no animated progress.
-Library callers explicitly supply a disabled progress handle by default.
+Conversion and verification show multiline indicatif progress on terminal
+stderr. Overall counters, throughput and ETA stay separate from the current
+operation, encoding (`HT4`, `HT3`, `I4R`, etc.), actual CPU/HIP backend, layer,
+expert and tensor. Expert indices are zero-based and accompanied by the
+expert count; layer scopes distinguish trunk, MTP and vision.
+Within-tensor counters update at streaming chunk/band boundaries. Expert
+matrices show progress within the current expert or gate/up portion; paired
+HT encoding reports gate+up row pairs. Nonexpert or flattened shapes do not
+invent an expert index. Hashing/finalization clears obsolete tensor context.
+
+A separate **Prepare rotations** stage counts generated signs and HT source
+scale scans, with CPU row-scan updates before encoding/verification begins.
+HIP selection does not imply GPU execution of this preparation stage.
+JSON stdout is unchanged; redirected stderr remains quiet. Library callers
+can explicitly supply disabled progress with no progress-only allocations.
 “Convert passes” counts each output value once, plus n-gram values once more
 for the mandatory global-scale scan; it is work across passes, not the
 model's unique parameter count. Verification counts each output value once.
@@ -606,6 +616,10 @@ throughput. A full v2 conversion is not evidence for HT43 qualification.
   with explicit provenance-attestation status and no artifact migration.
 - Added indicatif terminal progress for conversion and verification,
   including updates within large tensors and clean redirected JSON output.
+- Added visible layer/expert/codec/backend and within-tensor context, plus a
+  separately counted rotation-preparation stage. CPU conversion/verification
+  smoke runs exercised 80/100/120-column terminals (file-seek latency exposed
+  sub-frame fixture tensors), quiet redirected JSON and checksum-failure output.
 
 - Added opt-in gfx1151 HIP HT3/HT4 encoding, bounded reusable device storage,
   explicit backend provenance and CPU-only verification of HIP output.

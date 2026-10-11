@@ -11,21 +11,45 @@
 //! line claims completion only when the reported position equals the declared
 //! total. Rates and remaining time extrapolate the recent rate of that unit;
 //! they are estimates, not predictions, for work whose cost per unit varies.
+//!
+//! A live stage draws a short block. For the stage labels and context this
+//! crate reports, each line normally fits in 80 columns, so the overall
+//! counters never push the context off a narrow terminal (a longer line wraps
+//! and the redraw accounts for it):
+//!
+//! ```text
+//! ⠙ Convert passes [=========>              ] 512.00G/1.37T values
+//!   12.34M values/s  elapsed 00:12:34  eta ~2h
+//!   encode Ht3 on HIP · layers.12 · expert 37 (512 total) · gate+up
+//!   384/1,280 rows (30%) · layers.12.mlp.experts.gate_up_proj.weight
+//! ```
+//!
+//! The first two lines are the stage's overall work; the last two show the
+//! latest [`Detail`] (or a single [`Stage::set_item`] label) and appear only
+//! once the caller reports one. A stopped stage keeps them so a failure shows
+//! where it stopped; a completed stage collapses to one "done" line.
 
 use indicatif::{
     BinaryBytes, HumanCount, HumanDuration, ProgressBar, ProgressDrawTarget, ProgressState,
     ProgressStyle,
 };
-use std::{borrow::Cow, fmt, io::IsTerminal as _, time::Duration};
+use std::{
+    borrow::Cow,
+    fmt::{self, Write as _},
+    io::IsTerminal as _,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    time::Duration,
+};
 
 /// Redraw interval while a stage is live, so elapsed time, the spinner, the
-/// latest item label and the rate estimate stay current during long blocks.
+/// latest detail and the rate estimate stay current during long blocks.
 const TICK: Duration = Duration::from_millis(250);
 const GAUGE_WIDTH: u64 = 24;
-const RUNNING: &str =
-    "{spinner} {prefix} [{gauge}] {work}  {rate}  {elapsed_precise}  eta {remaining}  {wide_msg}";
+const RUNNING: &str = "{spinner} {prefix} [{gauge}] {work}\n  {rate}  elapsed {elapsed_precise}  eta {remaining}{detail}";
 const DONE: &str = "{prefix}: done {amount} in {elapsed_precise} ({rate})";
-const STOPPED: &str = "{prefix}: stopped at {work} after {elapsed_precise}  {wide_msg}";
+const STOPPED: &str = "{prefix}: stopped at {work} after {elapsed_precise}{detail}";
+/// Separates fields of a detail line.
+const FIELD: &str = " · ";
 
 /// Progress sink handed to long-running library operations.
 ///
@@ -60,14 +84,15 @@ impl Progress {
     /// the previous stage before starting the next one.
     pub fn stage(&self, label: impl Into<Cow<'static, str>>, total: u64, unit: Unit) -> Stage {
         if !self.enabled {
-            return Stage { bar: None, unit };
+            return Stage { live: None, unit };
         }
+        let context = Arc::default();
         let bar = ProgressBar::with_draw_target(Some(total), ProgressDrawTarget::stderr())
-            .with_style(unit.style(RUNNING))
+            .with_style(unit.style(RUNNING, &context))
             .with_prefix(label);
         bar.enable_steady_tick(TICK);
         Stage {
-            bar: Some(bar),
+            live: Some(Live { bar, context }),
             unit,
         }
     }
@@ -82,9 +107,16 @@ pub enum Unit {
 }
 
 impl Unit {
-    fn style(self, template: &str) -> ProgressStyle {
+    fn style(self, template: &str, context: &Arc<Mutex<Context>>) -> ProgressStyle {
+        let context = Arc::clone(context);
         ProgressStyle::with_template(template)
             .expect("static progress template")
+            .with_key(
+                "detail",
+                move |_: &ProgressState, out: &mut dyn fmt::Write| {
+                    let _ = lock(&context).write_lines(out);
+                },
+            )
             .with_key(
                 "gauge",
                 |state: &ProgressState, out: &mut dyn fmt::Write| {
@@ -214,68 +246,228 @@ fn write_si(out: &mut dyn fmt::Write, value: f64) -> fmt::Result {
     }
 }
 
+/// Where a stage is within its current item, for [`Stage::set_detail`].
+///
+/// Every field is borrowed, so building one costs nothing; a live stage copies
+/// it into reused buffers and a disabled stage ignores it. Empty strings and
+/// `None` fields are left out of the display.
+#[derive(Clone, Copy, Debug)]
+pub struct Detail<'a> {
+    /// Phase step, such as `encode`, `copy`, `scan` or `decode`.
+    pub operation: &'a str,
+    /// Output tensor name.
+    pub tensor: &'a str,
+    /// Scope-qualified location such as `layers.2`, `mtp.layers.0` or
+    /// `visual.blocks.3`; `None` for tensors outside any layer.
+    pub layer: Option<&'a str>,
+    /// Store label of the tensor's encoding.
+    pub encoding: &'a str,
+    /// Device actually running this step, such as `CPU` or `HIP`.
+    pub backend: &'a str,
+    /// `(index, count)`: zero-based index of the current expert and the number
+    /// of experts in the tensor. Shown as `expert 7 (512 total)`, so the last
+    /// expert of 512 reads `expert 511 (512 total)`.
+    pub expert: Option<(u64, u64)>,
+    /// Part of the expert or tensor, such as `gate`, `up` or `gate+up`.
+    pub part: Option<&'a str>,
+    /// Work on the current item finished so far, out of `total`, in `unit`
+    /// (for example `rows`, `bands`, `values` or `bytes`). A `total` of zero
+    /// leaves item progress out.
+    pub completed: u64,
+    pub total: u64,
+    pub unit: &'a str,
+}
+
+impl Detail<'_> {
+    /// Operation, encoding and backend, then location, for example
+    /// `encode Ht3 on HIP · layers.12 · expert 37 (512 total) · gate+up`.
+    fn write_scope(&self, out: &mut String) -> fmt::Result {
+        for word in [self.operation, self.encoding] {
+            if !word.is_empty() {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(word);
+            }
+        }
+        if !self.backend.is_empty() {
+            if !out.is_empty() {
+                out.push_str(" on ");
+            }
+            out.push_str(self.backend);
+        }
+        if let Some(layer) = self.layer {
+            push_field(out, layer);
+        }
+        if let Some((index, count)) = self.expert {
+            separate(out);
+            write!(out, "expert {index} ({count} total)")?;
+        }
+        if let Some(part) = self.part {
+            push_field(out, part);
+        }
+        Ok(())
+    }
+
+    /// Item progress, then the tensor name, for example
+    /// `384/1,280 rows (30%) · layers.12.mlp.experts.gate_up_proj.weight`.
+    /// The percentage rounds down, so it reads 100% only once all of the
+    /// item's work is reported.
+    fn write_item(&self, out: &mut String) -> fmt::Result {
+        if self.total > 0 {
+            write_count(out, self.unit, self.completed)?;
+            out.push('/');
+            write_count(out, self.unit, self.total)?;
+            if self.unit != "bytes" && !self.unit.is_empty() {
+                out.push(' ');
+                out.push_str(self.unit);
+            }
+            let percent = u128::from(self.completed) * 100 / u128::from(self.total);
+            write!(out, " ({percent}%)")?;
+        }
+        if !self.tensor.is_empty() {
+            push_field(out, self.tensor);
+        }
+        Ok(())
+    }
+}
+
+/// Start another field of a detail line.
+fn separate(out: &mut String) {
+    if !out.is_empty() {
+        out.push_str(FIELD);
+    }
+}
+
+fn push_field(out: &mut String, field: &str) {
+    separate(out);
+    out.push_str(field);
+}
+
+/// One count of a free-form detail unit: binary sizes for `bytes`, SI
+/// prefixes for `values`, grouped digits otherwise.
+fn write_count(out: &mut String, unit: &str, value: u64) -> fmt::Result {
+    match unit {
+        "bytes" => write!(out, "{}", BinaryBytes(value)),
+        "values" => write_si(out, value as f64),
+        _ => write!(out, "{}", HumanCount(value)),
+    }
+}
+
+/// Latest context of a live stage, drawn below its overall counters. Updated
+/// in place so steady-state updates reuse the same buffers.
+#[derive(Debug, Default)]
+struct Context {
+    /// Operation, encoding, backend and location; empty after
+    /// [`Stage::set_item`].
+    scope: String,
+    /// Item progress and tensor name, or a free-form item label.
+    item: String,
+}
+
+impl Context {
+    /// Each non-empty line, indented under the stage's counters.
+    fn write_lines(&self, out: &mut dyn fmt::Write) -> fmt::Result {
+        for line in [&self.scope, &self.item] {
+            if !line.is_empty() {
+                out.write_str("\n  ")?;
+                out.write_str(line)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Context stays drawable even if a panic poisoned it mid-update; the next
+/// update rewrites it completely.
+fn lock(context: &Mutex<Context>) -> MutexGuard<'_, Context> {
+    context.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+struct Live {
+    bar: ProgressBar,
+    context: Arc<Mutex<Context>>,
+}
+
 /// One live stage. Pass `&Stage` to the code doing the work.
 ///
 /// Dropping an unfinished stage (an error return or panic) leaves a
-/// "stopped at" line with the last reported position and item.
+/// "stopped at" line with the last reported position and context.
 #[must_use = "dropping a stage reports it as stopped"]
 pub struct Stage {
-    bar: Option<ProgressBar>,
+    live: Option<Live>,
     unit: Unit,
 }
 
 impl Stage {
-    /// False for disabled progress. Guard any label formatting with this so
-    /// disabled stages cost no allocation.
+    /// False for disabled progress. Guard any label formatting or context
+    /// derivation with this so disabled stages cost no allocation.
     pub fn is_enabled(&self) -> bool {
-        self.bar.is_some()
+        self.live.is_some()
     }
 
     /// Record `completed` more units of finished work. Atomic; terminal
     /// redraws are rate limited, so per-chunk calls are cheap.
     pub fn advance(&self, completed: u64) {
-        if let Some(bar) = &self.bar {
-            bar.inc(completed);
+        if let Some(live) = &self.live {
+            live.bar.inc(completed);
         }
     }
 
-    /// Show the item now being processed, normally a tensor name. Redraws are
-    /// coalesced to the terminal refresh rate; the latest label is shown on
-    /// the next tick.
+    /// Show a free-form item, such as a hashing or finalization step, in place
+    /// of any earlier [`Detail`], whose operation, layer and expert would no
+    /// longer describe the work. Drawn on the next redraw.
     pub fn set_item(&self, item: &str) {
-        if let Some(bar) = &self.bar {
-            bar.set_message(item.to_owned());
+        if let Some(live) = &self.live {
+            let mut context = lock(&live.context);
+            context.scope.clear();
+            context.item.clear();
+            context.item.push_str(item);
+        }
+    }
+
+    /// Show where the stage is within its current item. Call at chunk or band
+    /// boundaries next to [`Stage::advance`]; each call replaces the previous
+    /// detail and is drawn on the next redraw, so frequent calls are cheap.
+    pub fn set_detail(&self, detail: &Detail<'_>) {
+        if let Some(live) = &self.live {
+            let mut context = lock(&live.context);
+            let Context { scope, item } = &mut *context;
+            scope.clear();
+            item.clear();
+            let _ = detail.write_scope(scope);
+            let _ = detail.write_item(item);
         }
     }
 
     /// End the stage. Reports "done" only when the position equals the total;
     /// any other position is reported as stopped, never rounded to complete.
     pub fn finish(mut self) {
-        if let Some(bar) = self.bar.take() {
-            let template = if bar.length() == Some(bar.position()) {
+        if let Some(live) = self.live.take() {
+            let template = if live.bar.length() == Some(live.bar.position()) {
                 DONE
             } else {
                 STOPPED
             };
-            self.close(&bar, template);
+            self.close(&live, template);
         }
     }
 
-    fn close(&self, bar: &ProgressBar, template: &str) {
+    fn close(&self, live: &Live, template: &str) {
         // Join the ticker first so it cannot redraw the running template
         // between the style change and the final draw.
-        bar.disable_steady_tick();
-        bar.set_style(self.unit.style(template));
+        live.bar.disable_steady_tick();
+        live.bar.set_style(self.unit.style(template, &live.context));
         // Abandon keeps the reported position; indicatif's finish would set it
         // to the total.
-        bar.abandon();
+        live.bar.abandon();
     }
 }
 
 impl Drop for Stage {
     fn drop(&mut self) {
-        if let Some(bar) = self.bar.take() {
-            self.close(&bar, STOPPED);
+        if let Some(live) = self.live.take() {
+            self.close(&live, STOPPED);
         }
     }
 }

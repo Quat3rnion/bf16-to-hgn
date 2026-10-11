@@ -7,7 +7,7 @@ use crate::{
     progress::{Progress, Stage, Unit},
     rows_cols,
     source::{SourceKind, TensorSource, ASSET_NAMES},
-    ConversionPlan, Origin, TensorPlan, ENCODER_SHA256, SPEC_COMMIT, SPEC_VERSION,
+    tensor_progress, ConversionPlan, Origin, TensorPlan, ENCODER_SHA256, SPEC_COMMIT, SPEC_VERSION,
 };
 use anyhow::{bail, ensure, Context, Result};
 use sha2::{Digest, Sha256};
@@ -193,16 +193,63 @@ pub fn prepare_rotations(
     snapshot: &dyn TensorSource,
     plan: &ConversionPlan,
     options: &Options,
+    progress: &Progress,
 ) -> Result<BTreeMap<String, Vec<f32>>> {
+    let total = if progress.is_enabled() {
+        plan.files.iter().flat_map(|file| &file.tensors).try_fold(
+            0u64,
+            |total, tensor| -> Result<u64> {
+                let values = match &tensor.origin {
+                    Origin::Signs { .. } => numel(&tensor.shape)?,
+                    Origin::HtScales { tensor: source, .. } => {
+                        numel(&snapshot.tensors()[source].shape)?
+                    }
+                    _ => 0,
+                };
+                total
+                    .checked_add(values)
+                    .context("preparation progress total overflow")
+            },
+        )?
+    } else {
+        0
+    };
+    let stage = progress.stage("Prepare rotations", total, Unit::Values);
     let mut vectors = BTreeMap::new();
     for tensor in plan.files.iter().flat_map(|f| &f.tensors) {
         match &tensor.origin {
             Origin::Signs { key } => {
+                if stage.is_enabled() {
+                    tensor_progress::item(
+                        &stage,
+                        tensor,
+                        "generate signs",
+                        "CPU",
+                        0,
+                        numel(&tensor.shape)?,
+                        "values",
+                        None,
+                    );
+                }
                 let values = codec::generate_signs(
                     options.seed,
                     key,
                     usize::try_from(numel(&tensor.shape)?)?,
                 );
+                if stage.is_enabled() {
+                    let count = values.len() as u64;
+                    tensor_progress::item(
+                        &stage,
+                        tensor,
+                        "generate signs",
+                        "CPU",
+                        count,
+                        count,
+                        "values",
+                        None,
+                    );
+                    stage.advance(count);
+                }
                 vectors.insert(tensor.name.clone(), values);
             }
             Origin::HtScales {
@@ -217,8 +264,39 @@ pub fn prepare_rotations(
                 let signs = codec::generate_signs(options.seed, signs_key, rows);
                 let mut scales = Vec::with_capacity(rows);
                 let mut row = 0;
+                // Associate scale scans with the output weight, not the scale plane.
+                let weight = if stage.is_enabled() {
+                    plan.files.iter().flat_map(|file| &file.tensors).find(|weight| {
+                        matches!(&weight.origin, Origin::Tensor { name } if name == source)
+                    })
+                } else {
+                    None
+                };
                 while row < rows {
                     let take = MATRIX_ROWS.min(rows - row);
+                    if let Some(weight) = weight {
+                        tensor_progress::rows(
+                            &stage,
+                            weight,
+                            "scan HT scales",
+                            "CPU",
+                            row,
+                            take,
+                            false,
+                            false,
+                        );
+                    } else if stage.is_enabled() {
+                        tensor_progress::item(
+                            &stage,
+                            tensor,
+                            "scan HT scales",
+                            "CPU",
+                            row as u64,
+                            rows as u64,
+                            "rows",
+                            None,
+                        );
+                    }
                     let input = snapshot.read_f32(source, (row * cols) as u64, take * cols)?;
                     let block = codec::ht_row_scales(&input, take, cols, &signs[row..row + take])?;
                     ensure!(
@@ -226,6 +304,30 @@ pub fn prepare_rotations(
                         "invalid generated HT row scale"
                     );
                     scales.extend(block);
+                    if let Some(weight) = weight {
+                        tensor_progress::rows(
+                            &stage,
+                            weight,
+                            "scan HT scales",
+                            "CPU",
+                            row,
+                            take,
+                            true,
+                            false,
+                        );
+                    } else if stage.is_enabled() {
+                        tensor_progress::item(
+                            &stage,
+                            tensor,
+                            "scan HT scales",
+                            "CPU",
+                            (row + take) as u64,
+                            rows as u64,
+                            "rows",
+                            None,
+                        );
+                    }
+                    stage.advance((take * cols) as u64);
                     row += take;
                 }
                 vectors.insert(tensor.name.clone(), scales);
@@ -233,6 +335,7 @@ pub fn prepare_rotations(
             _ => {}
         }
     }
+    stage.finish();
     Ok(vectors)
 }
 
@@ -362,20 +465,28 @@ pub fn convert(
     let staging = tempfile::Builder::new()
         .prefix(".bf16-to-hgn-")
         .tempdir_in(parent)?;
+    let vectors = prepare_rotations(snapshot, plan, options, progress)?;
     let stage = progress.stage(
         "Convert passes",
         progress_values(plan, progress, true)?,
         Unit::Values,
     );
-    stage.set_item("Preparing rotations");
-    let vectors = prepare_rotations(snapshot, plan, options)?;
     let mut source_hashes = BTreeMap::new();
     let mut containers = Vec::new();
     for file in &plan.files {
         let mut writer = Writer::create(&staging.path().join(&file.filename), file)?;
         for (index, tensor) in file.tensors.iter().enumerate() {
             if stage.is_enabled() {
-                stage.set_item(&format!("encode {}", tensor.name));
+                tensor_progress::item(
+                    &stage,
+                    tensor,
+                    "encode",
+                    "CPU",
+                    0,
+                    numel(&tensor.shape)?,
+                    "values",
+                    None,
+                );
             }
             match &tensor.origin {
                 Origin::Signs { .. } | Origin::HtScales { .. } => {
@@ -388,6 +499,16 @@ pub fn convert(
                             .extend_from_slice(&half::f16::from_f32(value).to_bits().to_le_bytes());
                     }
                     writer.write_at(index, 0, &bytes)?;
+                    tensor_progress::item(
+                        &stage,
+                        tensor,
+                        "write rotation",
+                        "CPU",
+                        values.len() as u64,
+                        values.len() as u64,
+                        "values",
+                        None,
+                    );
                     stage.advance(values.len() as u64);
                 }
                 Origin::Tensor { name } => {
@@ -510,6 +631,9 @@ fn encode_tensor(
         let mut offset = 0;
         while offset < info.size {
             let len = (info.size - offset).min(COPY_CHUNK as u64) as usize;
+            tensor_progress::item(
+                stage, tensor, "copy", "CPU", offset, info.size, "bytes", None,
+            );
             let bytes = snapshot.read_bytes(&info.name, offset, len)?;
             if info.dtype != Dtype::I64 {
                 for value in bytes.chunks_exact(info.dtype.byte_width() as usize) {
@@ -519,6 +643,9 @@ fn encode_tensor(
             hash.update(&bytes);
             writer.write_at(index, offset, &bytes)?;
             offset += len as u64;
+            tensor_progress::item(
+                stage, tensor, "copy", "CPU", offset, info.size, "bytes", None,
+            );
             stage.advance((len as u64) / info.dtype.byte_width());
         }
         return Ok(format!("{:x}", hash.finalize()));
@@ -544,6 +671,18 @@ fn encode_tensor(
     let mut row = 0;
     while row < rows {
         let take = MATRIX_ROWS.min(rows - row);
+        if stage.is_enabled() {
+            tensor_progress::rows(
+                stage,
+                tensor,
+                "encode",
+                encode_backend(tensor, options),
+                row,
+                take,
+                false,
+                false,
+            );
+        }
         let (raw, values) = read_source_values(snapshot, info, (row * cols) as u64, take * cols)?;
         hash.update(raw);
         let (su, sv) = rotation_slice(tensor, vectors, row, take)?;
@@ -581,6 +720,18 @@ fn encode_tensor(
             );
             writer.write_at(index, row as u64 * stride, &block.codes)?;
         }
+        if stage.is_enabled() {
+            tensor_progress::rows(
+                stage,
+                tensor,
+                "encode",
+                encode_backend(tensor, options),
+                row,
+                take,
+                true,
+                false,
+            );
+        }
         row += take;
         stage.advance((take * cols) as u64);
     }
@@ -592,6 +743,14 @@ pub(crate) fn direct_copy(encoding: Encoding, dtype: Dtype) -> bool {
         (encoding, dtype),
         (Encoding::Bf16, Dtype::Bf16) | (Encoding::F32, Dtype::F32) | (Encoding::I64, Dtype::I64)
     )
+}
+
+fn encode_backend(tensor: &TensorPlan, options: &Options) -> &'static str {
+    if tensor.encoding.ht_bits().is_some() && options.ht_backend == codec::HtBackend::Hip {
+        "HIP"
+    } else {
+        "CPU"
+    }
 }
 
 fn encode_gate_up(
@@ -627,6 +786,18 @@ fn encode_gate_up(
         for band in (0..half_rows).step_by(MATRIX_ROWS) {
             let gate_row = expert * expert_rows + band;
             let up_row = gate_row + half_rows;
+            if stage.is_enabled() {
+                tensor_progress::rows(
+                    stage,
+                    tensor,
+                    "encode",
+                    encode_backend(tensor, options),
+                    gate_row,
+                    MATRIX_ROWS,
+                    false,
+                    true,
+                );
+            }
             let (gate_raw, gate) =
                 read_source_values(snapshot, info, (gate_row * cols) as u64, MATRIX_ROWS * cols)?;
             let (up_raw, up) =
@@ -663,6 +834,18 @@ fn encode_gate_up(
             offset = offset
                 .checked_add(pair_bytes)
                 .context("expert payload offset overflow")?;
+            if stage.is_enabled() {
+                tensor_progress::rows(
+                    stage,
+                    tensor,
+                    "encode",
+                    encode_backend(tensor, options),
+                    gate_row,
+                    MATRIX_ROWS,
+                    true,
+                    true,
+                );
+            }
             stage.advance((2 * MATRIX_ROWS * cols) as u64);
         }
         ensure!(
@@ -747,19 +930,40 @@ fn encode_table(
     let cols = usize::try_from(tensor.shape[2])?;
     let shard_rows = usize::try_from(tensor.shape[1])?;
     let mut absmax = 0.0f32;
-    if stage.is_enabled() {
-        stage.set_item(&format!("{} (scan FP8 scale)", tensor.name));
-    }
-    for name in shards {
+    for (shard, name) in shards.iter().enumerate() {
         let info = &snapshot.tensors()[name];
         let mut row = 0;
         while row < shard_rows {
             let take = TABLE_ROWS.min(shard_rows - row);
+            if stage.is_enabled() {
+                tensor_progress::item(
+                    stage,
+                    tensor,
+                    "scan FP8 scale",
+                    "CPU",
+                    (shard * shard_rows + row) as u64,
+                    (shards.len() * shard_rows) as u64,
+                    "rows",
+                    Some("scan"),
+                );
+            }
             let (_, values) = read_source_values(snapshot, info, (row * cols) as u64, take * cols)?;
             for value in values {
                 absmax = absmax.max(value.abs());
             }
             row += take;
+            if stage.is_enabled() {
+                tensor_progress::item(
+                    stage,
+                    tensor,
+                    "scan FP8 scale",
+                    "CPU",
+                    (shard * shard_rows + row) as u64,
+                    (shards.len() * shard_rows) as u64,
+                    "rows",
+                    Some("scan"),
+                );
+            }
             stage.advance((take * cols) as u64);
         }
     }
@@ -773,15 +977,24 @@ fn encode_table(
         ..QuantMeta::default()
     };
     let mut output_offset = 0;
-    if stage.is_enabled() {
-        stage.set_item(&format!("encode {}", tensor.name));
-    }
-    for name in shards {
+    for (shard, name) in shards.iter().enumerate() {
         let info = &snapshot.tensors()[name];
         let mut hash = Sha256::new();
         let mut row = 0;
         while row < shard_rows {
             let take = TABLE_ROWS.min(shard_rows - row);
+            if stage.is_enabled() {
+                tensor_progress::item(
+                    stage,
+                    tensor,
+                    "encode",
+                    "CPU",
+                    (shard * shard_rows + row) as u64,
+                    (shards.len() * shard_rows) as u64,
+                    "rows",
+                    Some("encode"),
+                );
+            }
             let (raw, values) =
                 read_source_values(snapshot, info, (row * cols) as u64, take * cols)?;
             hash.update(raw);
@@ -793,6 +1006,18 @@ fn encode_table(
             writer.write_at(index, output_offset, &block.codes)?;
             output_offset += block.codes.len() as u64;
             row += take;
+            if stage.is_enabled() {
+                tensor_progress::item(
+                    stage,
+                    tensor,
+                    "encode",
+                    "CPU",
+                    (shard * shard_rows + row) as u64,
+                    (shards.len() * shard_rows) as u64,
+                    "rows",
+                    Some("encode"),
+                );
+            }
             stage.advance((take * cols) as u64);
         }
         hashes.insert(name.clone(), format!("{:x}", hash.finalize()));
