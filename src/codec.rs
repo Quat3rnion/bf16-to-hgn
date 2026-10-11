@@ -89,6 +89,35 @@ pub const NF4_CODEBOOK: [f32; 16] = [
 pub fn q4c_codebook() -> [f32; 16] {
     NF4_CODEBOOK
 }
+/// Execution backend for HT3/HT4 trellis search only.
+/// All rotations, other quantizers, and all decoding remain on the CPU.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum HtBackend {
+    #[default]
+    Cpu,
+    Hip,
+}
+
+impl HtBackend {
+    /// Validate real device availability without encoding a band.
+    pub fn preflight(self) -> Result<()> {
+        match self {
+            Self::Cpu => Ok(()),
+            Self::Hip => {
+                #[cfg(feature = "hip")]
+                {
+                    // SAFETY: preflight takes no pointers and synchronizes native context access.
+                    let result = unsafe { ht_hip_preflight() };
+                    ensure!(result == 0, "HIP HT preflight failed: {}", hip_last_error());
+                    Ok(())
+                }
+                #[cfg(not(feature = "hip"))]
+                bail!("HIP HT backend requires a build with --features hip");
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct QuantMeta<'a> {
@@ -101,6 +130,7 @@ pub struct QuantMeta<'a> {
     pub fp8_scale: f32,
     pub threads: usize,
     pub ht_beam: usize,
+    pub ht_backend: HtBackend,
 }
 
 impl Default for QuantMeta<'_> {
@@ -112,6 +142,7 @@ impl Default for QuantMeta<'_> {
             fp8_scale: 1.0,
             threads: 1,
             ht_beam: 128,
+            ht_backend: HtBackend::Cpu,
         }
     }
 }
@@ -660,6 +691,53 @@ unsafe extern "C" {
     ) -> f32;
 }
 
+#[cfg(feature = "hip")]
+unsafe extern "C" {
+    fn ht_encode_bits_hip(
+        tiles: *const f32,
+        codebook: *const f32,
+        codes: *mut u8,
+        count: c_int,
+        beam: c_int,
+        bits: c_int,
+    ) -> c_int;
+    fn ht_hip_last_error() -> *const std::ffi::c_char;
+    fn ht_hip_preflight() -> c_int;
+}
+
+#[cfg(feature = "hip")]
+fn hip_last_error() -> String {
+    // SAFETY: the ABI returns a thread-local NUL-terminated error string,
+    // valid until this thread's next native HIP call. Copy it immediately.
+    let error = unsafe { ht_hip_last_error() };
+    if error.is_null() {
+        return "native HIP encoder returned no error detail".to_owned();
+    }
+    unsafe { std::ffi::CStr::from_ptr(error) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn validate_ht_backend(meta: &QuantMeta<'_>) -> Result<()> {
+    match meta.ht_backend {
+        HtBackend::Cpu => ensure!(
+            meta.ht_beam <= 4096,
+            "HT beam must be in 0..=4096 (0 is full-state search)"
+        ),
+        HtBackend::Hip => {
+            ensure!(
+                (1..=256).contains(&meta.ht_beam),
+                "HIP HT beam must be in 1..=256; beam 0/full-state and larger beams require CPU"
+            );
+            ensure!(
+                cfg!(feature = "hip"),
+                "HIP HT backend requires a build with --features hip"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn pack_ht_symbols(symbols: &[u8], bits: usize) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(symbols.len() / 8 * bits);
     let mut word = 0u64;
@@ -719,28 +797,50 @@ fn encode_ht_tiles(tiles: &[f32], meta: &QuantMeta<'_>, bits: usize) -> Result<V
         tiles.iter().all(|x| x.is_finite() && x.abs() <= 1.0e17),
         "HT values exceed finite cost range"
     );
-    ensure!(
-        meta.ht_beam <= 4096,
-        "HT beam must be in 0..=4096 (0 is full-state search)"
-    );
+    validate_ht_backend(meta)?;
     ensure!(meta.threads > 0, "HT thread count must be positive");
     let threads = c_int::try_from(meta.threads).context("HT thread count exceeds C ABI range")?;
     let mut symbols = vec![0u8; tiles.len()];
-    // SAFETY: each immutable input has count*256 floats, the codebook has
-    // 65536 floats, and the exclusive output has count*256 bytes. All native
-    // signed-int tile-index products fit; buffers live through every worker.
-    let result = unsafe {
-        ht_encode_bits(
-            tiles.as_ptr(),
-            ht_codebook().as_ptr(),
-            symbols.as_mut_ptr(),
-            count,
-            threads,
-            meta.ht_beam as c_int,
-            bits as c_int,
-        )
-    };
-    ensure!(result == 0, "native HT trellis encoder rejected parameters");
+    match meta.ht_backend {
+        HtBackend::Cpu => {
+            // SAFETY: inputs contain count*256 floats and 65536 codebook
+            // values; exclusive output contains count*256 bytes. Signed-int
+            // tile products fit and all buffers outlive the native workers.
+            let result = unsafe {
+                ht_encode_bits(
+                    tiles.as_ptr(),
+                    ht_codebook().as_ptr(),
+                    symbols.as_mut_ptr(),
+                    count,
+                    threads,
+                    meta.ht_beam as c_int,
+                    bits as c_int,
+                )
+            };
+            ensure!(result == 0, "native HT trellis encoder rejected parameters");
+        }
+        HtBackend::Hip => {
+            #[cfg(feature = "hip")]
+            {
+                // SAFETY: the same validated host buffer sizes apply. Native
+                // HIP copies and synchronizes before returning; it does not
+                // retain the caller's tile/output pointers.
+                let result = unsafe {
+                    ht_encode_bits_hip(
+                        tiles.as_ptr(),
+                        ht_codebook().as_ptr(),
+                        symbols.as_mut_ptr(),
+                        count,
+                        meta.ht_beam as c_int,
+                        bits as c_int,
+                    )
+                };
+                ensure!(result == 0, "HIP HT encoding failed: {}", hip_last_error());
+            }
+            #[cfg(not(feature = "hip"))]
+            bail!("HIP HT backend requires a build with --features hip");
+        }
+    }
     ensure!(
         symbols
             .iter()
@@ -763,6 +863,7 @@ pub fn encode_rows(
 ) -> Result<EncodedBlock> {
     if encoding.ht_bits().is_some() {
         ht_band_value_count(rows, cols, false)?;
+        validate_ht_backend(meta)?;
     }
     let count = element_count(input, rows, cols)?;
     payload_layout(encoding, rows, cols)?;
@@ -866,9 +967,12 @@ pub fn encode_ht_gate_up_bands(
         "gate and up must share the same input signs"
     );
     ensure!(
-        gate_meta.threads == up_meta.threads && gate_meta.ht_beam == up_meta.ht_beam,
+        gate_meta.threads == up_meta.threads
+            && gate_meta.ht_beam == up_meta.ht_beam
+            && gate_meta.ht_backend == up_meta.ht_backend,
         "paired HT bands must use the same encoder settings"
     );
+    validate_ht_backend(gate_meta)?;
     let mut tiles = vec![0.0; paired_count];
     rotate_into(
         gate,
@@ -2006,5 +2110,454 @@ mod tests {
             decode_ht_gate_up_band(Encoding::Ht3, &mixed, cols, false, &nonunit_meta).unwrap();
         assert_eq!(decoded[0], -442.0); // Decoder permits legal non-unit f16 vectors.
         assert!(encode_rows(Encoding::Ht3, &gate, 128, cols, &nonunit_meta).is_err());
+    }
+}
+
+#[cfg(test)]
+mod backend_tests {
+    use super::*;
+
+    #[cfg(feature = "hip")]
+    unsafe extern "C" {
+        fn hipSetDevice(device: c_int) -> c_int;
+    }
+
+    #[test]
+    fn ht_backend_defaults_and_beam_boundaries() {
+        assert_eq!(HtBackend::default(), HtBackend::Cpu);
+        assert_eq!(QuantMeta::default().ht_backend, HtBackend::Cpu);
+        for beam in [0, 1, 256, 4096] {
+            assert!(validate_ht_backend(&QuantMeta {
+                ht_beam: beam,
+                ..Default::default()
+            })
+            .is_ok());
+        }
+        assert!(validate_ht_backend(&QuantMeta {
+            ht_beam: 4097,
+            ..Default::default()
+        })
+        .is_err());
+        for beam in [0, 257, 4096, usize::MAX] {
+            let meta = QuantMeta {
+                ht_backend: HtBackend::Hip,
+                ht_beam: beam,
+                ..Default::default()
+            };
+            assert!(validate_ht_backend(&meta)
+                .unwrap_err()
+                .to_string()
+                .contains("1..=256"));
+        }
+        for beam in [1, 8, 128, 256] {
+            let meta = QuantMeta {
+                ht_backend: HtBackend::Hip,
+                ht_beam: beam,
+                ..Default::default()
+            };
+            assert_eq!(validate_ht_backend(&meta).is_ok(), cfg!(feature = "hip"));
+        }
+    }
+
+    #[test]
+    fn non_ht_quantizers_and_decoding_ignore_execution_backend() {
+        let input: Vec<f32> = (0..128 * 160)
+            .map(|i| (i % 37) as f32 / 32.0 - 0.5)
+            .collect();
+        let su = vec![1.0; 128];
+        let sv = vec![1.0; 128];
+        let cpu = QuantMeta {
+            su: &su,
+            sv: &sv,
+            ht_beam: 0,
+            ..Default::default()
+        };
+        let hip = QuantMeta {
+            ht_backend: HtBackend::Hip,
+            ..cpu
+        };
+        for encoding in [
+            Encoding::Bf16,
+            Encoding::F16,
+            Encoding::F32,
+            Encoding::Q4Cp,
+            Encoding::Q6G64,
+            Encoding::Q8G64,
+            Encoding::Fp8G128,
+            Encoding::I4r,
+        ] {
+            let cols = if encoding == Encoding::Fp8G128 {
+                160
+            } else {
+                128
+            };
+            let values = &input[..128 * cols];
+            let expected = encode_rows(encoding, values, 128, cols, &cpu).unwrap();
+            assert_eq!(
+                encode_rows(encoding, values, 128, cols, &hip).unwrap(),
+                expected
+            );
+            assert_eq!(
+                decode_rows(encoding, &expected, 128, cols, &hip).unwrap(),
+                decode_rows(encoding, &expected, 128, cols, &cpu).unwrap()
+            );
+        }
+        for encoding in [Encoding::Ht, Encoding::Ht3] {
+            let bytes = payload_layout(encoding, 128, 128).unwrap().len as usize;
+            let block = EncodedBlock {
+                codes: vec![0; bytes],
+                scales: Vec::new(),
+            };
+            assert_eq!(
+                decode_rows(encoding, &block, 128, 128, &hip).unwrap(),
+                decode_rows(encoding, &block, 128, 128, &cpu).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn paired_bands_reject_different_backends_before_execution() {
+        let input = vec![0.0; 128 * 128];
+        let su = vec![1.0; 128];
+        let sv = vec![1.0; 128];
+        let cpu = QuantMeta {
+            su: &su,
+            sv: &sv,
+            ..Default::default()
+        };
+        let hip = QuantMeta {
+            ht_backend: HtBackend::Hip,
+            ..cpu
+        };
+        for encoding in [Encoding::Ht, Encoding::Ht3] {
+            let error = encode_ht_gate_up_bands(encoding, &input, &input, 128, &cpu, &hip)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("same encoder settings"));
+        }
+    }
+
+    #[cfg(not(feature = "hip"))]
+    #[test]
+    fn hip_dispatch_without_feature_is_an_explicit_error() {
+        assert!(HtBackend::Hip
+            .preflight()
+            .unwrap_err()
+            .to_string()
+            .contains("--features hip"));
+        let hip = QuantMeta {
+            ht_backend: HtBackend::Hip,
+            ht_beam: 8,
+            ..Default::default()
+        };
+        for bits in [3, 4] {
+            let error = encode_ht_tiles(&[0.0; 256], &hip, bits)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("--features hip"));
+        }
+        let su = vec![1.0; 128];
+        let sv = vec![1.0; 128];
+        let hip = QuantMeta {
+            su: &su,
+            sv: &sv,
+            ..hip
+        };
+        let input = vec![0.0; 128 * 128];
+        for encoding in [Encoding::Ht, Encoding::Ht3] {
+            assert!(encode_rows(encoding, &input, 128, 128, &hip)
+                .unwrap_err()
+                .to_string()
+                .contains("--features hip"));
+            assert!(
+                encode_ht_gate_up_bands(encoding, &input, &input, 128, &hip, &hip)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("--features hip")
+            );
+        }
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn hip_native_rejects_invalid_parameters_without_a_device() {
+        let input = [0.0; 256];
+        let codebook = ht_codebook();
+        let mut output = [0x55; 256];
+        // A count whose complete values exceed the CPU-compatible index range
+        // is rejected by Rust without passing undersized buffers to native HIP.
+        assert!(native_ht_tile_count((c_int::MAX as usize / 256 + 1) * 256).is_err());
+        // SAFETY: an empty native call performs no accesses or device work.
+        let result = unsafe {
+            ht_encode_bits_hip(
+                input.as_ptr(),
+                codebook.as_ptr(),
+                output.as_mut_ptr(),
+                0,
+                1,
+                4,
+            )
+        };
+        assert_eq!(result, 0);
+        assert_eq!(output, [0x55; 256]);
+        for (count, beam, bits) in [(-1, 1, 4), (1, 0, 4), (1, 257, 4), (1, 1, 2), (1, 1, 5)] {
+            // SAFETY: invalid scalar parameters must be rejected before any
+            // buffer access; the valid-count cases have complete host buffers.
+            let result = unsafe {
+                ht_encode_bits_hip(
+                    input.as_ptr(),
+                    codebook.as_ptr(),
+                    output.as_mut_ptr(),
+                    count,
+                    beam,
+                    bits,
+                )
+            };
+            assert_ne!(result, 0, "count={count} beam={beam} bits={bits}");
+            assert!(!hip_last_error().is_empty());
+            assert_eq!(output, [0x55; 256]);
+        }
+        // SAFETY: null pointers are an explicitly rejected ABI input.
+        let result = unsafe {
+            ht_encode_bits_hip(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                1,
+                1,
+                4,
+            )
+        };
+        assert_ne!(result, 0);
+        assert!(!hip_last_error().is_empty());
+        // These nonnull addresses cannot contain even one tile/codebook.
+        // The native ABI checks address-plus-extent overflow before device work.
+        // Unlike a large valid count paired with a tiny slice, these addresses
+        // are provably rejected.
+        for (tiles, book, codes) in [
+            (
+                usize::MAX as *const f32,
+                codebook.as_ptr(),
+                output.as_mut_ptr(),
+            ),
+            (
+                input.as_ptr(),
+                usize::MAX as *const f32,
+                output.as_mut_ptr(),
+            ),
+            (input.as_ptr(), codebook.as_ptr(), usize::MAX as *mut u8),
+        ] {
+            // SAFETY: one buffer address overflows even a single-tile extent;
+            // native rejects it before accessing any pointer or creating a device.
+            let result = unsafe { ht_encode_bits_hip(tiles, book, codes, 1, 1, 4) };
+            assert_ne!(result, 0);
+            assert!(hip_last_error().contains("overflows the host address space"));
+            assert_eq!(output, [0x55; 256]);
+        }
+    }
+
+    #[cfg(feature = "hip")]
+    fn native_symbols(
+        backend: HtBackend,
+        tiles: &[f32],
+        codebook: &[f32],
+        beam: usize,
+        bits: usize,
+    ) -> Vec<u8> {
+        let count = native_ht_tile_count(tiles.len()).unwrap();
+        assert_eq!(codebook.len(), 65536);
+        let mut symbols = vec![0x55; tiles.len()];
+        // SAFETY: checked complete tile buffers, full state codebook, exclusive
+        // output and bounded ABI scalars; both implementations synchronize.
+        let result = unsafe {
+            match backend {
+                HtBackend::Cpu => ht_encode_bits(
+                    tiles.as_ptr(),
+                    codebook.as_ptr(),
+                    symbols.as_mut_ptr(),
+                    count,
+                    1,
+                    beam as c_int,
+                    bits as c_int,
+                ),
+                HtBackend::Hip => ht_encode_bits_hip(
+                    tiles.as_ptr(),
+                    codebook.as_ptr(),
+                    symbols.as_mut_ptr(),
+                    count,
+                    beam as c_int,
+                    bits as c_int,
+                ),
+            }
+        };
+        assert_eq!(
+            result,
+            0,
+            "backend={backend:?} beam={beam} bits={bits}: {}",
+            hip_last_error()
+        );
+        assert!(symbols
+            .iter()
+            .all(|&symbol| usize::from(symbol) < 1 << bits));
+        symbols
+    }
+
+    #[cfg(feature = "hip")]
+    fn tile_corpus(bits: usize) -> Vec<f32> {
+        let mut tiles = Vec::new();
+        tiles.extend((0..256).map(|i| ((i * 73 % 509) as f32 - 254.0) / 128.0));
+        tiles.extend((0..256).map(|i| if i % 2 == 0 { 0.0 } else { -0.0 }));
+        tiles.extend((0..256).map(|i| {
+            [
+                0.0,
+                f32::from_bits(1),
+                -f32::from_bits(1),
+                f32::MIN_POSITIVE,
+                1.0e-20,
+                -1.0e-20,
+                1.0e-19,
+                -1.0e-19,
+            ][i % 8]
+        }));
+        tiles.extend((0..256).map(|i| {
+            [
+                -0.5,
+                f32::from_bits(0xbf000001),
+                -0.25,
+                0.25,
+                0.5,
+                f32::from_bits(0x3f000001),
+            ][i % 6]
+        }));
+        tiles.extend([-3.453125; 256]);
+        // Decode a closed nontrivial byte stream as an exact cyclic target.
+        // HT3 exercises the partial-symbol 13-bit boundary closure.
+        let packed: Vec<u8> = (0..8 * bits)
+            .flat_map(|i| (0x6958e34bu32.wrapping_mul(i as u32 + 1)).to_le_bytes())
+            .collect();
+        let mut closed = [0.0; 256];
+        decode_ht_tile(&packed, bits, &mut closed);
+        tiles.extend(closed);
+        tiles
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    #[ignore = "requires an available gfx1151 HIP device; exact CPU/GPU corpus comparison"]
+    fn hip_native_corpus_matches_cpu_ht3_ht4_and_closure() {
+        HtBackend::Hip.preflight().unwrap();
+        let mut inject_prior_runtime_failure = true;
+        for bits in [3, 4] {
+            let tiles = tile_corpus(bits);
+            for beam in [1, 7, 8, 128, 256] {
+                let cpu = native_symbols(HtBackend::Cpu, &tiles, ht_codebook(), beam, bits);
+                if inject_prior_runtime_failure {
+                    // SAFETY: HIP accepts a scalar device ordinal and rejects
+                    // a negative ordinal without changing the current device.
+                    // Leave that reported runtime error pending deliberately.
+                    assert_ne!(unsafe { hipSetDevice(-1) }, 0);
+                    inject_prior_runtime_failure = false;
+                }
+                let hip = native_symbols(HtBackend::Hip, &tiles, ht_codebook(), beam, bits);
+                assert_eq!(hip, cpu, "raw symbols: bits={bits} beam={beam}");
+                assert_eq!(pack_ht_symbols(&hip, bits), pack_ht_symbols(&cpu, bits));
+            }
+        }
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    #[ignore = "requires an available gfx1151 HIP device; every CLI beam, not only powers of two"]
+    fn hip_every_supported_beam_matches_cpu() {
+        HtBackend::Hip.preflight().unwrap();
+        let tile: Vec<f32> = (0..256)
+            .map(|i| ((i * 31 % 127) as f32 - 63.0) / 32.0)
+            .collect();
+        for bits in [3, 4] {
+            for beam in 1..=256 {
+                assert_eq!(
+                    native_symbols(HtBackend::Hip, &tile, ht_codebook(), beam, bits),
+                    native_symbols(HtBackend::Cpu, &tile, ht_codebook(), beam, bits),
+                    "bits={bits} beam={beam}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    #[ignore = "requires an available gfx1151 HIP device; persistent cache and batch boundary"]
+    fn hip_native_batches_and_changed_codebooks_match_cpu() {
+        HtBackend::Hip.preflight().unwrap();
+        // 65 tiles crosses the native bounded 64-tile batch without large buffers.
+        let tiles: Vec<f32> = (0..65 * 256)
+            .map(|i| ((i * 17 % 97) as f32 - 48.0) / 32.0)
+            .collect();
+        let mut codebook = ht_codebook().to_vec();
+        for bits in [3, 4] {
+            assert_eq!(
+                native_symbols(HtBackend::Hip, &tiles, &codebook, 8, bits),
+                native_symbols(HtBackend::Cpu, &tiles, &codebook, 8, bits)
+            );
+            // Modify the same allocation: pointer identity is not a cache key.
+            codebook.iter_mut().for_each(|value| *value = -*value);
+            assert_eq!(
+                native_symbols(HtBackend::Hip, &tiles, &codebook, 8, bits),
+                native_symbols(HtBackend::Cpu, &tiles, &codebook, 8, bits)
+            );
+            let tiny_tiles = vec![1.0e-20; 256];
+            codebook
+                .iter_mut()
+                .enumerate()
+                .for_each(|(i, value)| *value = (i % 17) as f32 * 1.0e-21);
+            assert_eq!(
+                native_symbols(HtBackend::Hip, &tiny_tiles, &codebook, 128, bits),
+                native_symbols(HtBackend::Cpu, &tiny_tiles, &codebook, 128, bits)
+            );
+            codebook.copy_from_slice(ht_codebook());
+        }
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    #[ignore = "requires an available gfx1151 HIP device; public rotation and paired-band path"]
+    fn hip_public_bands_and_pairs_match_cpu() {
+        HtBackend::Hip.preflight().unwrap();
+        let cols = 128;
+        let su = generate_signs(7, "hip-test-su", cols);
+        let gate: Vec<f32> = (0..128 * cols)
+            .map(|i| ((i * 13 % 61) as f32 - 30.0) / 32.0)
+            .collect();
+        let up: Vec<f32> = (0..128 * cols)
+            .map(|i| ((i * 29 % 71) as f32 - 35.0) / 64.0)
+            .collect();
+        let gate_signs = generate_signs(11, "hip-test-gate", 128);
+        let up_signs = generate_signs(19, "hip-test-up", 128);
+        let gate_sv = ht_row_scales(&gate, 128, cols, &gate_signs).unwrap();
+        let up_sv = ht_row_scales(&up, 128, cols, &up_signs).unwrap();
+        for encoding in [Encoding::Ht, Encoding::Ht3] {
+            for beam in [1, 8, 128, 256] {
+                let cpu = QuantMeta {
+                    su: &su,
+                    sv: &gate_sv,
+                    ht_beam: beam,
+                    ..Default::default()
+                };
+                let cpu_up = QuantMeta { sv: &up_sv, ..cpu };
+                let hip = QuantMeta {
+                    ht_backend: HtBackend::Hip,
+                    ..cpu
+                };
+                let hip_up = QuantMeta { sv: &up_sv, ..hip };
+                assert_eq!(
+                    encode_rows(encoding, &gate, 128, cols, &hip).unwrap(),
+                    encode_rows(encoding, &gate, 128, cols, &cpu).unwrap()
+                );
+                assert_eq!(
+                    encode_ht_gate_up_bands(encoding, &gate, &up, cols, &hip, &hip_up).unwrap(),
+                    encode_ht_gate_up_bands(encoding, &gate, &up, cols, &cpu, &cpu_up).unwrap()
+                );
+            }
+        }
     }
 }

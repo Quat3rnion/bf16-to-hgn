@@ -1,8 +1,12 @@
 mod support;
 
 use anyhow::Result;
+#[cfg(feature = "hip")]
+use bf16_to_hgn::codec::Encoding;
 use bf16_to_hgn::{
-    architecture, container, conversion,
+    architecture,
+    codec::HtBackend,
+    container, conversion,
     hf::Snapshot,
     manifest::{Options, OutputProfile},
     source::{self, SourceKind, SourceOptions, TensorSource},
@@ -214,7 +218,18 @@ fn public_cli_has_no_structural_fixture_bypass() -> Result<()> {
 fn legacy_options_default_to_v2_and_profiles_serialize_explicitly() -> Result<()> {
     let old: Options = serde_json::from_str(r#"{"seed":7,"threads":1,"ht_beam":8}"#)?;
     assert_eq!(old.profile, OutputProfile::V2);
+    assert_eq!(old.ht_backend, HtBackend::Cpu);
     assert_eq!(serde_json::to_value(old)?["profile"], "v2");
+    let hip = Options {
+        ht_backend: HtBackend::Hip,
+        ..options()
+    };
+    hip.validate()?; // Semantic validation must not require a GPU or the feature.
+    assert_eq!(serde_json::to_value(hip)?["ht_backend"], "hip");
+    assert!(serde_json::from_str::<Options>(
+        r#"{"seed":7,"threads":1,"ht_beam":8,"ht_backend":"cuda"}"#
+    )
+    .is_err());
     assert_ne!(OutputProfile::V2.policy(), OutputProfile::Ht43.policy());
     Ok(())
 }
@@ -464,5 +479,201 @@ fn assert_no_staging(parent: &std::path::Path) -> Result<()> {
         .file_name()
         .to_string_lossy()
         .starts_with(".bf16-to-hgn-")));
+    Ok(())
+}
+
+#[test]
+fn verification_accepts_hip_metadata_and_schema2_without_backend() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let (snapshot, plan) = support::fixture(temporary.path())?;
+    let output = temporary.path().join("converted");
+    let manifest = conversion::convert(&snapshot, &plan, &output, &options())?;
+    assert_eq!(manifest.schema, 2);
+    assert_eq!(manifest.options.ht_backend, HtBackend::Cpu);
+    assert_eq!(manifest.plan, plan);
+    let current = verify::verify(&snapshot, &plan, &output)?;
+    let mut json = serde_json::to_value(&manifest)?;
+    json["options"]["ht_backend"] = serde_json::json!("hip");
+    fs::write(
+        output.join("conversion-manifest.json"),
+        serde_json::to_vec_pretty(&json)?,
+    )?;
+    verify::verify(&snapshot, &plan, &output)?;
+    json["options"]
+        .as_object_mut()
+        .expect("options object")
+        .remove("ht_backend");
+    fs::write(
+        output.join("conversion-manifest.json"),
+        serde_json::to_vec_pretty(&json)?,
+    )?;
+    // Exercise the full canonical manifest and fresh-plan verification gate,
+    // not only Options deserialization. The genuine CPU payloads are unchanged.
+    let legacy = verify::verify(&snapshot, &plan, &output)?;
+    assert_eq!(legacy.source_tensors, current.source_tensors);
+    assert_eq!(legacy.output_tensors, current.output_tensors);
+    assert_eq!(
+        serde_json::to_value(&legacy.errors)?,
+        serde_json::to_value(&current.errors)?
+    );
+    json["options"]["unknown_backend_setting"] = serde_json::json!(1);
+    fs::write(
+        output.join("conversion-manifest.json"),
+        serde_json::to_vec_pretty(&json)?,
+    )?;
+    let error = verify::verify(&snapshot, &plan, &output)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("unknown or noncanonical manifest fields"));
+    json["options"]
+        .as_object_mut()
+        .expect("options object")
+        .remove("unknown_backend_setting");
+    json["plan"]["architecture"] = serde_json::json!("not-the-fresh-source-plan");
+    fs::write(
+        output.join("conversion-manifest.json"),
+        serde_json::to_vec_pretty(&json)?,
+    )?;
+    let error = verify::verify(&snapshot, &plan, &output)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("manifest plan differs from the fresh source plan"));
+    Ok(())
+}
+
+#[cfg(not(feature = "hip"))]
+#[test]
+fn hip_conversion_requires_feature_before_staging_or_source_open() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let (snapshot, plan) = support::fixture(temporary.path())?;
+    let output = temporary.path().join("converted");
+    let hip = Options {
+        ht_backend: HtBackend::Hip,
+        ..options()
+    };
+    let error = conversion::convert(&snapshot, &plan, &output, &hip).unwrap_err();
+    assert!(error.to_string().contains("--features hip"));
+    assert!(!output.exists());
+    assert_no_staging(temporary.path())?;
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_bf16-to-hgn"))
+        .args(["convert", "--ht-backend", "hip", "--source"])
+        .arg(temporary.path().join("missing-source"))
+        .arg("--output")
+        .arg(&output)
+        .output()?;
+    assert_eq!(result.status.code(), Some(2));
+    assert!(String::from_utf8(result.stderr)?.contains("--features hip"));
+    assert!(result.stdout.is_empty());
+    assert!(!output.exists());
+    assert_no_staging(temporary.path())?;
+    Ok(())
+}
+
+#[test]
+fn describing_hip_does_not_initialize_a_device_or_bypass_architecture() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let (snapshot, _) = support::fixture(temporary.path())?;
+    for command in ["inspect", "plan", "convert"] {
+        let mut cli = std::process::Command::new(env!("CARGO_BIN_EXE_bf16-to-hgn"));
+        cli.args([command, "--ht-backend", "hip", "--source"])
+            .arg(&snapshot.root);
+        if command == "convert" {
+            cli.arg("--dry-run")
+                .arg("--output")
+                .arg(temporary.path().join("converted"));
+        }
+        let result = cli.output()?;
+        assert_eq!(result.status.code(), Some(2)); // Structural config remains rejected.
+        let error = String::from_utf8(result.stderr)?;
+        assert!(!error.contains("--features hip"));
+        assert!(!error.contains("HIP HT preflight"));
+        assert!(result.stdout.is_empty());
+    }
+    assert_no_staging(temporary.path())?;
+    Ok(())
+}
+
+#[cfg(feature = "hip")]
+#[test]
+#[ignore = "requires an available gfx1151 HIP device; encodes and publishes real tiny files"]
+fn hip_tiny_conversion_matches_cpu_all_containers_and_verifies() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let (snapshot, plan) = support::hip_fixture(temporary.path())?;
+    assert!(plan
+        .files
+        .iter()
+        .flat_map(|file| &file.tensors)
+        .any(|t| t.encoding == Encoding::Ht3));
+    assert!(plan
+        .files
+        .iter()
+        .flat_map(|file| &file.tensors)
+        .any(|t| t.encoding == Encoding::Ht));
+    let mut baseline = None;
+    for backend in [HtBackend::Cpu, HtBackend::Hip] {
+        let name = if backend == HtBackend::Cpu {
+            "cpu"
+        } else {
+            "hip"
+        };
+        let output = temporary.path().join(name);
+        let opts = Options {
+            profile: OutputProfile::Ht43,
+            ht_backend: backend,
+            ..options()
+        };
+        let manifest = conversion::convert(&snapshot, &plan, &output, &opts)?;
+        assert_eq!(manifest.options.ht_backend, backend);
+        verify::verify(&snapshot, &plan, &output)?;
+        if let Some(cpu) = &baseline {
+            let cpu: &bf16_to_hgn::manifest::Manifest = cpu;
+            assert_eq!(cpu.containers, manifest.containers);
+            assert_eq!(cpu.sources, manifest.sources);
+            assert_eq!(cpu.assets, manifest.assets);
+            for container in &manifest.containers {
+                assert_eq!(
+                    fs::read(temporary.path().join("cpu").join(&container.filename))?,
+                    fs::read(output.join(&container.filename))?,
+                    "{}",
+                    container.filename
+                );
+            }
+        } else {
+            baseline = Some(manifest);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn backend_selection_preserves_semantic_option_limits() -> Result<()> {
+    for backend in [HtBackend::Cpu, HtBackend::Hip] {
+        for beam in [1, 256] {
+            Options {
+                ht_backend: backend,
+                ht_beam: beam,
+                ..options()
+            }
+            .validate()?;
+        }
+        for beam in [0, 257, usize::MAX] {
+            assert!(Options {
+                ht_backend: backend,
+                ht_beam: beam,
+                ..options()
+            }
+            .validate()
+            .is_err());
+        }
+        for threads in [0, 65, usize::MAX] {
+            assert!(Options {
+                ht_backend: backend,
+                threads,
+                ..options()
+            }
+            .validate()
+            .is_err());
+        }
+    }
     Ok(())
 }

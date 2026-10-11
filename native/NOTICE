@@ -16,6 +16,15 @@ Local modifications preserve the C ABI and beam-search ordering:
   with HT_TRELLIS_FORCE_SCALAR; the latter does not force comparator fallback.
 The original Apache-2.0 attribution and license are retained.
 
+ht_trellis_hip.hip implements the same two-pass beam-search semantics on AMD
+gfx1151 through HIP, under the accompanying Apache-2.0 license. It retains
+the host codebook, separate binary32 operations, parent-position ties and
+partial-symbol cyclic closure. Its independently implemented device selection
+preserves the ordinary libstdc++ 16 introselect permutation, including the
+heap fallback; it is not a copied libstdc++ source file.
+tests/hip_selection.hip differentially checks complete device permutations
+against the installed standard-library implementation.
+
 The Rust storage layouts and golden test vectors follow jtsylve/hgn-spec
 1.1.0 at commit 79e75fd4ae7642478823525b0a3212951f584af5:
 https://github.com/jtsylve/hgn-spec/tree/79e75fd4ae7642478823525b0a3212951f584af5

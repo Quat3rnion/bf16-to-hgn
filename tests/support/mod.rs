@@ -210,6 +210,40 @@ pub fn fixture(parent: &Path) -> Result<(Snapshot, ConversionPlan)> {
     Ok((Snapshot::open(&source)?, plan))
 }
 
+/// Full tiny publication fixture with legal 2-D HT4/HT3 matrices and sidecars.
+/// Compact expert source axes are folded, never admitted as fake fused HGN shapes.
+pub fn hip_fixture(parent: &Path) -> Result<(Snapshot, ConversionPlan)> {
+    let (snapshot, mut plan) = fixture(parent)?;
+    for tensor in &mut plan.files[0].tensors {
+        match tensor.name.as_str() {
+            "fixture.experts.gate_up.weight" => {
+                tensor.shape = vec![2 * 256, 128];
+                tensor.encoding = Encoding::Ht3;
+            }
+            "fixture.experts.down.weight" => {
+                tensor.shape = vec![2 * 128, 128];
+                tensor.encoding = Encoding::Ht;
+            }
+            "fixture.experts.gate_up.svh" => {
+                tensor.shape = vec![2 * 256];
+                tensor.origin = Origin::HtScales {
+                    tensor: "fixture.experts.gate_up".into(),
+                    signs_key: tensor.name.clone(),
+                };
+            }
+            "fixture.experts.down.svh" => {
+                tensor.shape = vec![2 * 128];
+                tensor.origin = Origin::HtScales {
+                    tensor: "fixture.experts.down".into(),
+                    signs_key: tensor.name.clone(),
+                };
+            }
+            _ => {}
+        }
+    }
+    Ok((snapshot, plan))
+}
+
 /// Small canonical matrices exercising HT4/HT3 and Q8G64 without pretending to
 /// be an engine-compatible Flash-Next checkpoint or bypassing its planner.
 pub fn matrix_fixture(parent: &Path, profile: OutputProfile) -> Result<(Snapshot, ConversionPlan)> {

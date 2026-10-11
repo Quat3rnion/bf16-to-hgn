@@ -1,4 +1,5 @@
 use crate::{
+    codec::HtBackend,
     container::{Entry, Fingerprint, Layout},
     hf::TensorInfo,
     source::SourceKind,
@@ -29,6 +30,9 @@ pub struct Options {
     pub seed: u64,
     pub threads: usize,
     pub ht_beam: usize,
+    /// Trellis execution backend; decoding and verification are backend-independent.
+    #[serde(default)]
+    pub ht_backend: HtBackend,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -37,6 +41,7 @@ impl Default for Options {
             seed: 0,
             threads: 1,
             ht_beam: 128,
+            ht_backend: HtBackend::Cpu,
         }
     }
 }
@@ -51,6 +56,13 @@ impl Options {
             "HT beam must be in 1..=256"
         );
         Ok(())
+    }
+
+    /// Check real encoding availability before creating staging/output files.
+    /// `validate` deliberately remains device-independent for plans and verification.
+    pub fn validate_for_execution(&self) -> anyhow::Result<()> {
+        self.validate()?;
+        self.ht_backend.preflight()
     }
 }
 

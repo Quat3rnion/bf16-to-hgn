@@ -348,7 +348,7 @@ pub fn convert(
         cfg!(any(target_os = "linux", target_os = "macos")),
         "atomic no-clobber publication is supported on Linux/macOS only"
     );
-    options.validate()?;
+    options.validate_for_execution()?;
     let expected_sources = validate_plan(snapshot, plan)?;
     validate_ple(snapshot, plan)?;
     snapshot.check_unchanged()?;
@@ -525,6 +525,7 @@ fn encode_tensor(
             sv,
             threads: options.threads,
             ht_beam: options.ht_beam,
+            ht_backend: options.ht_backend,
             ..QuantMeta::default()
         };
         let block = codec::encode_rows(tensor.encoding, &values, take, cols, &meta)
@@ -610,6 +611,7 @@ fn encode_gate_up(
                 sv: gate_sv,
                 threads: options.threads,
                 ht_beam: options.ht_beam,
+                ht_backend: options.ht_backend,
                 ..QuantMeta::default()
             };
             let up_meta = QuantMeta {
@@ -732,6 +734,7 @@ fn encode_table(
         fp8_scale: scale,
         threads: options.threads,
         ht_beam: options.ht_beam,
+        ht_backend: options.ht_backend,
         ..QuantMeta::default()
     };
     let mut output_offset = 0;

@@ -172,10 +172,20 @@ fn read_manifest(path: &Path, plan: &ConversionPlan) -> Result<Manifest> {
     let manifest = Manifest::deserialize(&json).context("invalid conversion manifest")?;
     // Shared serde types also serve the writer. Reject fields those types would
     // otherwise silently ignore, including unknown fields in nested records.
-    ensure!(
-        serde_json::to_value(&manifest)? == json,
-        "unknown or noncanonical manifest fields"
-    );
+    // Schema2 predates backend selection: omit only the newly defaulted field
+    // when comparing an old manifest, without relaxing any other canonicality.
+    let mut canonical = serde_json::to_value(&manifest)?;
+    if manifest.schema == 2
+        && json["options"]
+            .as_object()
+            .is_some_and(|options| !options.contains_key("ht_backend"))
+    {
+        canonical["options"]
+            .as_object_mut()
+            .expect("serialized Options is an object")
+            .remove("ht_backend");
+    }
+    ensure!(canonical == json, "unknown or noncanonical manifest fields");
     ensure!(manifest.schema == 2, "unsupported manifest schema");
     ensure!(manifest.tool == "bf16-to-hgn", "unexpected manifest tool");
     ensure!(

@@ -12,12 +12,12 @@
 //! and rotation. Source reads/generation, sign/RMS preparation, warmup, hashing,
 //! printing, result-vector allocation, and output destruction are excluded.
 //! All returned code/scale bytes, padding, codebook/global scale, and rotation
-//! side planes are fingerprinted; every iteration and thread count must agree.
+//! side planes are fingerprinted; every iteration, thread count and backend must agree.
 
 use anyhow::{bail, ensure, Context, Result};
 use bf16_to_hgn::codec::{
     encode_ht_gate_up_bands, encode_rows, fp8_decode, generate_signs, ht_row_scales,
-    payload_layout, EncodedBlock, Encoding, QuantMeta, NF4_CODEBOOK,
+    payload_layout, EncodedBlock, Encoding, HtBackend, QuantMeta, NF4_CODEBOOK,
 };
 use bf16_to_hgn::hf::{Dtype, Snapshot};
 use clap::{Parser, ValueEnum};
@@ -158,6 +158,9 @@ struct Args {
     /// Comma-separated list of 1 and/or 2; runs sequentially and checks equality.
     #[arg(long, value_delimiter = ',', default_value = "1")]
     threads: Vec<usize>,
+    /// HT backend axis; sequential runs must produce identical payload/side-plane hashes.
+    #[arg(long, value_enum, value_delimiter = ',', default_value = "cpu")]
+    backends: Vec<HtBackend>,
     /// Timed calls per sample; retained outputs are limited to 128 MiB.
     #[arg(long, default_value_t = 1)]
     iterations: usize,
@@ -166,7 +169,7 @@ struct Args {
     /// Untimed calls per case/thread/beam before timing samples.
     #[arg(long, default_value_t = 1)]
     warmup: usize,
-    /// Synthetic timing geometry is one 128-row matrix band (HT beam is 128).
+    /// Synthetic timing geometry is one 128-row matrix band.
     #[arg(long, default_value_t = 2560)]
     cols: usize,
     /// FP8G128 timing uses n-gram geometry rather than --cols.
@@ -179,6 +182,9 @@ struct Args {
     fixtures: Vec<Fixture>,
     #[arg(long, value_delimiter = ',', default_value = "1,8,128")]
     corpus_beams: Vec<usize>,
+    /// Timed HT beam width. CPU permits up to 4096; HIP supports 1..=256.
+    #[arg(long, default_value_t = 128)]
+    timing_beam: usize,
     /// Indexed HF snapshot; only metadata and the selected BF16 bands are read.
     #[arg(long)]
     hf: Option<PathBuf>,
@@ -721,13 +727,19 @@ fn prepare<'a>(
     })
 }
 
-fn encode(work: &Prepared<'_>, threads: usize, beam: usize) -> Result<EncodedBlock> {
+fn encode(
+    work: &Prepared<'_>,
+    threads: usize,
+    beam: usize,
+    backend: HtBackend,
+) -> Result<EncodedBlock> {
     let meta = QuantMeta {
         su: &work.su,
         sv: &work.sv,
         fp8_scale: work.fp8_scale,
         threads,
         ht_beam: beam,
+        ht_backend: backend,
         ..QuantMeta::default()
     };
     let encoding = work.case.encoding();
@@ -882,7 +894,7 @@ fn check_output(expected: &mut BTreeMap<String, Value>, key: &str, actual: Value
     if let Some(previous) = expected.get(key) {
         ensure!(
             previous == &actual,
-            "nondeterministic output for {key} (iteration/sample/thread mismatch)"
+            "nondeterministic output for {key} (iteration/sample/thread/backend mismatch)"
         );
     } else {
         expected.insert(key.to_owned(), actual.clone());
@@ -909,7 +921,7 @@ fn run_workload(
     let beams: &[usize] = if ht && !timing {
         &args.corpus_beams
     } else {
-        &[128]
+        &[args.timing_beam]
     };
     let iterations = if timing { args.iterations } else { 1 };
     let repetitions = if timing { args.repetitions } else { 1 };
@@ -936,49 +948,57 @@ fn run_workload(
             work.rows,
             work.cols
         );
-        for &threads in &args.threads {
-            for _ in 0..warmup {
-                let block = encode(work, threads, beam)?;
-                check_output(expected, &key, fingerprint(work, &block)?)?;
-            }
-            for sample in 0..repetitions {
-                let mut outputs = Vec::with_capacity(iterations);
-                let start = Instant::now();
-                for _ in 0..iterations {
-                    outputs.push(black_box(encode(work, threads, beam)?));
+        // Neither backend nor threads is part of the equality key.
+        for &backend in &args.backends {
+            let timed_region = json!({
+                "public_encoding": true, "validation": true, "codec_allocations": true,
+                "rotation": work.case.rotated(), "input_setup": false, "sign_generation": false,
+                "row_rms": false, "hashing": false, "output_destruction": false,
+                "hip_host_device_copies_and_synchronization": ht && backend == HtBackend::Hip,
+                "hip_device_preflight": false, "preallocated_result_push": true,
+            });
+            for &threads in &args.threads {
+                for _ in 0..warmup {
+                    let block = encode(work, threads, beam, backend)?;
+                    check_output(expected, &key, fingerprint(work, &block)?)?;
                 }
-                let elapsed_ns = ns(start)?;
-                let mut output_fingerprint = None;
-                for block in &outputs {
-                    output_fingerprint =
-                        Some(check_output(expected, &key, fingerprint(work, block)?)?);
+                for sample in 0..repetitions {
+                    let mut outputs = Vec::with_capacity(iterations);
+                    let start = Instant::now();
+                    for _ in 0..iterations {
+                        outputs.push(black_box(encode(work, threads, beam, backend)?));
+                    }
+                    let elapsed_ns = ns(start)?;
+                    let mut output_fingerprint = None;
+                    for block in &outputs {
+                        output_fingerprint =
+                            Some(check_output(expected, &key, fingerprint(work, block)?)?);
+                    }
+                    let values_per_iteration =
+                        work.rows * work.cols * if work.case.paired() { 2 } else { 1 };
+                    emit(
+                        out,
+                        &json!({
+                            "schema": 1, "kind": "sample", "contract": CONTRACT,
+                            "label": args.label, "suite": suite, "case": work.case.name(),
+                            "encoding_code": work.case.encoding().code(), "encoding_variant": work.case.encoding().variant(),
+                            "fixture": work.fixture.name(), "source": work.source, "seed": args.seed,
+                            "rows": work.rows, "cols": work.cols, "projection_count": if work.case.paired() { 2 } else { 1 },
+                            "payload_rows": payload_rows, "values_per_iteration": values_per_iteration,
+                            "beam": if ht { Some(beam) } else { None }, "threads": threads,
+                            "backend": backend, "encoding_backend": if ht { backend } else { HtBackend::Cpu },
+                            "sample": sample, "iterations": iterations, "repetitions": repetitions, "warmup": warmup,
+                            "elapsed_ns": elapsed_ns, "ns_per_iteration": elapsed_ns as f64 / iterations as f64,
+                            "values_per_second": values_per_iteration as f64 * iterations as f64 * 1.0e9 / elapsed_ns.max(1) as f64,
+                            "setup_elapsed_ns": work.setup_elapsed_ns, "preparation_elapsed_ns": work.preparation_elapsed_ns,
+                            "preparation": work.preparation, "input_fingerprint": input_fingerprint,
+                            "timed_region": timed_region,
+                            "verified_identical_outputs": iterations,
+                            "output_fingerprint": output_fingerprint.context("empty sample")?,
+                        }),
+                    )?;
+                    // Retained outputs are destroyed after timing and fingerprinting.
                 }
-                let values_per_iteration =
-                    work.rows * work.cols * if work.case.paired() { 2 } else { 1 };
-                emit(
-                    out,
-                    &json!({
-                        "schema": 1, "kind": "sample", "contract": CONTRACT,
-                        "label": args.label, "suite": suite, "case": work.case.name(),
-                        "encoding_code": work.case.encoding().code(), "encoding_variant": work.case.encoding().variant(),
-                        "fixture": work.fixture.name(), "source": work.source, "seed": args.seed,
-                        "rows": work.rows, "cols": work.cols, "projection_count": if work.case.paired() { 2 } else { 1 },
-                        "payload_rows": payload_rows, "values_per_iteration": values_per_iteration,
-                        "beam": if ht { Some(beam) } else { None }, "threads": threads,
-                        "sample": sample, "iterations": iterations, "repetitions": repetitions, "warmup": warmup,
-                        "elapsed_ns": elapsed_ns, "ns_per_iteration": elapsed_ns as f64 / iterations as f64,
-                        "values_per_second": values_per_iteration as f64 * iterations as f64 * 1.0e9 / elapsed_ns.max(1) as f64,
-                        "setup_elapsed_ns": work.setup_elapsed_ns, "preparation_elapsed_ns": work.preparation_elapsed_ns,
-                        "preparation": work.preparation, "input_fingerprint": input_fingerprint,
-                        "timed_region": {"public_encoding": true, "validation": true, "codec_allocations": true,
-                            "rotation": work.case.rotated(), "input_setup": false, "sign_generation": false,
-                            "row_rms": false, "hashing": false, "output_destruction": false,
-                            "preallocated_result_push": true},
-                        "verified_identical_outputs": iterations,
-                        "output_fingerprint": output_fingerprint.context("empty sample")?,
-                    }),
-                )?;
-                // Retained outputs are destroyed after timing and fingerprinting.
             }
         }
     }
@@ -1022,6 +1042,22 @@ fn main() -> Result<()> {
                 .all(|beam| *beam > 0 && *beam <= 4096),
         "corpus beams must be in 1..=4096 (full-state search is intentionally excluded)"
     );
+    ensure!(
+        (1..=4096).contains(&args.timing_beam),
+        "timing beam must be in 1..=4096"
+    );
+    ensure!(!args.backends.is_empty(), "select at least one backend");
+    let hip_preflight_elapsed_ns = if args.backends.contains(&HtBackend::Hip) {
+        ensure!(
+            args.timing_beam <= 256 && args.corpus_beams.iter().all(|beam| *beam <= 256),
+            "HIP beams must be in 1..=256"
+        );
+        let start = Instant::now();
+        HtBackend::Hip.preflight()?;
+        Some(ns(start)?)
+    } else {
+        None
+    };
     if args.hf.is_none()
         && (args.tensor.is_some()
             || args.up_tensor.is_some()
@@ -1049,12 +1085,16 @@ fn main() -> Result<()> {
             "schema": 1, "kind": "run", "contract": CONTRACT, "label": args.label,
             "encoder_sha256": bf16_to_hgn::ENCODER_SHA256, "package_version": env!("CARGO_PKG_VERSION"),
             "debug_assertions": cfg!(debug_assertions), "cases": cases.iter().map(|case| case.name()).collect::<Vec<_>>(),
-            "threads": args.threads, "timing_beam": 128, "corpus_beams": args.corpus_beams,
+            "threads": args.threads, "backends": args.backends,
+            "timing_beam": args.timing_beam, "corpus_beams": args.corpus_beams,
             "iterations": args.iterations, "repetitions": args.repetitions, "warmup": args.warmup,
             "synthetic_cols": args.cols, "fp8_rows": args.fp8_rows, "seed": args.seed,
             "real_band_read_elapsed_ns": real.as_ref().map(|real| real.read_elapsed_ns),
+            "hip_preflight_elapsed_ns": hip_preflight_elapsed_ns,
+            "hip_preflight_before_samples": hip_preflight_elapsed_ns.is_some(),
+            "hip_timing": "Synchronous public encoding includes GPU copies/kernels. Preflight is separate; fresh-process --backends hip --warmup 0 measures first encoding. Subsequent samples reuse native workspace/codebook.",
             "input_band_value_limit": MAX_BAND_VALUES, "retained_output_byte_limit": MAX_RETAINED_BYTES,
-            "fingerprint": "SHA-256; little-endian raw floats/side planes; tagged component lengths; excludes timing, threads and label",
+            "fingerprint": "SHA-256; little-endian raw floats/side planes; tagged component lengths; excludes timing, threads, backend and label",
         }),
     )?;
     let mut expected = BTreeMap::new();
@@ -1073,4 +1113,25 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn equality_key_rejects_backend_byte_or_side_plane_differences() {
+        let mut expected = BTreeMap::new();
+        let key = "corpus:ht3:ordinary-bf16:128:128:256";
+        let cpu =
+            json!({"codes": {"sha256": "cpu-bytes"}, "rotation_sv_f16": {"sha256": "scale-bytes"}});
+        check_output(&mut expected, key, cpu.clone()).unwrap();
+        check_output(&mut expected, key, cpu.clone()).unwrap();
+        let mut changed_codes = cpu.clone();
+        changed_codes["codes"]["sha256"] = json!("different-hip-bytes");
+        assert!(check_output(&mut expected, key, changed_codes).is_err());
+        let mut changed_plane = cpu;
+        changed_plane["rotation_sv_f16"]["sha256"] = json!("different-scale-bytes");
+        assert!(check_output(&mut expected, key, changed_plane).is_err());
+    }
 }

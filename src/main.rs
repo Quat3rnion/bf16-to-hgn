@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use bf16_to_hgn::{
-    architecture, container, conversion, hf,
+    architecture,
+    codec::HtBackend,
+    container, conversion, hf,
     manifest::{Manifest, Options, OutputProfile},
     source::{self, SourceKind, SourceOptions, TensorSource},
     verify, ConversionPlan, SPEC_COMMIT, SPEC_VERSION,
@@ -31,6 +33,9 @@ enum Command {
         input: InputOptions,
         #[arg(long, value_enum, default_value_t = OutputProfile::V2)]
         profile: OutputProfile,
+        /// HT execution backend to describe; inspection does not load a device.
+        #[arg(long, value_enum, default_value_t = HtBackend::Cpu)]
+        ht_backend: HtBackend,
     },
     /// Print the complete tensor/store/layout plan without writing anything.
     Plan {
@@ -110,6 +115,9 @@ struct EncodingOptions {
     /// Deterministic approximate HT trellis beam width (1..256).
     #[arg(long, default_value_t = 128)]
     ht_beam: usize,
+    /// HT3/HT4 trellis execution backend; requires --features hip for real HIP encoding.
+    #[arg(long, value_enum, default_value_t = HtBackend::Cpu)]
+    ht_backend: HtBackend,
 }
 impl EncodingOptions {
     fn options(&self) -> Result<Options> {
@@ -118,6 +126,7 @@ impl EncodingOptions {
             seed: self.seed,
             threads: self.threads,
             ht_beam: self.ht_beam,
+            ht_backend: self.ht_backend,
         };
         options.validate()?;
         Ok(options)
@@ -133,9 +142,14 @@ fn main() {
 
 fn run() -> Result<()> {
     match Cli::parse().command {
-        Command::Inspect { input, profile } => {
+        Command::Inspect {
+            input,
+            profile,
+            ht_backend,
+        } => {
             let options = Options {
                 profile,
+                ht_backend,
                 ..Options::default()
             };
             let snapshot = input.open()?;
@@ -155,6 +169,9 @@ fn run() -> Result<()> {
             encoding,
         } => {
             let options = encoding.options()?;
+            if !dry_run {
+                options.validate_for_execution()?;
+            }
             let snapshot = input.open()?;
             let plan = architecture::plan(snapshot.as_ref(), &options)?;
             conversion::destination_path(snapshot.as_ref(), &output)?;
@@ -163,7 +180,7 @@ fn run() -> Result<()> {
             } else {
                 let manifest = conversion::convert(snapshot.as_ref(), &plan, &output, &options)?;
                 print_json(
-                    &json!({ "published": true, "source_tensors": manifest.sources.len(), "output_tensors": manifest.containers.iter().map(|c| c.tensors.len()).sum::<usize>(), "manifest": "conversion-manifest.json", "source_format": manifest.source_kind, "profile": manifest.options.profile, "policy": manifest.policy }),
+                    &json!({ "published": true, "source_tensors": manifest.sources.len(), "output_tensors": manifest.containers.iter().map(|c| c.tensors.len()).sum::<usize>(), "manifest": "conversion-manifest.json", "source_format": manifest.source_kind, "profile": manifest.options.profile, "ht_backend": manifest.options.ht_backend, "policy": manifest.policy }),
                 )?;
             }
         }
@@ -202,7 +219,7 @@ fn summary(
         outputs.push(json!({ "filename": file.filename, "identity": file.identity, "tensors": file.tensors.len(), "bytes": container::layout(file)?.file_size, "stores": stores }));
     }
     Ok(
-        json!({ "architecture": plan.architecture, "source_format": snapshot.kind(), "source_tensors": snapshot.tensors().len(), "source_shards": shards.len(), "canonical_source_payload_bytes": source_bytes, "source_dtypes": dtypes, "outputs": outputs, "assets": plan.assets, "output_hgn_bytes": conversion::planned_bytes(plan)?, "spec_version": SPEC_VERSION, "spec_commit": SPEC_COMMIT, "profile": options.profile, "policy": options.profile.policy(), "tensor_payloads_read": false }),
+        json!({ "architecture": plan.architecture, "source_format": snapshot.kind(), "source_tensors": snapshot.tensors().len(), "source_shards": shards.len(), "canonical_source_payload_bytes": source_bytes, "source_dtypes": dtypes, "outputs": outputs, "assets": plan.assets, "output_hgn_bytes": conversion::planned_bytes(plan)?, "spec_version": SPEC_VERSION, "spec_commit": SPEC_COMMIT, "profile": options.profile, "ht_backend": options.ht_backend, "policy": options.profile.policy(), "tensor_payloads_read": false }),
     )
 }
 

@@ -88,8 +88,8 @@ policy are not public; this tool uses the explicit policy below.
 ## Requirements and build
 
 Linux, Rust 1.85 or newer, a C++17 compiler with OpenMP (for example GCC and
-`libgomp`), and sufficient disk space. There are no host/model paths compiled
-into the tool, no GPU dependency, and no Python runtime dependency.
+`libgomp`), and sufficient disk space. The default build has no GPU dependency.
+No model paths or Python runtime are required.
 Linux publication uses `renameat2(RENAME_NOREPLACE)`; the output filesystem
 must support it. A macOS no-replace publication implementation is present,
 but its compiler/OpenMP toolchain is not qualified. Other OS publication is
@@ -107,6 +107,25 @@ and a guarded packed cost/state comparator. Portable arithmetic/comparison
 fallbacks remain. Notices and the original source attribution are under
 `native/`. The conversion manifest records an aggregate SHA-256 of the
 compiled tool's source files, lockfile and helper.
+
+For optional Strix Halo GPU encoding, build with ROCm/HIP and ordinary
+**libstdc++ 16 for both C++ translation units**:
+
+```sh
+# From this crate directory; separate output keeps existing binaries intact.
+CARGO_TARGET_DIR=/tmp/bf16-hgn-hip-target CARGO_BUILD_JOBS=1 \
+  cargo build --release --locked --features hip
+HIP_BIN=/tmp/bf16-hgn-hip-target/release/bf16-to-hgn
+$HIP_BIN convert --source /path/to/hf-bf16 --output /path/to/new-output \
+  --profile ht43 --ht-backend hip --ht-beam 128
+```
+
+`ROCM_PATH` defaults to `/opt/rocm`; `HIPCC` may override its compiler.
+The HIP build targets `gfx1151`, preserves FP32 denormals, disables fast math
+and FMA contraction, and links the ROCm HIP runtime. Its CPU and GPU searches
+depend on the same libstdc++ 16 selection permutation; incompatible standard
+libraries or parallel algorithms are rejected at build time.
+CUDA and other GPU architectures are not implemented.
 
 ## Commands
 
@@ -316,11 +335,27 @@ They are not all “small”: HT43's per-expert signs/scales require roughly
 import decoder scratch and native per-worker trellis scratch are additional.
 These are working-set bounds, not an exact RSS guarantee for every allocator/OS.
 
-Default `--threads 1` is deliberate. `--threads` only controls native HT
-workers (1–64); there is no parallel whole-tensor/expert queue. Start with
-one or two workers on a memory-constrained machine. The tool does not
-consult or modify production service state. Do not run full conversion on
-a host whose live model already consumes its memory/disk headroom.
+Default `--ht-backend cpu --threads 1` is deliberate. `--threads` controls
+only CPU HT workers (1–64), not HIP. HIP accelerates HT3/HT4 trellis search;
+rotations and all other codecs remain on CPU. It supports every CLI beam
+1–256; exact beam 0 and larger library-only beams require the CPU backend.
+Requesting HIP without the feature, a compatible device, or a working runtime
+is an error, never a silent CPU fallback. Real conversion preflights HIP before
+creating staging output; metadata-only inspect/plan do not initialize a GPU.
+
+HIP uses device 0 (respecting `HIP_VISIBLE_DEVICES`), a least-priority stream,
+64 tiles per batch and one reusable **27,607,808-byte device allocation**.
+Runtime/driver memory is additional. Calls share a serialized persistent
+context and content-checked codebook cache. A low-priority stream is not
+isolation: HIP still competes with inference for GPU compute and shared UMA.
+There is no parallel whole-tensor/expert queue or automatic service management.
+Do not run full conversion on a host whose live model consumes its headroom.
+
+The manifest records `options.ht_backend`; an omitted field in an older
+schema-2 manifest means CPU. CPU-only builds can verify HIP-produced output
+without a GPU. Container bytes must match the same-toolchain CPU reference;
+the manifest legitimately differs in backend metadata. Changing backends
+does not resume an unfinished conversion.
 
 The BF16 source is approximately 360 GB. Including n-gram and vision, outputs
 are approximately **119 GB for v2** or **110 GB for HT43** (decimal, excluding
@@ -347,7 +382,7 @@ output/metadata/rotation/padding fingerprints, and per-sample timings.
 Timing includes public encoding, validation, codec allocations and rotation,
 but excludes input loading, sign/row-RMS preparation, hashing and destruction.
 It caps input bands and retained outputs, reads only selected HF BF16 bands,
-and checks equality across iterations, samples and worker counts.
+and checks equality across iterations, samples, worker counts and backends.
 
 ```sh
 CARGO_BUILD_JOBS=1 cargo build --release --locked --example encoder_bench
@@ -406,6 +441,55 @@ and 26% of I4R cycles to general rounding; selection, rotation, input decoding
 and output I/O remain costs. Full-model conversion/inference was not run,
 and no active conversion or serving process was replaced.
 
+### Strix Halo HIP backend
+
+HIP preserves the CPU selection permutation, tie handling, closure and
+separate binary32 subtraction/multiplication/addition; it does not reduce
+beam width or precision. The tested reference is GCC/libstdc++ 16.2.1 and
+ROCm 7.2 on gfx1151. Native differential coverage checks every beam 1–256
+for HT3/HT4, batch boundaries, ties, subnormal squares, changing codebooks
+and concurrent callers. The GPU selection regression passed 5,896 full
+candidate-permutation and forced-heap-fallback cases against libstdc++.
+All five opt-in device/conversion tests passed. The executable tiny smoke
+published byte-identical CPU/HIP containers; a separate CPU-only executable
+also verified them with GPU visibility disabled.
+
+```sh
+CARGO_TARGET_DIR=/tmp/bf16-hgn-hip-target CARGO_BUILD_JOBS=1 \
+  cargo build --release --locked --features hip --example encoder_bench
+HIP_BENCH=/tmp/bf16-hgn-hip-target/release/examples/encoder_bench
+$HIP_BENCH --suite corpus --backends cpu,hip --threads 1,2 \
+  --cases ht4,ht3,ht4-pair,ht3-pair --corpus-beams 1,8,128,256
+# Add --backends cpu,hip --timing-beam 128 to the real-band command above.
+```
+
+HIP timings include host/device copies and synchronization. Device preflight
+is reported separately; warm samples reuse workspace and codebook. Use a
+fresh process with `--backends hip --warmup 0` for first-encoding cost, and
+include the reported preflight for startup-inclusive cost. Small batches or
+small beams may be slower on GPU. Host-side preparation, other codecs and
+I/O are not accelerated; band results are not a whole-model ETA.
+
+Measured on Frame before unloading production Halogen: real Blackfrost
+128×2560 bands, beam 128, CPUs 10/11, two CPU workers, four warm samples per
+backend/case across CPU→HIP and HIP→CPU process orders:
+
+| Case | CPU median ms (range) | HIP median ms (range) | Throughput ratio |
+| --- | ---: | ---: | ---: |
+| HT4 | 3128 (3085–3476) | 862 (423–1327) | 3.63× |
+| HT3 | 2120 (2024–2243) | 450 (301–666) | 4.71× |
+| HT4 gate/up | 6460 (6119–6966) | 845 (844–847) | 7.64× |
+| HT3 gate/up | 4336 (4035–5146) | 914 (601–1273) | 4.74× |
+
+All 64 timing samples (including the separate one-worker axis) matched
+complete input/output fingerprints across processes. The public corpus
+matched 448 samples across both backends, one/two workers, seven fixtures
+and beams 1/8/128/256. Native comparisons matched 640 cases covering every
+supported beam. Device preflight took 200–328 ms, excluded from this table.
+The shared GPU was not idle: wide HIP ranges reflect contention, and the
+unusually tight paired-HT4 subset must not be generalized. No full-model
+GPU conversion or inference qualification was performed.
+
 ## Bounded structural checks
 
 The public CLI has no fixture mode or architecture bypass. Library examples
@@ -433,6 +517,29 @@ split GGUFs, append-only HGN, input immutability and publication boundaries.
 The optional real-stock HGN probe is ignored by default and requires its
 local fixture; it is not a portable test prerequisite.
 
+Optional GPU acceptance on gfx1151:
+
+```sh
+CARGO_TARGET_DIR=/tmp/bf16-hgn-hip-target CARGO_BUILD_JOBS=1 \
+  cargo test --release --locked --features hip hip_ -- --ignored --test-threads=1
+CARGO_TARGET_DIR=/tmp/bf16-hgn-hip-target CARGO_BUILD_JOBS=1 \
+  cargo run --release --locked --features hip --example tiny_hip_conversion \
+  -- --root /tmp/tiny-hip-conversion
+# Separate default-feature executable: no GPU or HIP runtime needed to verify.
+HIP_VISIBLE_DEVICES=-1 CARGO_TARGET_DIR=/tmp/bf16-hgn-cpu-target CARGO_BUILD_JOBS=1 \
+  cargo run --release --locked --example tiny_hip_conversion \
+  -- --root /tmp/tiny-hip-conversion --verify-only
+
+hipcc -std=c++17 -O3 --offload-arch=gfx1151 -ffp-contract=off \
+  -fno-fast-math -fno-gpu-flush-denormals-to-zero -pthread \
+  tests/hip_selection.hip -o /tmp/hip-selection
+/tmp/hip-selection
+```
+
+The retained smoke root must be new. It compares every byte of all three
+published CPU/HIP HGN containers and independently verifies both conversions.
+These structural fixtures are deliberately not engine-loadable models.
+
 Bounded CPU-only checks on 2026-10-10 passed the integrated all-target test
 suite, the separately enabled real-stock HT43 probe, and all four executable
 examples (real conversion plus verification). Metadata-only public CLI
@@ -441,11 +548,17 @@ appended native r2 HGN with sidecars, and BF16 GGUF with MTP/vision sidecars.
 The HGN/GGUF metadata smokes used structurally compatible config/assets;
 they do not endorse checkpoint provenance or quality.
 
-These checks do **not** include full-model HT43 conversion, GPU/engine
+These checks do **not** include full-model HT43 conversion, engine model
 loading, full-model inference, inference-quality comparisons or full-model
-throughput. A running full v2 conversion is not evidence for HT43 qualification.
+throughput. A full v2 conversion is not evidence for HT43 qualification.
 
 ## Changes
+
+- Added opt-in gfx1151 HIP HT3/HT4 encoding, bounded reusable device storage,
+  explicit backend provenance and CPU-only verification of HIP output.
+- Added CPU/GPU differential benchmarks, native selection regressions and
+  real tiny GPU conversion/publication/verification coverage. CPU remains
+  the default; CUDA and non-HT GPU quantizers are not implemented.
 
 - Added byte-preserving AVX2 HT transitions, exact packed candidate ordering
   and bounded I4R/Q6/Q8 rounding, with scalar/portable fallbacks.
