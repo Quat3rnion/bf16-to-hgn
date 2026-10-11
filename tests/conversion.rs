@@ -1,11 +1,9 @@
 mod support;
 
 use anyhow::Result;
-#[cfg(feature = "hip")]
-use bf16_to_hgn::codec::Encoding;
 use bf16_to_hgn::{
     architecture,
-    codec::HtBackend,
+    codec::{Encoding, HtBackend},
     container, conversion,
     hf::Snapshot,
     manifest::{Options, OutputProfile},
@@ -72,6 +70,63 @@ fn actual_fixture_converts_and_verifies_every_source_and_output() -> Result<()> 
     assert_eq!(gate.entry.encoding.code(), 23);
     assert_eq!(gate.entry.encoding.variant(), 128);
     assert_eq!(gate.entry.shape, [2, 256, 128]);
+    Ok(())
+}
+
+#[test]
+fn eta_fixture_converts_and_verifies_mixed_encodings_and_coverage() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let (snapshot, plan) = support::eta_fixture(temporary.path())?;
+    let output = temporary.path().join("converted");
+    let progress = Progress::disabled();
+    let manifest = conversion::convert(&snapshot, &plan, &output, &options(), &progress)?;
+    let report = verify::verify(&snapshot, &plan, &output, DecodeBackend::Cpu, &progress)?;
+    assert_eq!(manifest.sources.len(), snapshot.tensors.len());
+    assert_eq!(report.source_tensors, snapshot.tensors.len());
+    assert_eq!(
+        report.output_tensors,
+        plan.files
+            .iter()
+            .map(|file| file.tensors.len())
+            .sum::<usize>()
+    );
+    assert_eq!(report.errors.len(), manifest.sources.len() - 1);
+    assert!(report
+        .errors
+        .values()
+        .all(|error| error.error_squared.is_finite() && error.values > 0));
+    for (name, encoding, bits) in [
+        ("fixture.dense.weight", Encoding::Ht, 4),
+        ("fixture.dense_ht3.weight", Encoding::Ht3, 3),
+    ] {
+        let entry = &manifest.containers[0]
+            .tensors
+            .iter()
+            .find(|record| record.entry.name == name)
+            .expect("encoded HT matrix")
+            .entry;
+        assert_eq!(entry.encoding, encoding);
+        assert_eq!(entry.shape, [128, 128]);
+        assert_eq!(entry.size, 128 * 128 * bits / 8);
+        assert_eq!(
+            report.errors[&format!("model.hgn:{name}")].values,
+            128 * 128
+        );
+    }
+    for encoding in [Encoding::I4r, Encoding::Q8G64] {
+        assert_eq!(
+            manifest.containers[0]
+                .tensors
+                .iter()
+                .filter(|record| record.entry.encoding == encoding)
+                .count(),
+            2
+        );
+    }
+    assert_eq!(
+        report.errors["qwen38-flash-next-ngram.hgn:layers.1.ple.ngram_embedding.weight"].values,
+        2 * 3 * 160
+    );
     Ok(())
 }
 

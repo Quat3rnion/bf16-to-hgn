@@ -81,7 +81,7 @@ pub fn verify(
     let rotations = conversion::prepare_rotations(snapshot, plan, &manifest.options, progress)?;
     let stage = progress.stage(
         "Verify payloads",
-        conversion::progress_values(plan, progress, false)?,
+        conversion::verification_values(plan, progress)?,
         Unit::Values,
     );
     let mut payloads = PayloadVerifier {

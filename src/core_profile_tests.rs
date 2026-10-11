@@ -3,6 +3,10 @@ use crate::{hf::Snapshot, manifest::OutputProfile, ContainerPlan, Rotation};
 use serde_json::json;
 
 fn expert_source(root: &Path, shape: &[u64], input: &[f32]) -> Snapshot {
+    tensor_source(root, "expert", shape, input)
+}
+
+fn tensor_source(root: &Path, name: &str, shape: &[u64], input: &[f32]) -> Snapshot {
     fs::create_dir(root).unwrap();
     fs::write(root.join("config.json"), b"{}").unwrap();
     let raw: Vec<u8> = input
@@ -10,7 +14,7 @@ fn expert_source(root: &Path, shape: &[u64], input: &[f32]) -> Snapshot {
         .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
         .collect();
     let mut header = serde_json::to_vec(&json!({
-        "expert": {"dtype": "BF16", "shape": shape, "data_offsets": [0, raw.len()]}
+        (name): {"dtype": "BF16", "shape": shape, "data_offsets": [0, raw.len()]}
     }))
     .unwrap();
     header.resize(header.len() + (8 - header.len() % 8) % 8, b' ');
@@ -23,7 +27,7 @@ fn expert_source(root: &Path, shape: &[u64], input: &[f32]) -> Snapshot {
     fs::write(
         root.join("model.safetensors.index.json"),
         serde_json::to_vec(&json!({
-            "metadata": {"total_size": raw.len()}, "weight_map": {"expert": "model.safetensors"}
+            "metadata": {"total_size": raw.len()}, "weight_map": {(name): "model.safetensors"}
         }))
         .unwrap(),
     )
@@ -216,4 +220,122 @@ fn canonical_container_rejects_tiny_ht_experts_and_unknown_ht_variant() {
     file.write_all(&0x1207u32.to_le_bytes()).unwrap();
     drop(file);
     assert!(container::Reader::open(&path).is_err());
+}
+
+#[test]
+fn conversion_work_counts_ngram_passes_and_rotation_writes_not_preparation() {
+    let directory = tempfile::tempdir().unwrap();
+    let name = "model.language_model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight";
+    let snapshot = tensor_source(
+        &directory.path().join("source"),
+        name,
+        &[2, 160],
+        &[0.0; 320],
+    );
+    let plan = ConversionPlan {
+        architecture: "work-pass-fixture".into(),
+        files: vec![
+            ContainerPlan {
+                filename: "model.hgn".into(),
+                identity: "work-pass-fixture".into(),
+                tensors: vec![
+                    TensorPlan {
+                        name: "fixture.su".into(),
+                        shape: vec![128],
+                        encoding: Encoding::F16,
+                        origin: Origin::Signs {
+                            key: "fixture.su".into(),
+                        },
+                        rotation: None,
+                    },
+                    TensorPlan {
+                        name: "fixture.sv".into(),
+                        shape: vec![2],
+                        encoding: Encoding::F16,
+                        origin: Origin::HtScales {
+                            tensor: name.into(),
+                            signs_key: "fixture.sv".into(),
+                        },
+                        rotation: None,
+                    },
+                ],
+            },
+            ContainerPlan {
+                filename: "qwen38-flash-next-ngram.hgn".into(),
+                identity: "work-pass-fixture".into(),
+                tensors: vec![TensorPlan {
+                    name: "layers.0.ple.ngram_embedding.weight".into(),
+                    shape: vec![1, 2, 160],
+                    encoding: Encoding::Fp8G128,
+                    origin: Origin::Ngram {
+                        shards: vec![name.into()],
+                    },
+                    rotation: None,
+                }],
+            },
+        ],
+        assets: Vec::new(),
+    };
+    validate_plan(&snapshot, &plan).unwrap();
+    let options = Options {
+        ht_backend: codec::HtBackend::Hip,
+        ..Options::default()
+    };
+    let estimate = conversion_work(&snapshot, &plan, &options).unwrap();
+    // 320 values in each table pass, plus 128 signs and two scale values
+    // written once. The earlier 320-value HT scale scan is not counted here.
+    assert_eq!(estimate.total(), 770);
+    assert_eq!(estimate.planned_values(WorkClass::ScanFp8Scale), 320);
+    assert_eq!(
+        estimate.planned_values(WorkClass::encode(Encoding::Fp8G128, codec::HtBackend::Cpu)),
+        320
+    );
+    assert_eq!(estimate.planned_values(WorkClass::WriteRotation), 130);
+    assert_eq!(
+        estimate.planned_values(WorkClass::encode(Encoding::Ht, codec::HtBackend::Hip)),
+        0
+    );
+    let mut overflow = plan;
+    overflow.files[0].tensors[0].shape = vec![u64::MAX];
+    assert!(conversion_work(&snapshot, &overflow, &options).is_err());
+}
+
+#[test]
+fn conversion_work_classifies_copy_reencoding_and_actual_backend() {
+    let options = Options {
+        ht_backend: codec::HtBackend::Hip,
+        ..Options::default()
+    };
+    for (encoding, dtype) in [
+        (Encoding::Bf16, Dtype::Bf16),
+        (Encoding::F32, Dtype::F32),
+        (Encoding::I64, Dtype::I64),
+    ] {
+        assert_eq!(
+            source_work(encoding, dtype, &options),
+            WorkClass::Copy(encoding)
+        );
+    }
+    // Imported F32 values converted back to BF16 are encoding work, not copies.
+    assert_eq!(
+        source_work(Encoding::Bf16, Dtype::F32, &options),
+        WorkClass::encode(Encoding::Bf16, codec::HtBackend::Cpu)
+    );
+    for encoding in [Encoding::Ht, Encoding::Ht3] {
+        assert_eq!(
+            source_work(encoding, Dtype::Bf16, &options),
+            WorkClass::Encode(encoding, codec::HtBackend::Hip)
+        );
+    }
+    for encoding in [
+        Encoding::I4r,
+        Encoding::Q4Cp,
+        Encoding::Q8G64,
+        Encoding::Q6G64,
+    ] {
+        assert_eq!(
+            source_work(encoding, Dtype::Bf16, &options),
+            WorkClass::Encode(encoding, codec::HtBackend::Cpu)
+        );
+    }
 }

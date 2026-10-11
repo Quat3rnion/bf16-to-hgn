@@ -144,7 +144,7 @@ layout/padding/metadata validation and sequential F64 error accumulation
 stay on CPU. GPU verification does not re-encode the weights or skip checks.
 
 Conversion and verification show multiline indicatif progress on terminal
-stderr. Overall counters, throughput and ETA stay separate from the current
+stderr. Overall counters, aggregate throughput and ETA stay separate from the current
 operation, encoding (`HT4`, `HT3`, `I4R`, etc.), actual CPU/HIP backend, layer,
 expert and tensor. Expert indices are zero-based and accompanied by the
 expert count; layer scopes distinguish trunk, MTP and vision.
@@ -161,10 +161,28 @@ can explicitly supply disabled progress with no progress-only allocations.
 “Convert passes” counts each output value once, plus n-gram values once more
 for the mandatory global-scale scan; it is work across passes, not the
 model's unique parameter count. Verification counts each output value once.
-Hashing, provenance and publication can still be running after all values
-are counted; only successful finalization prints “done”. ETA estimates the
-current operation, not a promise across codecs with different costs.
-Errors print “stopped” rather than claiming completion.
+Conversion ETA sums the remaining value-work budget of each operation/pass,
+encoding and actual backend at that class's observed mean chunk rate. HT4,
+HT3, I4R, direct copies, rotation writes, and the n-gram scale scan/encode
+passes learn independent rates; completed tensors' measurements remain
+available when a class is revisited. Timed chunks include their source reads,
+hashing, rotations, encoding and payload writes, not unrelated work or gaps
+between chunks. No rate is borrowed from another codec or a previous run.
+
+Before all remaining classes have samples, ETA says **learning (N classes)**
+or **partial ~duration + N unmeasured**: the duration covers measured classes
+only, not a full conversion estimate. File creation/hashing, asset copying,
+provenance and publication are outside this value-work ETA and display
+**finalizing (outside ETA)**, even between files that still have values left.
+Only successful finalization prints “done”; errors print “stopped”.
+Preparation and verification retain their separate aggregate recent-rate
+estimates. All ETAs are measurements-based estimates, not completion promises.
+
+A genuine temporary mixed HT4/HT3/I4R/n-gram conversion and verification smoke
+is available with `cargo run --release --example tiny_conversion`. Run it in
+a terminal with a non-dumb `TERM` to see stderr progress; stdout remains the
+JSON verification report. Its structural fixture is not an engine-compatible
+checkpoint and is removed when the example exits.
 
 ```sh
 # HF: metadata inspection and deterministic plan, without tensor payload reads.

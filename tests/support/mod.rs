@@ -12,6 +12,15 @@ use std::{
 
 /// Actual small safetensors inputs for every v2 codec; not an engine-compatible model.
 pub fn fixture(parent: &Path) -> Result<(Snapshot, ConversionPlan)> {
+    fixture_with_ht3(parent, false)
+}
+
+/// Mixed-codec ETA input including both n-gram passes; library-only structural data.
+pub fn eta_fixture(parent: &Path) -> Result<(Snapshot, ConversionPlan)> {
+    fixture_with_ht3(parent, true)
+}
+
+fn fixture_with_ht3(parent: &Path, include_ht3: bool) -> Result<(Snapshot, ConversionPlan)> {
     let source = parent.join("source");
     fs::create_dir(&source)?;
     fs::write(
@@ -50,6 +59,9 @@ pub fn fixture(parent: &Path) -> Result<(Snapshot, ConversionPlan)> {
     add_bf16(&mut tensors, "fixture.affine8.weight", &[4, 64], false);
     add_bf16(&mut tensors, "fixture.affine6.weight", &[4, 320], false);
     add_bf16(&mut tensors, "fixture.dense.weight", &[128, 128], true);
+    if include_ht3 {
+        add_bf16(&mut tensors, "fixture.dense_ht3.weight", &[128, 128], false);
+    }
     add_bf16(
         &mut tensors,
         "fixture.experts.gate_up",
@@ -172,6 +184,30 @@ pub fn fixture(parent: &Path) -> Result<(Snapshot, ConversionPlan)> {
         sv: "fixture.experts.down.svh".into(),
     });
     main.push(down);
+    if include_ht3 {
+        main.push(signs("fixture.dense_ht3.suh", 128));
+        main.push(TensorPlan {
+            name: "fixture.dense_ht3.svh".into(),
+            shape: vec![128],
+            encoding: Encoding::F16,
+            origin: Origin::HtScales {
+                tensor: "fixture.dense_ht3.weight".into(),
+                signs_key: "fixture.dense_ht3.svh".into(),
+            },
+            rotation: None,
+        });
+        let mut ht3 = direct(
+            "fixture.dense_ht3.weight",
+            "fixture.dense_ht3.weight",
+            &[128, 128],
+            Encoding::Ht3,
+        );
+        ht3.rotation = Some(Rotation {
+            su: "fixture.dense_ht3.suh".into(),
+            sv: "fixture.dense_ht3.svh".into(),
+        });
+        main.push(ht3);
+    }
     main.sort_by(|a, b| a.name.cmp(&b.name));
     let plan = ConversionPlan {
         architecture: "structural-fixture-not-engine-checkpoint".into(),

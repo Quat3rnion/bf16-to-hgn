@@ -3,7 +3,7 @@ mod support;
 
 fn main() -> anyhow::Result<()> {
     let temporary = tempfile::tempdir()?;
-    let (snapshot, plan) = support::fixture(temporary.path())?;
+    let (snapshot, plan) = support::eta_fixture(temporary.path())?;
     let options = bf16_to_hgn::manifest::Options {
         seed: 7,
         threads: 1,

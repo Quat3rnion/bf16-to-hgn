@@ -4,7 +4,7 @@ use crate::{
     hf::{Dtype, TensorInfo},
     manifest::{AssetRecord, ContainerRecord, Manifest, Options, OutputRecord, SourceRecord},
     numel,
-    progress::{Progress, Stage, Unit},
+    progress::{Progress, Stage, Unit, WorkClass, WorkEstimate},
     rows_cols,
     source::{SourceKind, TensorSource, ASSET_NAMES},
     tensor_progress, ConversionPlan, Origin, TensorPlan, ENCODER_SHA256, SPEC_COMMIT, SPEC_VERSION,
@@ -466,33 +466,35 @@ pub fn convert(
         .prefix(".bf16-to-hgn-")
         .tempdir_in(parent)?;
     let vectors = prepare_rotations(snapshot, plan, options, progress)?;
-    let stage = progress.stage(
-        "Convert passes",
-        progress_values(plan, progress, true)?,
-        Unit::Values,
-    );
+    let stage = if progress.is_enabled() {
+        progress.work_stage("Convert passes", conversion_work(snapshot, plan, options)?)
+    } else {
+        progress.stage("Convert passes", 0, Unit::Values)
+    };
     let mut source_hashes = BTreeMap::new();
     let mut containers = Vec::new();
     for file in &plan.files {
+        if stage.is_enabled() {
+            stage.set_uncounted_item(&format!("create {}", file.filename));
+        }
         let mut writer = Writer::create(&staging.path().join(&file.filename), file)?;
         for (index, tensor) in file.tensors.iter().enumerate() {
-            if stage.is_enabled() {
-                tensor_progress::item(
-                    &stage,
-                    tensor,
-                    "encode",
-                    "CPU",
-                    0,
-                    numel(&tensor.shape)?,
-                    "values",
-                    None,
-                );
-            }
             match &tensor.origin {
                 Origin::Signs { .. } | Origin::HtScales { .. } => {
                     let values = vectors
                         .get(&tensor.name)
                         .context("missing prepared rotation")?;
+                    tensor_progress::item(
+                        &stage,
+                        tensor,
+                        "write rotation",
+                        "CPU",
+                        0,
+                        values.len() as u64,
+                        "values",
+                        None,
+                    );
+                    let started = stage.start_work();
                     let mut bytes = Vec::with_capacity(values.len() * 2);
                     for &value in values {
                         bytes
@@ -509,7 +511,7 @@ pub fn convert(
                         "values",
                         None,
                     );
-                    stage.advance(values.len() as u64);
+                    stage.advance_work(WorkClass::WriteRotation, values.len() as u64, started);
                 }
                 Origin::Tensor { name } => {
                     let info = &snapshot.tensors()[name];
@@ -538,7 +540,7 @@ pub fn convert(
             }
         }
         if stage.is_enabled() {
-            stage.set_item(&format!("hash {}", file.filename));
+            stage.set_uncounted_item(&format!("hash {}", file.filename));
         }
         let (layout, fingerprints) = writer.finish()?;
         let tensors = layout
@@ -565,16 +567,16 @@ pub fn convert(
             sha256,
         })
         .collect();
-    stage.set_item("Copying assets");
+    stage.set_uncounted_item("Copying assets");
     let assets = copy_assets(snapshot, plan, staging.path())?;
-    stage.set_item("Hashing source metadata");
+    stage.set_uncounted_item("Hashing source metadata");
     let (_, config_sha256) = hash_file(&snapshot.asset_path("config.json")?)?;
     let index_sha256 = if snapshot.kind() == SourceKind::Hf {
         Some(hash_file(&snapshot.asset_path("model.safetensors.index.json")?)?.1)
     } else {
         None
     };
-    stage.set_item("Checking source provenance");
+    stage.set_uncounted_item("Checking source provenance");
     let source_provenance = snapshot.provenance()?;
     let manifest = Manifest {
         schema: 2,
@@ -594,7 +596,7 @@ pub fn convert(
         assets,
         containers,
     };
-    stage.set_item("Publishing output");
+    stage.set_uncounted_item("Publishing output");
     let manifest_path = staging.path().join("conversion-manifest.json");
     let mut manifest_file = OpenOptions::new()
         .write(true)
@@ -627,13 +629,15 @@ fn encode_tensor(
     stage: &Stage,
 ) -> Result<String> {
     let mut hash = Sha256::new();
-    if direct_copy(tensor.encoding, info.dtype) {
+    let class = source_work(tensor.encoding, info.dtype, options);
+    if matches!(class, WorkClass::Copy(_)) {
         let mut offset = 0;
         while offset < info.size {
             let len = (info.size - offset).min(COPY_CHUNK as u64) as usize;
             tensor_progress::item(
                 stage, tensor, "copy", "CPU", offset, info.size, "bytes", None,
             );
+            let started = stage.start_work();
             let bytes = snapshot.read_bytes(&info.name, offset, len)?;
             if info.dtype != Dtype::I64 {
                 for value in bytes.chunks_exact(info.dtype.byte_width() as usize) {
@@ -646,7 +650,7 @@ fn encode_tensor(
             tensor_progress::item(
                 stage, tensor, "copy", "CPU", offset, info.size, "bytes", None,
             );
-            stage.advance((len as u64) / info.dtype.byte_width());
+            stage.advance_work(class, (len as u64) / info.dtype.byte_width(), started);
         }
         return Ok(format!("{:x}", hash.finalize()));
     }
@@ -683,6 +687,7 @@ fn encode_tensor(
                 false,
             );
         }
+        let started = stage.start_work();
         let (raw, values) = read_source_values(snapshot, info, (row * cols) as u64, take * cols)?;
         hash.update(raw);
         let (su, sv) = rotation_slice(tensor, vectors, row, take)?;
@@ -733,7 +738,7 @@ fn encode_tensor(
             );
         }
         row += take;
-        stage.advance((take * cols) as u64);
+        stage.advance_work(class, (take * cols) as u64, started);
     }
     Ok(format!("{:x}", hash.finalize()))
 }
@@ -746,11 +751,44 @@ pub(crate) fn direct_copy(encoding: Encoding, dtype: Dtype) -> bool {
 }
 
 fn encode_backend(tensor: &TensorPlan, options: &Options) -> &'static str {
-    if tensor.encoding.ht_bits().is_some() && options.ht_backend == codec::HtBackend::Hip {
-        "HIP"
+    WorkClass::encode(tensor.encoding, options.ht_backend).backend_label()
+}
+
+fn source_work(encoding: Encoding, dtype: Dtype, options: &Options) -> WorkClass {
+    if direct_copy(encoding, dtype) {
+        WorkClass::Copy(encoding)
     } else {
-        "CPU"
+        WorkClass::encode(encoding, options.ht_backend)
     }
+}
+
+/// Build the fixed class budgets once. Preparation and finalization do not
+/// process these counted conversion passes and must not enter their rates.
+fn conversion_work(
+    snapshot: &dyn TensorSource,
+    plan: &ConversionPlan,
+    options: &Options,
+) -> Result<WorkEstimate> {
+    let mut estimate = WorkEstimate::default();
+    for tensor in plan.files.iter().flat_map(|file| &file.tensors) {
+        let values = numel(&tensor.shape)?;
+        let class = match &tensor.origin {
+            Origin::Tensor { name } => {
+                source_work(tensor.encoding, snapshot.tensors()[name].dtype, options)
+            }
+            Origin::Signs { .. } | Origin::HtScales { .. } => WorkClass::WriteRotation,
+            Origin::Ngram { .. } => {
+                estimate
+                    .add(WorkClass::ScanFp8Scale, values)
+                    .context("progress value count overflow")?;
+                WorkClass::encode(Encoding::Fp8G128, codec::HtBackend::Cpu)
+            }
+        };
+        estimate
+            .add(class, values)
+            .context("progress total overflow")?;
+    }
+    Ok(estimate)
 }
 
 fn encode_gate_up(
@@ -763,6 +801,7 @@ fn encode_gate_up(
     options: &Options,
     stage: &Stage,
 ) -> Result<String> {
+    let class = WorkClass::encode(tensor.encoding, options.ht_backend);
     let experts = usize::try_from(tensor.shape[0])?;
     let expert_rows = usize::try_from(tensor.shape[1])?;
     let cols = usize::try_from(tensor.shape[2])?;
@@ -798,6 +837,7 @@ fn encode_gate_up(
                     true,
                 );
             }
+            let started = stage.start_work();
             let (gate_raw, gate) =
                 read_source_values(snapshot, info, (gate_row * cols) as u64, MATRIX_ROWS * cols)?;
             let (up_raw, up) =
@@ -834,6 +874,15 @@ fn encode_gate_up(
             offset = offset
                 .checked_add(pair_bytes)
                 .context("expert payload offset overflow")?;
+            if band + MATRIX_ROWS == half_rows {
+                ensure!(
+                    up_bytes.len() == buffered,
+                    "incomplete expert source coverage"
+                );
+                // Charge the canonical up-plane hash to this expert's final
+                // encode chunk, never to an unrelated later work class.
+                hash.update(&up_bytes);
+            }
             if stage.is_enabled() {
                 tensor_progress::rows(
                     stage,
@@ -846,13 +895,8 @@ fn encode_gate_up(
                     true,
                 );
             }
-            stage.advance((2 * MATRIX_ROWS * cols) as u64);
+            stage.advance_work(class, (2 * MATRIX_ROWS * cols) as u64, started);
         }
-        ensure!(
-            up_bytes.len() == buffered,
-            "incomplete expert source coverage"
-        );
-        hash.update(&up_bytes);
     }
     ensure!(
         offset == writer.layout.entries[index].size,
@@ -947,6 +991,7 @@ fn encode_table(
                     Some("scan"),
                 );
             }
+            let started = stage.start_work();
             let (_, values) = read_source_values(snapshot, info, (row * cols) as u64, take * cols)?;
             for value in values {
                 absmax = absmax.max(value.abs());
@@ -964,7 +1009,7 @@ fn encode_table(
                     Some("scan"),
                 );
             }
-            stage.advance((take * cols) as u64);
+            stage.advance_work(WorkClass::ScanFp8Scale, (take * cols) as u64, started);
         }
     }
     let scale = if absmax == 0.0 { 1.0 } else { absmax / 448.0 };
@@ -995,6 +1040,7 @@ fn encode_table(
                     Some("encode"),
                 );
             }
+            let started = stage.start_work();
             let (raw, values) =
                 read_source_values(snapshot, info, (row * cols) as u64, take * cols)?;
             hash.update(raw);
@@ -1018,7 +1064,11 @@ fn encode_table(
                     Some("encode"),
                 );
             }
-            stage.advance((take * cols) as u64);
+            stage.advance_work(
+                WorkClass::encode(Encoding::Fp8G128, codec::HtBackend::Cpu),
+                (take * cols) as u64,
+                started,
+            );
         }
         hashes.insert(name.clone(), format!("{:x}", hash.finalize()));
     }
@@ -1034,12 +1084,8 @@ fn encode_table(
     Ok(())
 }
 
-/// Count existing value-processing passes only; do no work for hidden bars.
-pub(crate) fn progress_values(
-    plan: &ConversionPlan,
-    progress: &Progress,
-    scan_tables: bool,
-) -> Result<u64> {
+/// Verification visits each output value once; do no work for hidden bars.
+pub(crate) fn verification_values(plan: &ConversionPlan, progress: &Progress) -> Result<u64> {
     if !progress.is_enabled() {
         return Ok(0);
     }
@@ -1047,15 +1093,9 @@ pub(crate) fn progress_values(
         .iter()
         .flat_map(|file| &file.tensors)
         .try_fold(0u64, |total, tensor| {
-            let passes = if scan_tables && matches!(&tensor.origin, Origin::Ngram { .. }) {
-                2
-            } else {
-                1
-            };
-            let values = numel(&tensor.shape)?
-                .checked_mul(passes)
-                .context("progress value count overflow")?;
-            total.checked_add(values).context("progress total overflow")
+            total
+                .checked_add(numel(&tensor.shape)?)
+                .context("progress total overflow")
         })
 }
 
