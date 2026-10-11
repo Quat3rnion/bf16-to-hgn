@@ -1,5 +1,5 @@
-// HIP beam encoder for Halogen's scalar 16-bit / three- or four-bit trellis.
-// The CPU implementation remains the reference; this file never calls it.
+// HIP trellis encoder and independent verification decode/unrotation.
+// The CPU implementations remain the references; this file never calls them.
 //
 // Selection below is an independent implementation of the observable
 // libstdc++ 16 nth_element permutation, not merely its selected set. Changing
@@ -77,6 +77,127 @@ static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559);
 //     + 64*256*(4+1) + 64*12 = 27,607,808 bytes (< 27 MiB).
 static_assert(sizeof(DeviceStorage) == 27607808);
 static_assert(sizeof(DeviceStorage) <= 256u * 1024u * 1024u);
+
+// Decode uses two FP64 axis passes, with only 16 independent 128-point
+// transforms in LDS at once. The complete 128x128 block would require 128 KiB.
+// Batch rectangles contain at most 256 such blocks, even for a single very
+// wide band. Encoder and decoder allocations are independent and lazy.
+constexpr int kDecodeBlocks = 256;
+constexpr int kDecodeValues = kDecodeBlocks * 128 * 128;
+struct DecodeStorage {
+    float codebook[kStates];
+    uint8_t payload[kDecodeValues]; // HT4 paired is the largest input: 1 B/value.
+    uint16_t scales[kDecodeValues / 128];
+    float su[kDecodeBlocks * 128];
+    float sv[kDecodeBlocks * 128];
+    double scratch[kDecodeValues];
+    float output[kDecodeValues];
+};
+static_assert(sizeof(double) == 8 && std::numeric_limits<double>::is_iec559);
+static_assert(sizeof(DecodeStorage) <= 64u * 1024u * 1024u);
+
+__device__ __forceinline__ float decode_half(uint16_t bits) {
+    const unsigned sign = unsigned(bits & 0x8000) << 16;
+    const unsigned exponent = (bits >> 10) & 31;
+    const unsigned fraction = bits & 1023;
+    if (exponent == 0) {
+        // Integer conversion and this power-of-two multiplication are exact,
+        // including half subnormals. Restore the sign even when fraction=0.
+        return __uint_as_float(sign | __float_as_uint(float(fraction) * 0x1p-24f));
+    }
+    return __uint_as_float(sign | ((exponent == 31 ? 255 : exponent + 112) << 23)
+                           | (fraction << 13));
+}
+
+__device__ __forceinline__ uint32_t decode_word(const uint8_t *bytes) {
+    return uint32_t(bytes[0]) | (uint32_t(bytes[1]) << 8)
+        | (uint32_t(bytes[2]) << 16) | (uint32_t(bytes[3]) << 24);
+}
+
+// Each pair has exactly one owner. Complete all pairs at a level before
+// reading the next: both CPU references use this same FP64 butterfly order.
+template<int Stride>
+__device__ __forceinline__ void decode_axis(double *values) {
+    __syncthreads();
+    for (int step = 1; step < 128; step *= 2) {
+        for (int pair = int(threadIdx.x); pair < 16 * 64; pair += kThreads) {
+            const int lane = pair % 64;
+            const int first = (pair / 64) * Stride + (lane / step) * (2 * step) + lane % step;
+            const double a = values[first];
+            const double b = values[first + step];
+            values[first] = a + b;
+            values[first + step] = a - b;
+        }
+        __syncthreads();
+    }
+}
+
+template<int Bits>
+__global__ __launch_bounds__(kThreads) void decode_row_axis(
+    DecodeStorage *storage, int cols, int row_tiles, int tile_offset) {
+    __shared__ double values[16 * 128];
+    const int row_base = int(blockIdx.y) * 16;
+    const int col_base = int(blockIdx.x) * 128;
+    for (int index = int(threadIdx.x); index < 16 * 128; index += kThreads) {
+        const int row = row_base + index / 128;
+        const int col = col_base + index % 128;
+        if constexpr (Bits == 0) {
+            const uint8_t packed = storage->payload[(row * cols + col) / 2];
+            const unsigned code = (packed >> (4 * (col % 2))) & 15;
+            const float scale = decode_half(storage->scales[row * (cols / 128) + col / 128]);
+            // Preserve the CPU's f32 multiply, notably the sign of zero.
+            values[index] = double((float(code) - 8.0f) * scale);
+        } else {
+            // Independent verifier mapping: address the circular 16-bit state
+            // directly, rather than using the encoder's symbol decoder.
+            const int tile = ((row / 128) * (cols / 16) + col / 16) * row_tiles
+                + (row % 128) / 16 + tile_offset;
+            const int value = (col % 16 / 8) * 128 + (row % 16) * 8 + col % 8;
+            const int start = (Bits * (value + 1) + 256 * Bits - 16) % (256 * Bits);
+            const int word = start / 32;
+            const int next = (word + 1) % (8 * Bits);
+            const uint8_t *bytes = storage->payload + tile * (32 * Bits);
+            const uint32_t first = decode_word(bytes + 4 * word);
+            const uint32_t second = decode_word(bytes + 4 * next);
+            const uint16_t state = uint16_t(((uint64_t(first) << 32) | second)
+                                            >> (48 - start % 32));
+            values[index] = double(storage->codebook[state]);
+        }
+    }
+    decode_axis<128>(values);
+    for (int index = int(threadIdx.x); index < 16 * 128; index += kThreads) {
+        const int row = row_base + index / 128;
+        const int col = col_base + index % 128;
+        storage->scratch[row * cols + col] = values[index];
+    }
+}
+
+__global__ __launch_bounds__(kThreads) void decode_column_axis(
+    DecodeStorage *storage, int cols, int per_band_su) {
+    // Padding keeps the transpose from mapping all 16 columns to one LDS bank.
+    __shared__ double values[16 * 129];
+    const int row_base = int(blockIdx.y) * 128;
+    const int col_base = int(blockIdx.x) * 16;
+    // Coalesced global accesses, transposed LDS: the independent transforms
+    // now run down rows, only after the complete column-coordinate pass.
+    for (int index = int(threadIdx.x); index < 16 * 128; index += kThreads) {
+        const int row = row_base + index / 16;
+        const int col = col_base + index % 16;
+        values[(index % 16) * 129 + index / 16] = storage->scratch[row * cols + col];
+    }
+    decode_axis<129>(values);
+    for (int index = int(threadIdx.x); index < 16 * 128; index += kThreads) {
+        const int row = row_base + index / 16;
+        const int col = col_base + index % 16;
+        const double value = values[(index % 16) * 129 + index / 16];
+        const int su_index = (per_band_su ? (row / 128) * cols : 0) + col;
+        // /128 is an exact power-of-two scaling. Keep the two following
+        // multiplies separate and ordered; build.rs disables FP contraction
+        // and preserves f32 denormals, including the final narrowing cast.
+        storage->output[row * cols + col] = float(value * 0x1p-7
+            * double(storage->sv[row]) * double(storage->su[su_index]));
+    }
+}
 
 template<int Bits> struct BlockState {
     static constexpr int histories = kStates >> Bits;
@@ -455,20 +576,23 @@ struct Context {
     std::mutex mutex;
     hipStream_t stream = nullptr;
     DeviceStorage *storage = nullptr;
+    DecodeStorage *decode_storage = nullptr;
     std::array<float, kStates> cached_codebook;
+    std::array<float, kStates> decode_cached_codebook;
     // Remains alive while an error path drains a queued D2H transfer.
     std::array<TileStatus, kBatch> tile_status;
     bool codebook_valid = false;
+    bool decode_codebook_valid = false;
 
     int initialize() {
-        if (storage) return 0;
+        if (stream) return 0;
         hipDeviceProp_t properties{};
         hipError_t error = hipGetDeviceProperties(&properties, 0);
         if (error != hipSuccess) return hip_failure(error, "query HIP device 0");
         const char *arch = properties.gcnArchName;
         if (std::strncmp(arch, "gfx1151", 7) != 0 || (arch[7] != '\0' && arch[7] != ':')) {
             std::snprintf(last_error, sizeof(last_error),
-                          "HIP HT encoding supports only gfx1151; visible device 0 is %s (%s)",
+                          "HIP encoding/verification supports only gfx1151; visible device 0 is %s (%s)",
                           properties.name, arch);
             return -2;
         }
@@ -476,11 +600,14 @@ struct Context {
         int greatest_priority = 0;
         error = hipDeviceGetStreamPriorityRange(&least_priority, &greatest_priority);
         if (error != hipSuccess) return hip_failure(error, "query HIP stream priorities");
-        if (!stream) {
-            error = hipStreamCreateWithPriority(&stream, hipStreamNonBlocking, least_priority);
-            if (error != hipSuccess) return hip_failure(error, "create low-priority HIP stream");
-        }
-        error = hipMalloc(reinterpret_cast<void **>(&storage), sizeof(DeviceStorage));
+        error = hipStreamCreateWithPriority(&stream, hipStreamNonBlocking, least_priority);
+        if (error != hipSuccess) return hip_failure(error, "create low-priority HIP stream");
+        return 0;
+    }
+
+    int ensure_encoder() {
+        if (storage) return 0;
+        const hipError_t error = hipMalloc(reinterpret_cast<void **>(&storage), sizeof(DeviceStorage));
         if (error != hipSuccess) {
             storage = nullptr;
             return hip_failure(error, "allocate bounded 27,607,808-byte HIP workspace");
@@ -488,10 +615,20 @@ struct Context {
         return 0;
     }
 
+    int ensure_decoder() {
+        if (decode_storage) return 0;
+        const hipError_t error = hipMalloc(reinterpret_cast<void **>(&decode_storage), sizeof(DecodeStorage));
+        if (error != hipSuccess) {
+            decode_storage = nullptr;
+            return hip_failure(error, "allocate bounded HIP verification workspace");
+        }
+        return 0;
+    }
+
     ~Context() {
         // Process-lifetime resources only; never touch another device's
         // allocations or reset a device shared with an inference server.
-        if (!stream && !storage) return;
+        if (!stream && !storage && !decode_storage) return;
         int previous = 0;
         hipError_t error = hipGetDevice(&previous);
         if (error == hipSuccess) error = hipSetDevice(0);
@@ -508,6 +645,11 @@ struct Context {
             error = hipFree(storage);
             if (error != hipSuccess)
                 std::fprintf(stderr, "HIP HT cleanup: free workspace: %s\n", hipGetErrorString(error));
+        }
+        if (decode_storage) {
+            error = hipFree(decode_storage);
+            if (error != hipSuccess)
+                std::fprintf(stderr, "HIP cleanup: free verification workspace: %s\n", hipGetErrorString(error));
         }
         if (stream) {
             error = hipStreamDestroy(stream);
@@ -545,7 +687,7 @@ template<class Operation> int with_context(Operation operation) {
         if (rounding != 0) return rounding;
         Context &state = context();
         std::lock_guard<std::mutex> lock(state.mutex);
-        if (!state.storage) {
+        if (!state.stream) {
             int devices = 0;
             const hipError_t error = hipGetDeviceCount(&devices);
             if (error != hipSuccess) return hip_failure(error, "enumerate HIP devices");
@@ -564,6 +706,7 @@ template<class Operation> int with_context(Operation operation) {
             // Do not return while an enqueued transfer could still access a
             // caller-owned buffer. Never trust a partially uploaded cache.
             state.codebook_valid = false;
+            state.decode_codebook_valid = false;
             error = hipStreamSynchronize(state.stream);
             if (error != hipSuccess) append_hip_failure(error, "drain failed HIP operation");
         }
@@ -589,6 +732,8 @@ bool address_overflows(const void *pointer, size_t bytes) {
 
 int encode(Context &state, const float *tiles, const float *codebook,
            uint8_t *codes, int count, int beam, int bits) {
+    const int allocation = state.ensure_encoder();
+    if (allocation != 0) return allocation;
     const size_t codebook_bytes = sizeof(state.cached_codebook);
     if (!state.codebook_valid || std::memcmp(codebook, state.cached_codebook.data(), codebook_bytes) != 0) {
         // Cache contents, not the caller's address: an in-place changed
@@ -635,9 +780,113 @@ int encode(Context &state, const float *tiles, const float *codebook,
     }
     return 0;
 }
+
+hipError_t copy_decode_rectangle(void *destination, size_t destination_pitch,
+                                const void *source, size_t source_pitch,
+                                size_t width, size_t rows, hipMemcpyKind kind,
+                                hipStream_t stream) {
+    if (destination_pitch == width && source_pitch == width)
+        return hipMemcpyAsync(destination, source, width * rows, kind, stream);
+    return hipMemcpy2DAsync(destination, destination_pitch, source, source_pitch,
+                            width, rows, kind, stream);
+}
+
+int decode(Context &state, const uint8_t *bytes, const uint16_t *scales,
+           const float *codebook, const float *su, const float *sv, float *output,
+           int bands, int cols, int bits, int row_tiles, int tile_offset) {
+    const int allocation = state.ensure_decoder();
+    if (allocation != 0) return allocation;
+    DecodeStorage *storage = state.decode_storage;
+    if (bits != 0) {
+        const size_t bytes_count = sizeof(state.decode_cached_codebook);
+        if (!state.decode_codebook_valid
+            || std::memcmp(codebook, state.decode_cached_codebook.data(), bytes_count) != 0) {
+            // Verification supplies its own independent codebook. Never use
+            // the encoder's cache, nor assume stable pointer means stable data.
+            std::memcpy(state.decode_cached_codebook.data(), codebook, bytes_count);
+            const hipError_t error = hipMemcpyAsync(storage->codebook,
+                state.decode_cached_codebook.data(), bytes_count, hipMemcpyHostToDevice, state.stream);
+            if (error != hipSuccess) return hip_failure(error, "upload HIP verifier codebook");
+            state.decode_codebook_valid = true;
+        }
+    }
+    const size_t full_cols = size_t(cols);
+    const size_t width_limit = full_cols < size_t(kDecodeBlocks * 128)
+        ? full_cols : size_t(kDecodeBlocks * 128);
+    const size_t band_limit = kDecodeBlocks / (width_limit / 128);
+    int per_band_su = bits != 0;
+    const void *row_kernel = bits == 0 ? reinterpret_cast<const void *>(decode_row_axis<0>)
+        : bits == 3 ? reinterpret_cast<const void *>(decode_row_axis<3>)
+        : reinterpret_cast<const void *>(decode_row_axis<4>);
+    for (size_t band_base = 0; band_base < size_t(bands);) {
+        const size_t remaining = size_t(bands) - band_base;
+        const size_t batch_bands = remaining < band_limit ? remaining : band_limit;
+        const size_t rows = batch_bands * 128;
+        for (size_t col_base = 0; col_base < full_cols; col_base += width_limit) {
+            const size_t width = full_cols - col_base < width_limit
+                ? full_cols - col_base : width_limit;
+            int batch_cols = int(width);
+            // A horizontally split rectangle always contains one band.
+            // Otherwise whole bands and their per-band metadata are contiguous.
+            const float *input_su = su + (per_band_su ? band_base * full_cols : 0) + col_base;
+            hipError_t error = hipMemcpyAsync(storage->su, input_su,
+                width * (per_band_su ? batch_bands : 1) * sizeof(float),
+                hipMemcpyHostToDevice, state.stream);
+            if (error != hipSuccess) return hip_failure(error, "upload HIP verifier input rotation");
+            error = hipMemcpyAsync(storage->sv, sv + band_base * 128, rows * sizeof(float),
+                                   hipMemcpyHostToDevice, state.stream);
+            if (error != hipSuccess) return hip_failure(error, "upload HIP verifier output rotation");
+            if (bits == 0) {
+                error = copy_decode_rectangle(storage->payload, width / 2,
+                    bytes + band_base * 128 * (full_cols / 2) + col_base / 2, full_cols / 2,
+                    width / 2, rows, hipMemcpyHostToDevice, state.stream);
+                if (error != hipSuccess) return hip_failure(error, "upload HIP I4R codes");
+                // The ABI's half words are little-endian bytes; the host may
+                // supply an unaligned byte plane. No host uint16_t dereference.
+                const uint8_t *scale_bytes = reinterpret_cast<const uint8_t *>(scales);
+                error = copy_decode_rectangle(storage->scales, width / 64,
+                    scale_bytes + band_base * 128 * (full_cols / 64) + col_base / 64,
+                    full_cols / 64, width / 64, rows, hipMemcpyHostToDevice, state.stream);
+                if (error != hipSuccess) return hip_failure(error, "upload HIP I4R scales");
+            } else {
+                const size_t column_bytes = size_t(row_tiles) * size_t(32 * bits);
+                const size_t offset = (band_base * (full_cols / 16) + col_base / 16) * column_bytes;
+                error = hipMemcpyAsync(storage->payload, bytes + offset,
+                    batch_bands * (width / 16) * column_bytes, hipMemcpyHostToDevice, state.stream);
+                if (error != hipSuccess) return hip_failure(error, "upload HIP HT verifier tiles");
+            }
+            void *row_arguments[] = {&storage, &batch_cols, &row_tiles, &tile_offset};
+            error = hipLaunchKernel(row_kernel, dim3(unsigned(width / 128), unsigned(rows / 16)),
+                                    dim3(kThreads), row_arguments, 0, state.stream);
+            if (error != hipSuccess) return hip_failure(error, "launch HIP verifier row butterflies");
+            void *column_arguments[] = {&storage, &batch_cols, &per_band_su};
+            error = hipLaunchKernel(reinterpret_cast<const void *>(decode_column_axis),
+                dim3(unsigned(width / 16), unsigned(rows / 128)), dim3(kThreads),
+                column_arguments, 0, state.stream);
+            if (error != hipSuccess) return hip_failure(error, "launch HIP verifier column butterflies");
+            error = copy_decode_rectangle(output + band_base * 128 * full_cols + col_base,
+                full_cols * sizeof(float), storage->output, width * sizeof(float),
+                width * sizeof(float), rows, hipMemcpyDeviceToHost, state.stream);
+            if (error != hipSuccess) return hip_failure(error, "download HIP verifier values");
+            error = hipStreamSynchronize(state.stream);
+            if (error != hipSuccess) return hip_failure(error, "complete HIP verifier batch");
+        }
+        band_base += batch_bands;
+    }
+    return 0;
+}
+
+int decode_extent(int bands, int cols, size_t &values) {
+    if (bands <= 0 || cols <= 0 || cols % 128 != 0)
+        return fail(-1, "HIP decode requires positive bands and a positive multiple-of-128 column count");
+    if (size_t(bands) > std::numeric_limits<size_t>::max() / 128 / size_t(cols) / sizeof(float))
+        return fail(-1, "HIP decode shape overflows the host address space");
+    values = size_t(bands) * 128 * size_t(cols);
+    return 0;
+}
 } // namespace
 
-// Error text is per calling thread, valid until its next encode/preflight.
+// Error text is per calling thread, valid until its next encode/decode/preflight.
 // Failures may leave a partial output buffer; callers must discard it.
 extern "C" const char *ht_hip_last_error() {
     return last_error;
@@ -647,7 +896,7 @@ extern "C" int ht_hip_preflight() {
     last_error[0] = '\0';
     // Initializes device, low-priority stream and the fixed workspace only;
     // no encode or large kernel is run by preflight.
-    return with_context([](Context &) { return 0; });
+    return with_context([](Context &state) { return state.ensure_encoder(); });
 }
 
 extern "C" int ht_encode_bits_hip(const float *tiles, const float *codebook,
@@ -668,5 +917,56 @@ extern "C" int ht_encode_bits_hip(const float *tiles, const float *codebook,
         return fail(-1, "HIP HT buffer extent overflows the host address space");
     return with_context([&](Context &state) {
         return encode(state, tiles, codebook, codes, count, beam, bits);
+    });
+}
+
+extern "C" int hgn_hip_decode_preflight() {
+    last_error[0] = '\0';
+    // Allocate only the bounded decoder workspace; never the encoder's beam
+    // storage, and never launch a kernel merely to discover availability.
+    return with_context([](Context &state) { return state.ensure_decoder(); });
+}
+
+extern "C" int hgn_hip_decode_i4r(const uint8_t *codes, const uint16_t *scales,
+                                  const float *su, const float *sv, float *out,
+                                  int bands, int cols) {
+    last_error[0] = '\0';
+    size_t values = 0;
+    const int shape = decode_extent(bands, cols, values);
+    if (shape != 0) return shape;
+    if (!codes || !scales || !su || !sv || !out)
+        return fail(-1, "HIP I4R decode requires nonnull buffers");
+    if (address_overflows(codes, values / 2) || address_overflows(scales, values / 64)
+        || address_overflows(su, size_t(cols) * sizeof(float))
+        || address_overflows(sv, size_t(bands) * 128 * sizeof(float))
+        || address_overflows(out, values * sizeof(float)))
+        return fail(-1, "HIP I4R decode buffer extent overflows the host address space");
+    return with_context([&](Context &state) {
+        return decode(state, codes, scales, nullptr, su, sv, out, bands, cols, 0, 8, 0);
+    });
+}
+
+extern "C" int hgn_hip_decode_ht(const uint8_t *bytes, const float *codebook,
+                                 const float *su, const float *sv, float *out,
+                                 int bands, int cols, int bits, int row_tiles, int tile_offset) {
+    last_error[0] = '\0';
+    if (bits != 3 && bits != 4) return fail(-1, "invalid HT verifier width");
+    if (!((row_tiles == 8 && tile_offset == 0)
+          || (row_tiles == 16 && (tile_offset == 0 || tile_offset == 8))))
+        return fail(-1, "invalid HT verifier tile geometry");
+    size_t values = 0;
+    const int shape = decode_extent(bands, cols, values);
+    if (shape != 0) return shape;
+    if (!bytes || !codebook || !su || !sv || !out)
+        return fail(-1, "HIP HT decode requires nonnull buffers");
+    const size_t payload_bytes = size_t(bands) * (size_t(cols) / 16) * size_t(row_tiles) * size_t(32 * bits);
+    if (address_overflows(bytes, payload_bytes)
+        || address_overflows(codebook, kStates * sizeof(float))
+        || address_overflows(su, size_t(bands) * size_t(cols) * sizeof(float))
+        || address_overflows(sv, size_t(bands) * 128 * sizeof(float))
+        || address_overflows(out, values * sizeof(float)))
+        return fail(-1, "HIP HT decode buffer extent overflows the host address space");
+    return with_context([&](Context &state) {
+        return decode(state, bytes, nullptr, codebook, su, sv, out, bands, cols, bits, row_tiles, tile_offset);
     });
 }

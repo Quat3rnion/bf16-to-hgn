@@ -25,6 +25,11 @@ heap fallback; it is not a copied libstdc++ source file.
 tests/hip_selection.hip differentially checks complete device permutations
 against the installed standard-library implementation.
 
+The same HIP source implements independent I4R and HT3/HT4 verification
+decoders with ordered binary64 Hadamard unrotation. HT verification receives
+the Rust verifier's independent codebook rather than using the encoder's
+codebook or re-encoding payloads.
+
 The Rust storage layouts and golden test vectors follow jtsylve/hgn-spec
 1.1.0 at commit 79e75fd4ae7642478823525b0a3212951f584af5:
 https://github.com/jtsylve/hgn-spec/tree/79e75fd4ae7642478823525b0a3212951f584af5

@@ -22,8 +22,15 @@ fn main() -> anyhow::Result<()> {
         ..Options::default()
     };
     let output = temporary.path().join("ht43");
-    conversion::convert(&source, &plan, &output, &options)?;
-    let report = verify::verify(&source, &plan, &output)?;
+    let progress = bf16_to_hgn::progress::Progress::disabled();
+    conversion::convert(&source, &plan, &output, &options, &progress)?;
+    let report = verify::verify(
+        &source,
+        &plan,
+        &output,
+        bf16_to_hgn::verify_gpu::DecodeBackend::Cpu,
+        &progress,
+    )?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     // Independently written GGUF v3 contains genuine F32/Q8_0 payloads, exact
     // PLE integer metadata, and an embedded table. No engine identity or CLI

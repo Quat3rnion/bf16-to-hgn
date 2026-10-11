@@ -89,8 +89,9 @@ pub const NF4_CODEBOOK: [f32; 16] = [
 pub fn q4c_codebook() -> [f32; 16] {
     NF4_CODEBOOK
 }
-/// Execution backend for HT3/HT4 trellis search only.
-/// All rotations, other quantizers, and all decoding remain on the CPU.
+/// Encoding backend for HT3/HT4 trellis search only.
+/// Encoding rotations and other quantizers remain on CPU. Verification selects
+/// its independent decode backend through [`crate::verify_gpu::DecodeBackend`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum HtBackend {

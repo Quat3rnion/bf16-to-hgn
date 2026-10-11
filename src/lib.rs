@@ -7,8 +7,11 @@ pub mod gguf_source;
 pub mod hf;
 pub mod hgn_source;
 pub mod manifest;
+pub mod progress;
 pub mod source;
+pub(crate) mod verification_manifest;
 pub mod verify;
+pub mod verify_gpu;
 
 use codec::Encoding;
 use serde::{Deserialize, Serialize};

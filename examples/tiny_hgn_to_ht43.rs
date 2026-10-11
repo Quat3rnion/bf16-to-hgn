@@ -18,7 +18,8 @@ fn main() -> anyhow::Result<()> {
         ht_beam: 8,
         ..Options::default()
     };
-    conversion::convert(&hf, &plan, &v2, &options)?;
+    let progress = bf16_to_hgn::progress::Progress::disabled();
+    conversion::convert(&hf, &plan, &v2, &options, &progress)?;
 
     let hgn = HgnSidecar::open(&v2.join("model.hgn"))?;
     let source = support::FixtureAssets {
@@ -39,8 +40,14 @@ fn main() -> anyhow::Result<()> {
         ..options
     };
     let output = temporary.path().join("ht43");
-    conversion::convert(&source, &plan, &output, &options)?;
-    let report = verify::verify(&source, &plan, &output)?;
+    conversion::convert(&source, &plan, &output, &options, &progress)?;
+    let report = verify::verify(
+        &source,
+        &plan,
+        &output,
+        bf16_to_hgn::verify_gpu::DecodeBackend::Cpu,
+        &progress,
+    )?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     // A real v2 quantized HGN is decoded and requantized. This fixture-only
     // library plan has no public CLI architecture-validation bypass.

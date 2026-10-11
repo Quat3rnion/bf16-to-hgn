@@ -2,14 +2,17 @@ use crate::{
     codec::{self, EncodedBlock, Encoding, PayloadLayout, QuantMeta},
     container::{self, Entry, Layout, Reader},
     conversion,
-    hf::{self, Dtype, TensorInfo},
-    manifest::{AssetRecord, ErrorTotals, Manifest, Options, SourceRecord, VerifyReport},
-    numel, rows_cols,
+    hf::{Dtype, TensorInfo},
+    manifest::{AssetRecord, ErrorTotals, Options, SourceRecord, VerifyReport},
+    numel,
+    progress::{Progress, Stage, Unit},
+    rows_cols,
     source::{SourceKind, TensorSource},
-    ConversionPlan, Origin, TensorPlan, SPEC_COMMIT, SPEC_VERSION,
+    verification_manifest::read_manifest,
+    verify_gpu::{self, DecodeBackend},
+    ConversionPlan, Origin, TensorPlan,
 };
 use anyhow::{bail, ensure, Context, Result};
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -21,13 +24,22 @@ const MANIFEST_NAME: &str = "conversion-manifest.json";
 const BLOCK_ROWS: usize = 128;
 const RAW_CHUNK: usize = 8 * 1024 * 1024;
 
+/// Read strictly versioned encoding options before constructing the fresh plan.
+/// The runtime decode backend is deliberately not discovered from the manifest.
+pub fn manifest_options(output: &Path) -> Result<Options> {
+    Ok(read_manifest(&output.join(MANIFEST_NAME), None)?.options)
+}
+
 /// Verify every source byte and every output payload without retaining matrices.
 /// Error totals describe the decoded result; they are not a quality threshold.
 pub fn verify(
     snapshot: &dyn TensorSource,
     plan: &ConversionPlan,
     output: &Path,
+    decode_backend: DecodeBackend,
+    progress: &Progress,
 ) -> Result<VerifyReport> {
+    decode_backend.preflight()?;
     snapshot.check_unchanged()?;
     let expected_sources = conversion::validate_plan(snapshot, plan)?;
     for tensor in plan.files.iter().flat_map(|file| &file.tensors) {
@@ -37,7 +49,7 @@ pub fn verify(
     }
     let destinations = conversion::asset_destinations(plan)?;
     check_inventory(output, plan, &destinations)?;
-    let manifest = read_manifest(&output.join(MANIFEST_NAME), plan)?;
+    let manifest = read_manifest(&output.join(MANIFEST_NAME), Some(plan))?;
     let sources = SourceCoverage::new(snapshot, &expected_sources, &manifest.sources)?;
     ensure!(
         manifest.containers.len() == plan.files.len(),
@@ -65,14 +77,24 @@ pub fn verify(
     verify_assets(snapshot, output, &destinations, &manifest.assets)?;
     conversion::validate_ple(snapshot, plan)?;
 
+    let stage = progress.stage(
+        "Verify payloads",
+        conversion::progress_values(plan, progress, false)?,
+        Unit::Values,
+    );
+    stage.set_item("Preparing rotations");
     let rotations = conversion::prepare_rotations(snapshot, plan, &manifest.options)?;
     let mut payloads = PayloadVerifier {
         snapshot,
         options: &manifest.options,
         rotations,
         sources,
+        decode_backend,
+        stage: &stage,
     };
     let mut report = VerifyReport {
+        manifest_schema: manifest.schema,
+        provenance_attested: manifest.source_provenance.is_some(),
         source_tensors: 0,
         output_tensors: 0,
         payload_bytes: 0,
@@ -104,6 +126,9 @@ pub fn verify(
             file_plan.tensors.iter().zip(&record.tensors).enumerate()
         {
             let entry = &reader.layout.entries[index];
+            if stage.is_enabled() {
+                stage.set_item(&format!("decode/check {}", tensor.name));
+            }
             ensure!(
                 output_record.entry == *entry,
                 "manifest entry mismatch: {}",
@@ -124,6 +149,9 @@ pub fn verify(
             let errors = payloads
                 .verify_tensor(&mut reader, index, tensor)
                 .with_context(|| format!("verify {}:{}", file_plan.filename, tensor.name))?;
+            if stage.is_enabled() {
+                stage.set_item(&format!("hash {}", tensor.name));
+            }
             let actual = reader.fingerprint(index)?;
             ensure!(
                 actual == output_record.fingerprint,
@@ -158,65 +186,19 @@ pub fn verify(
             }
         }
     }
+    stage.set_item("Checking source coverage");
     report.source_tensors = payloads.sources.finish()?;
-    ensure!(
-        snapshot.provenance()? == manifest.source_provenance,
-        "source physical provenance mismatch"
-    );
+    if let Some(provenance) = manifest.source_provenance {
+        stage.set_item("Checking source provenance");
+        ensure!(
+            snapshot.provenance()? == provenance,
+            "source physical provenance mismatch"
+        );
+    }
+    stage.set_item("Finalizing verification");
     snapshot.check_unchanged()?;
+    stage.finish();
     Ok(report)
-}
-
-fn read_manifest(path: &Path, plan: &ConversionPlan) -> Result<Manifest> {
-    let json = hf::read_json(path)?;
-    let manifest = Manifest::deserialize(&json).context("invalid conversion manifest")?;
-    // Shared serde types also serve the writer. Reject fields those types would
-    // otherwise silently ignore, including unknown fields in nested records.
-    // Schema2 predates backend selection: omit only the newly defaulted field
-    // when comparing an old manifest, without relaxing any other canonicality.
-    let mut canonical = serde_json::to_value(&manifest)?;
-    if manifest.schema == 2
-        && json["options"]
-            .as_object()
-            .is_some_and(|options| !options.contains_key("ht_backend"))
-    {
-        canonical["options"]
-            .as_object_mut()
-            .expect("serialized Options is an object")
-            .remove("ht_backend");
-    }
-    ensure!(canonical == json, "unknown or noncanonical manifest fields");
-    ensure!(manifest.schema == 2, "unsupported manifest schema");
-    ensure!(manifest.tool == "bf16-to-hgn", "unexpected manifest tool");
-    ensure!(
-        manifest.tool_version == env!("CARGO_PKG_VERSION"),
-        "unsupported manifest tool version"
-    );
-    ensure!(
-        manifest.spec_version == SPEC_VERSION && manifest.spec_commit == SPEC_COMMIT,
-        "manifest specification mismatch"
-    );
-    ensure!(
-        manifest.policy == manifest.options.profile.policy(),
-        "manifest quantization policy mismatch"
-    );
-    // The encoder digest records provenance, not authorization. An unchanged
-    // format/policy remains verifiable after rebuilding the converter.
-    check_sha256(&manifest.encoder_sha256)?;
-    check_sha256(&manifest.config_sha256)?;
-    if let Some(hash) = &manifest.index_sha256 {
-        check_sha256(hash)?;
-    }
-    ensure!(
-        manifest.index_sha256.is_some() == (manifest.source_kind == SourceKind::Hf),
-        "source index provenance does not match source format"
-    );
-    manifest.options.validate()?;
-    ensure!(
-        &manifest.plan == plan,
-        "manifest plan differs from the fresh source plan"
-    );
-    Ok(manifest)
 }
 
 fn check_sha256(hash: &str) -> Result<()> {
@@ -486,6 +468,8 @@ struct PayloadVerifier<'a> {
     options: &'a Options,
     rotations: BTreeMap<String, Vec<f32>>,
     sources: SourceCoverage<'a>,
+    decode_backend: DecodeBackend,
+    stage: &'a Stage,
 }
 
 impl PayloadVerifier<'_> {
@@ -545,6 +529,7 @@ impl PayloadVerifier<'_> {
                 );
             }
             offset += bytes.len() as u64;
+            self.stage.advance(values.len() as u64);
         }
         ensure!(
             offset == reader.layout.entries[index].size,
@@ -576,6 +561,8 @@ impl PayloadVerifier<'_> {
             offset = offset
                 .checked_add(raw.len() as u64)
                 .context("source coverage overflow")?;
+            self.stage
+                .advance((raw.len() as u64) / info.dtype.byte_width());
         }
         self.sources.record(info, hash, offset)?;
         Ok(totals)
@@ -628,7 +615,18 @@ impl PayloadVerifier<'_> {
                 ..QuantMeta::default()
             };
             let decoded = if let Some(bits) = tensor.encoding.ht_bits() {
-                decode_ht_independent(&block.codes, bits, cols, None, su, sv)?
+                decode_ht_for_verification(
+                    self.decode_backend,
+                    &block.codes,
+                    bits,
+                    cols,
+                    None,
+                    su,
+                    sv,
+                )?
+            } else if tensor.encoding == Encoding::I4r && self.decode_backend == DecodeBackend::Hip
+            {
+                verify_gpu::decode_i4r(&block, take, cols, &meta)?
             } else {
                 codec::decode_rows(tensor.encoding, &block, take, cols, &meta)?
             };
@@ -642,6 +640,7 @@ impl PayloadVerifier<'_> {
             }
             accumulate_errors(&mut totals, &source, &decoded)?;
             row += take;
+            self.stage.advance(elements as u64);
         }
         self.sources.record(info, hash, consumed)?;
         Ok(totals)
@@ -702,8 +701,17 @@ impl PayloadVerifier<'_> {
                         .checked_add(raw.len() as u64)
                         .context("source coverage overflow")?;
                     let (su, sv) = verification_rotation_slice(tensor, &self.rotations, row, 128)?;
-                    let decoded = decode_ht_independent(&bytes, bits, cols, Some(is_up), su, sv)?;
+                    let decoded = decode_ht_for_verification(
+                        self.decode_backend,
+                        &bytes,
+                        bits,
+                        cols,
+                        Some(is_up),
+                        su,
+                        sv,
+                    )?;
                     accumulate_errors(&mut totals, &source, &decoded)?;
+                    self.stage.advance((128 * cols) as u64);
                 }
             }
             hash.update(&pending_up);
@@ -780,6 +788,7 @@ impl PayloadVerifier<'_> {
                 output_row = output_row
                     .checked_add(take)
                     .context("table coverage overflow")?;
+                self.stage.advance(elements as u64);
             }
             self.sources.record(info, hash, consumed)?;
         }
@@ -847,21 +856,48 @@ fn verification_rotation_slice<'a>(
     ))
 }
 
-static VERIFICATION_HT_CODEBOOK: std::sync::LazyLock<Vec<f32>> = std::sync::LazyLock::new(|| {
-    (0..=u16::MAX)
-        .map(|state| {
-            let mixed = u32::from(state).wrapping_mul(0x83dcd12d);
-            let sum = (mixed & 255) + ((mixed >> 8) & 255) + ((mixed >> 16) & 255) + (mixed >> 24);
-            let exact = (1774i64 * i64::from(sum) - 905216) as f64 / 262144.0;
-            half::f16::from_f64(exact).to_f32()
-        })
-        .collect()
-});
+pub(crate) static VERIFICATION_HT_CODEBOOK: std::sync::LazyLock<Vec<f32>> =
+    std::sync::LazyLock::new(|| {
+        (0..=u16::MAX)
+            .map(|state| {
+                let mixed = u32::from(state).wrapping_mul(0x83dcd12d);
+                let sum =
+                    (mixed & 255) + ((mixed >> 8) & 255) + ((mixed >> 16) & 255) + (mixed >> 24);
+                let exact = (1774i64 * i64::from(sum) - 905216) as f64 / 262144.0;
+                half::f16::from_f64(exact).to_f32()
+            })
+            .collect()
+    });
+
+fn decode_ht_for_verification(
+    backend: DecodeBackend,
+    bytes: &[u8],
+    bits: usize,
+    cols: usize,
+    paired: Option<bool>,
+    su: &[f32],
+    sv: &[f32],
+) -> Result<Vec<f32>> {
+    match backend {
+        DecodeBackend::Cpu => decode_ht_independent(bytes, bits, cols, paired, su, sv),
+        DecodeBackend::Hip => verify_gpu::decode_ht(
+            bytes,
+            BLOCK_ROWS,
+            cols,
+            bits,
+            su,
+            sv,
+            if paired.is_some() { 16 } else { 8 },
+            if paired == Some(true) { 8 } else { 0 },
+            &VERIFICATION_HT_CODEBOOK,
+        ),
+    }
+}
 
 /// Independent output oracle: addresses each (row,column) directly, extracts
 /// its circular 16-bit state from a two-word window, and performs an FP64
 /// inverse transform. It does not reuse the codec's tile mapping or decoder.
-fn decode_ht_independent(
+pub(crate) fn decode_ht_independent(
     bytes: &[u8],
     bits: usize,
     cols: usize,
@@ -1167,8 +1203,11 @@ fn accumulate_exact(totals: &mut ErrorTotals, raw: &[u8], dtype: Dtype) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hf::Snapshot;
-    use crate::ContainerPlan;
+    use crate::{
+        hf::{self, Snapshot},
+        manifest::Manifest,
+        ContainerPlan,
+    };
     use serde_json::{json, Value};
     use std::{
         fs::File,
@@ -1290,13 +1329,24 @@ mod tests {
         };
         let snapshot = Snapshot::open(&root).unwrap();
         let output = directory.path().join("output");
-        conversion::convert(&snapshot, &plan, &output, &Options::default()).unwrap();
+        conversion::convert(
+            &snapshot,
+            &plan,
+            &output,
+            &Options::default(),
+            &Progress::disabled(),
+        )
+        .unwrap();
         Fixture {
             _directory: directory,
             snapshot,
             plan,
             output,
         }
+    }
+
+    fn fixture_manifest(fixture: &Fixture) -> Manifest {
+        serde_json::from_value(hf::read_json(&fixture.output.join(MANIFEST_NAME)).unwrap()).unwrap()
     }
 
     fn save_manifest(fixture: &Fixture, manifest: &Manifest) {
@@ -1327,8 +1377,7 @@ mod tests {
     // Give corrupt bytes internally consistent hashes/checksums. Semantic and
     // source checks must still reject them, independently of fingerprint checks.
     fn reseal(fixture: &Fixture, container_index: usize, tensor_index: usize) {
-        let mut manifest =
-            read_manifest(&fixture.output.join(MANIFEST_NAME), &fixture.plan).unwrap();
+        let mut manifest = fixture_manifest(&fixture);
         let path = fixture
             .output
             .join(&fixture.plan.files[container_index].filename);
@@ -1351,7 +1400,14 @@ mod tests {
     }
 
     fn assert_rejected(fixture: &Fixture, message: &str) {
-        let error = verify(&fixture.snapshot, &fixture.plan, &fixture.output).unwrap_err();
+        let error = verify(
+            &fixture.snapshot,
+            &fixture.plan,
+            &fixture.output,
+            DecodeBackend::Cpu,
+            &Progress::disabled(),
+        )
+        .unwrap_err();
         assert!(
             format!("{error:#}").contains(message),
             "unexpected error: {error:#}"
@@ -1361,7 +1417,14 @@ mod tests {
     #[test]
     fn actual_conversion_is_fully_verified_across_partial_blocks() {
         let fixture = fixture();
-        let report = verify(&fixture.snapshot, &fixture.plan, &fixture.output).unwrap();
+        let report = verify(
+            &fixture.snapshot,
+            &fixture.plan,
+            &fixture.output,
+            DecodeBackend::Cpu,
+            &Progress::disabled(),
+        )
+        .unwrap();
         assert_eq!(report.source_tensors, 6);
         assert_eq!(report.output_tensors, 6);
         assert_eq!(report.errors.len(), 6);
@@ -1387,11 +1450,17 @@ mod tests {
     #[test]
     fn provenance_hash_allows_rebuilds_but_manifest_fields_are_strict() {
         let fixture = fixture();
-        let mut manifest =
-            read_manifest(&fixture.output.join(MANIFEST_NAME), &fixture.plan).unwrap();
+        let mut manifest = fixture_manifest(&fixture);
         manifest.encoder_sha256 = "a".repeat(64);
         save_manifest(&fixture, &manifest);
-        verify(&fixture.snapshot, &fixture.plan, &fixture.output).unwrap();
+        verify(
+            &fixture.snapshot,
+            &fixture.plan,
+            &fixture.output,
+            DecodeBackend::Cpu,
+            &Progress::disabled(),
+        )
+        .unwrap();
         let mut json = serde_json::to_value(&manifest).unwrap();
         json["sources"][0]["unexpected"] = json!(true);
         fs::write(
@@ -1411,7 +1480,7 @@ mod tests {
     #[test]
     fn manifest_sources_require_exact_metadata_coverage_and_hashes() {
         let fixture = fixture();
-        let original = read_manifest(&fixture.output.join(MANIFEST_NAME), &fixture.plan).unwrap();
+        let original = fixture_manifest(&fixture);
         let mut manifest = original.clone();
         manifest.sources[0].tensor.offset += 1;
         save_manifest(&fixture, &manifest);
@@ -1506,8 +1575,7 @@ mod tests {
     #[test]
     fn inventories_and_asset_provenance_are_exact() {
         let fixture = fixture();
-        let mut manifest =
-            read_manifest(&fixture.output.join(MANIFEST_NAME), &fixture.plan).unwrap();
+        let mut manifest = fixture_manifest(&fixture);
         manifest.assets[0].source = "tokenizer.json".into();
         save_manifest(&fixture, &manifest);
         assert_rejected(&fixture, "manifest asset source mismatch");
@@ -1564,8 +1632,7 @@ mod tests {
     #[test]
     fn manifest_plan_must_match_even_with_equal_tensor_counts() {
         let fixture = fixture();
-        let mut manifest =
-            read_manifest(&fixture.output.join(MANIFEST_NAME), &fixture.plan).unwrap();
+        let mut manifest = fixture_manifest(&fixture);
         manifest.plan.files[0].tensors.swap(0, 1);
         save_manifest(&fixture, &manifest);
         assert_rejected(&fixture, "fresh source plan");
@@ -1611,11 +1678,14 @@ pub(crate) fn verify_tensor_fixture(
     }];
     let expected = BTreeSet::from([name.clone()]);
     let sources = SourceCoverage::new(snapshot, &expected, &records)?;
+    let stage = Progress::disabled().stage("Verify fixture", 0, Unit::Values);
     let mut verifier = PayloadVerifier {
         snapshot,
         options,
         rotations,
         sources,
+        decode_backend: DecodeBackend::Cpu,
+        stage: &stage,
     };
     let totals = verifier
         .verify_tensor(reader, 0, tensor)?
@@ -1629,5 +1699,6 @@ pub(crate) fn verify_tensor_fixture(
         fingerprint.xor32 == reader.layout.entries[0].checksum,
         "fixture payload checksum mismatch"
     );
+    stage.finish();
     Ok(totals)
 }

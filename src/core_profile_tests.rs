@@ -88,6 +88,11 @@ fn paired_stream_encode_and_independent_verify_cover_canonical_source_order() {
             &mut writer,
             &vectors,
             &options,
+            &crate::progress::Progress::disabled().stage(
+                "fixture",
+                0,
+                crate::progress::Unit::Values,
+            ),
         )
         .unwrap();
         assert_eq!(hash, snapshot.hash_tensor("expert").unwrap());

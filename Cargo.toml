@@ -13,6 +13,7 @@ hip = []
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 half = "2.4"
+indicatif = "0.18"
 libc = "0.2"
 memmap2 = "0.9"
 serde = { version = "1.0", features = ["derive"] }

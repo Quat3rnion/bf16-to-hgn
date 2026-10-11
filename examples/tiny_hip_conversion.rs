@@ -2,6 +2,7 @@
 //! independent full verification and byte-for-byte HGN container comparison.
 //! `--root /tmp/tiny-hip` retains inputs/outputs; a CPU-only executable can then
 //! use `--root /tmp/tiny-hip --verify-only` without a GPU or HIP feature.
+//! Select real HIP verification with `--verify-only --decode-backend hip`.
 
 #[path = "../tests/support/mod.rs"]
 mod support;
@@ -11,7 +12,9 @@ use bf16_to_hgn::{
     codec::HtBackend,
     conversion, hf,
     manifest::{Manifest, Options, OutputProfile},
+    progress::Progress,
     verify,
+    verify_gpu::DecodeBackend,
 };
 use clap::Parser;
 use serde_json::{json, Value};
@@ -31,6 +34,9 @@ struct Args {
     /// Verify existing outputs and compare bytes; works in CPU-only builds.
     #[arg(long, requires = "root")]
     verify_only: bool,
+    /// Runtime HT3/HT4/I4R decoder; independent of recorded encoding provenance.
+    #[arg(long, value_enum, default_value_t = DecodeBackend::Cpu)]
+    decode_backend: DecodeBackend,
     #[arg(long, default_value_t = 8)]
     ht_beam: usize,
 }
@@ -63,10 +69,14 @@ fn compare_container(cpu: &Path, hip: &Path) -> Result<Value> {
     Ok(json!({"bytes": size, "sha256": format!("{:x}", hash.finalize()), "identical_bytes": true}))
 }
 
-fn verify_and_compare(root: &Path) -> Result<Value> {
+fn verify_and_compare(
+    root: &Path,
+    decode_backend: DecodeBackend,
+    progress: &Progress,
+) -> Result<Value> {
     let snapshot = hf::Snapshot::open(&root.join("source"))?;
     let mut manifests = Vec::new();
-    let mut reports = Vec::new();
+    let mut reports = Vec::<Value>::new();
     for (name, backend) in [("cpu", HtBackend::Cpu), ("hip", HtBackend::Hip)] {
         let output = root.join(name);
         let manifest: Manifest =
@@ -76,7 +86,19 @@ fn verify_and_compare(root: &Path) -> Result<Value> {
             manifest.options.ht_backend == backend,
             "{name} manifest records the wrong backend"
         );
-        let report = verify::verify(&snapshot, &manifest.plan, &output)?;
+        let report = serde_json::to_value(verify::verify(
+            &snapshot,
+            &manifest.plan,
+            &output,
+            decode_backend,
+            progress,
+        )?)?;
+        if let Some(reference) = reports.first() {
+            ensure!(
+                reference["verification"] == report,
+                "complete verification reports differ for CPU/HIP encoded payloads"
+            );
+        }
         reports.push(json!({"backend": backend, "verification": report}));
         manifests.push(manifest);
     }
@@ -105,8 +127,13 @@ fn verify_and_compare(root: &Path) -> Result<Value> {
         )?;
         containers.push(json!({"filename": container.filename, "comparison": comparison}));
     }
+    let decode_backend = match decode_backend {
+        DecodeBackend::Cpu => "cpu",
+        DecodeBackend::Hip => "hip",
+    };
     Ok(json!({
         "fixture": "library-only; not an engine-compatible checkpoint or public CLI bypass",
+        "decode_backend": decode_backend,
         "ht_beam": cpu.options.ht_beam,
         "conversion_encoder_sha256": cpu.encoder_sha256,
         "verifier_encoder_sha256": bf16_to_hgn::ENCODER_SHA256,
@@ -129,6 +156,7 @@ fn main() -> Result<()> {
         // Fail before creating even a fixture directory: never fake a GPU run.
         options.validate_for_execution()?;
     }
+    let progress = Progress::stderr();
     let mut temporary = None;
     let root = if let Some(root) = args.root {
         if !args.verify_only {
@@ -151,12 +179,12 @@ fn main() -> Result<()> {
                 ht_backend: backend,
                 ..options.clone()
             };
-            conversion::convert(&snapshot, &plan, &root.join(name), &opts)?;
+            conversion::convert(&snapshot, &plan, &root.join(name), &opts, &progress)?;
         }
     }
     println!(
         "{}",
-        serde_json::to_string_pretty(&verify_and_compare(&root)?)?
+        serde_json::to_string_pretty(&verify_and_compare(&root, args.decode_backend, &progress)?)?
     );
     // Retained roots are never deleted; the default TempDir cleans up its own fixture.
     drop(temporary);

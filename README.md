@@ -108,8 +108,8 @@ fallbacks remain. Notices and the original source attribution are under
 `native/`. The conversion manifest records an aggregate SHA-256 of the
 compiled tool's source files, lockfile and helper.
 
-For optional Strix Halo GPU encoding, build with ROCm/HIP and ordinary
-**libstdc++ 16 for both C++ translation units**:
+For optional Strix Halo GPU encoding and verification, build with ROCm/HIP
+and ordinary **libstdc++ 16 for both C++ translation units**:
 
 ```sh
 # From this crate directory; separate output keeps existing binaries intact.
@@ -118,6 +118,8 @@ CARGO_TARGET_DIR=/tmp/bf16-hgn-hip-target CARGO_BUILD_JOBS=1 \
 HIP_BIN=/tmp/bf16-hgn-hip-target/release/bf16-to-hgn
 $HIP_BIN convert --source /path/to/hf-bf16 --output /path/to/new-output \
   --profile ht43 --ht-backend hip --ht-beam 128
+$HIP_BIN verify --source /path/to/hf-bf16 --output /path/to/new-output \
+  --decode-backend hip
 ```
 
 `ROCM_PATH` defaults to `/opt/rocm`; `HIPCC` may override its compiler.
@@ -133,6 +135,26 @@ CUDA and other GPU architectures are not implemented.
 unambiguous. `inspect`, `plan` and `convert` accept `--profile v2|ht43`;
 omitting it selects v2. `verify` derives the profile and encoding options
 from `conversion-manifest.json`, not a CLI profile override.
+
+`verify --decode-backend cpu|hip` selects the verifier's runtime decoder
+independently of the encoder backend recorded in the manifest. CPU is the
+default. HIP accelerates I4R and independent HT3/HT4 decoding and inverse
+rotations, including paired HT bands. Other codecs, SHA-256/XOR checks,
+layout/padding/metadata validation and sequential F64 error accumulation
+stay on CPU. GPU verification does not re-encode the weights or skip checks.
+
+Conversion and verification show indicatif stage progress on terminal stderr:
+completed work, throughput, stage ETA and the current tensor. Updates happen
+at streaming chunk/band boundaries, including within large expert tensors.
+JSON stdout is unchanged; redirected stderr has no animated progress.
+Library callers explicitly supply a disabled progress handle by default.
+“Convert passes” counts each output value once, plus n-gram values once more
+for the mandatory global-scale scan; it is work across passes, not the
+model's unique parameter count. Verification counts each output value once.
+Hashing, provenance and publication can still be running after all values
+are counted; only successful finalization prints “done”. ETA estimates the
+current operation, not a promise across codecs with different costs.
+Errors print “stopped” rather than claiming completion.
 
 ```sh
 # HF: metadata inspection and deterministic plan, without tensor payload reads.
@@ -182,6 +204,25 @@ equality where applicable, finite quantized scales, and every decoded
 quantized value against canonical source values. F64 squared-error totals
 measure conversion error, not model quality or an acceptance threshold.
 
+Strix Halo verification acceptance (2026-10-10): the rebuilt HIP verifier
+checked Blackfrost's schema-1 conversion: 1,658 source tensors, 2,349 output
+tensors and 118,785,459,868 payload bytes. All 1,531 numerical error records
+matched the original CPU verifier bit-for-bit. The GPU run took 19m36s
+versus the original CPU run's 22m19s, both with a 4 GiB memory cap, no swap
+and a two-CPU quota; these shared-host runs are not an isolated benchmark.
+Eleven hardware regressions passed, including exact CPU/GPU decode and
+complete-report comparisons. A verification-only ROCm trace confirmed
+HT3/HT4 row decoding and column unrotation kernels, not encoding kernels;
+profiler timestamp warnings mean those trace durations are not benchmarks.
+Terminal conversion/verification, quiet redirected JSON and a corrupted
+payload's nonzero exit with “stopped” progress were exercised.
+
+The same unchanged Blackfrost files passed Halogen 0.17.5 native verification
+and isolated arithmetic, instruction, tool-call and vision smokes with no
+NPU models loaded. Its thinking-forcing template required the explicitly
+approved `HALOGEN_TEMPLATE_UNCHECKED=1` override. This is functional smoke
+coverage, not a model-quality or full-context qualification.
+
 All source files, sidecars and assets must remain immutable during conversion
 and verification. Signatures and consumed-byte hashes are checked. Concurrent
 external truncation of an mmap-backed HF input cannot be made safe by metadata
@@ -223,10 +264,14 @@ never presented as raw HGN/GGUF payload hashes. There are no absolute source
 paths, timestamps, credentials or assumed upstream repository. The HGN
 identity denotes the engine format, not the checkpoint's provenance.
 
-**Schema 2 is a clean manifest cutover, not schema-1 compatible.** The new
-verifier rejects schema-1 outputs; use the original preserved schema-1
-executable to verify old/running conversions. It does not migrate old
-manifests or reinterpret their source hashes.
+The writer produces schema 2. The verifier also reads **strict schema-1 HF
+manifests** without modifying or migrating them. Schema 1 attests raw HF
+safetensors tensor bytes, the required index, assets and output payloads;
+it cannot attest HGN/GGUF sources or schema-2 physical provenance such as
+shard-header hashes. Its profile is v2 and its encoder backend is CPU.
+The verification report exposes `manifest_schema` and `provenance_attested`;
+schema-1 provenance is explicitly unattested, never synthesized from the
+current source. Missing provenance in a schema-2 manifest remains an error.
 
 A staging directory is created beside the requested output. Payloads are
 written at preplanned aligned offsets; header/table are finalized only
@@ -336,16 +381,17 @@ import decoder scratch and native per-worker trellis scratch are additional.
 These are working-set bounds, not an exact RSS guarantee for every allocator/OS.
 
 Default `--ht-backend cpu --threads 1` is deliberate. `--threads` controls
-only CPU HT workers (1–64), not HIP. HIP accelerates HT3/HT4 trellis search;
-rotations and all other codecs remain on CPU. It supports every CLI beam
+only CPU HT workers (1–64), not HIP. During conversion, HIP accelerates HT3/HT4
+trellis search; rotations and all other codecs remain on CPU. It supports every CLI beam
 1–256; exact beam 0 and larger library-only beams require the CPU backend.
 Requesting HIP without the feature, a compatible device, or a working runtime
 is an error, never a silent CPU fallback. Real conversion preflights HIP before
 creating staging output; metadata-only inspect/plan do not initialize a GPU.
 
-HIP uses device 0 (respecting `HIP_VISIBLE_DEVICES`), a least-priority stream,
-64 tiles per batch and one reusable **27,607,808-byte device allocation**.
-Runtime/driver memory is additional. Calls share a serialized persistent
+HIP uses device 0 (respecting `HIP_VISIBLE_DEVICES`) and a least-priority
+stream. Encoding uses 64 tiles per batch and a reusable **27,607,808-byte
+device allocation**; verification has its own lazily allocated bounded
+decode workspace. Runtime/driver memory is additional. Calls share a serialized persistent
 context and content-checked codebook cache. A low-priority stream is not
 isolation: HIP still competes with inference for GPU compute and shared UMA.
 There is no parallel whole-tensor/expert queue or automatic service management.
@@ -554,6 +600,13 @@ throughput. A full v2 conversion is not evidence for HT43 qualification.
 
 ## Changes
 
+- Added explicit HIP verification of I4R and independent HT3/HT4 decoding,
+  retaining CPU integrity checks and exact sequential error accumulation.
+- Added strict read-only schema-1 HF verification alongside schema 2,
+  with explicit provenance-attestation status and no artifact migration.
+- Added indicatif terminal progress for conversion and verification,
+  including updates within large tensors and clean redirected JSON output.
+
 - Added opt-in gfx1151 HIP HT3/HT4 encoding, bounded reusable device storage,
   explicit backend provenance and CPU-only verification of HIP output.
 - Added CPU/GPU differential benchmarks, native selection regressions and
@@ -569,6 +622,6 @@ throughput. A full v2 conversion is not evidence for HT43 qualification.
   and matching assets; HF BF16 input and default v2 quantization remain.
 - Added the exact HT43 expert/mixer store and paired-band layout profile.
 - Added schema-2 canonical-source hashes plus separate physical provenance;
-  old schema-1 outputs require their original verifier.
+  schema-1 raw HF hashes remain explicitly distinguished during verification.
 - Added executable tiny conversions for HF/HGN/GGUF → HT43 and bounded
   regression coverage; no hidden calibration or stock-weight substitution.

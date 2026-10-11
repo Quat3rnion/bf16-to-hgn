@@ -9,8 +9,10 @@ use bf16_to_hgn::{
     container, conversion,
     hf::Snapshot,
     manifest::{Options, OutputProfile},
+    progress::Progress,
     source::{self, SourceKind, SourceOptions, TensorSource},
     verify,
+    verify_gpu::DecodeBackend,
 };
 use std::{
     fs::{self, OpenOptions},
@@ -31,8 +33,15 @@ fn actual_fixture_converts_and_verifies_every_source_and_output() -> Result<()> 
     let temporary = tempfile::tempdir()?;
     let (snapshot, plan) = support::fixture(temporary.path())?;
     let output = temporary.path().join("converted");
-    let manifest = conversion::convert(&snapshot, &plan, &output, &options())?;
-    let report = verify::verify(&snapshot, &plan, &output)?;
+    let manifest =
+        conversion::convert(&snapshot, &plan, &output, &options(), &Progress::disabled())?;
+    let report = verify::verify(
+        &snapshot,
+        &plan,
+        &output,
+        DecodeBackend::Cpu,
+        &Progress::disabled(),
+    )?;
     assert_eq!(report.source_tensors, snapshot.tensors.len());
     assert_eq!(
         report.output_tensors,
@@ -72,8 +81,8 @@ fn same_source_seed_and_compiled_encoder_produce_identical_bytes() -> Result<()>
     let (snapshot, plan) = support::fixture(temporary.path())?;
     let first = temporary.path().join("first");
     let second = temporary.path().join("second");
-    let a = conversion::convert(&snapshot, &plan, &first, &options())?;
-    let b = conversion::convert(&snapshot, &plan, &second, &options())?;
+    let a = conversion::convert(&snapshot, &plan, &first, &options(), &Progress::disabled())?;
+    let b = conversion::convert(&snapshot, &plan, &second, &options(), &Progress::disabled())?;
     assert_eq!(a, b);
     for file in &plan.files {
         assert_eq!(
@@ -91,7 +100,9 @@ fn existing_destination_is_not_clobbered() -> Result<()> {
     let output = temporary.path().join("converted");
     fs::create_dir(&output)?;
     fs::write(output.join("sentinel"), b"untouched")?;
-    assert!(conversion::convert(&snapshot, &plan, &output, &options()).is_err());
+    assert!(
+        conversion::convert(&snapshot, &plan, &output, &options(), &Progress::disabled()).is_err()
+    );
     assert_eq!(fs::read(output.join("sentinel"))?, b"untouched");
     assert_eq!(fs::read_dir(&output)?.count(), 1);
     assert_no_staging(temporary.path())?;
@@ -103,7 +114,9 @@ fn output_inside_input_is_rejected_without_writes() -> Result<()> {
     let temporary = tempfile::tempdir()?;
     let (snapshot, plan) = support::fixture(temporary.path())?;
     let output = snapshot.root.join("converted");
-    assert!(conversion::convert(&snapshot, &plan, &output, &options()).is_err());
+    assert!(
+        conversion::convert(&snapshot, &plan, &output, &options(), &Progress::disabled()).is_err()
+    );
     assert!(!output.exists());
     assert_no_staging(&snapshot.root)?;
     Ok(())
@@ -123,7 +136,7 @@ fn failed_encoding_cleans_staging_and_never_publishes() -> Result<()> {
     drop(file);
     let snapshot = Snapshot::open(&snapshot.root)?;
     let output = temporary.path().join("converted");
-    let error = conversion::convert(&snapshot, &plan, &output, &options())
+    let error = conversion::convert(&snapshot, &plan, &output, &options(), &Progress::disabled())
         .expect_err("nonfinite BF16 must fail");
     assert!(format!("{error:#}").contains("nonfinite"));
     assert!(!output.exists());
@@ -136,7 +149,8 @@ fn modified_payload_and_manifest_coverage_are_rejected() -> Result<()> {
     let temporary = tempfile::tempdir()?;
     let (snapshot, plan) = support::fixture(temporary.path())?;
     let output = temporary.path().join("converted");
-    let manifest = conversion::convert(&snapshot, &plan, &output, &options())?;
+    let manifest =
+        conversion::convert(&snapshot, &plan, &output, &options(), &Progress::disabled())?;
     let index = manifest.containers[0]
         .tensors
         .iter()
@@ -149,7 +163,14 @@ fn modified_payload_and_manifest_coverage_are_rejected() -> Result<()> {
     file.seek(SeekFrom::Start(offset))?;
     file.write_all(&[original[offset as usize] ^ 1])?;
     file.sync_all()?;
-    assert!(verify::verify(&snapshot, &plan, &output).is_err());
+    assert!(verify::verify(
+        &snapshot,
+        &plan,
+        &output,
+        DecodeBackend::Cpu,
+        &Progress::disabled()
+    )
+    .is_err());
     drop(file);
     fs::write(&path, original)?;
     let mut corrupt = manifest;
@@ -158,7 +179,14 @@ fn modified_payload_and_manifest_coverage_are_rejected() -> Result<()> {
         output.join("conversion-manifest.json"),
         serde_json::to_vec(&corrupt)?,
     )?;
-    assert!(verify::verify(&snapshot, &plan, &output).is_err());
+    assert!(verify::verify(
+        &snapshot,
+        &plan,
+        &output,
+        DecodeBackend::Cpu,
+        &Progress::disabled()
+    )
+    .is_err());
     Ok(())
 }
 
@@ -167,9 +195,16 @@ fn unmanifested_output_and_source_mutations_are_rejected() -> Result<()> {
     let temporary = tempfile::tempdir()?;
     let (snapshot, plan) = support::fixture(temporary.path())?;
     let output = temporary.path().join("converted");
-    conversion::convert(&snapshot, &plan, &output, &options())?;
+    conversion::convert(&snapshot, &plan, &output, &options(), &Progress::disabled())?;
     fs::write(output.join("unknown.hgn"), b"unexpected")?;
-    assert!(verify::verify(&snapshot, &plan, &output).is_err());
+    assert!(verify::verify(
+        &snapshot,
+        &plan,
+        &output,
+        DecodeBackend::Cpu,
+        &Progress::disabled()
+    )
+    .is_err());
     fs::remove_file(output.join("unknown.hgn"))?;
     let info = &snapshot.tensors["fixture.raw.weight"];
     let mut file = OpenOptions::new()
@@ -180,7 +215,14 @@ fn unmanifested_output_and_source_mutations_are_rejected() -> Result<()> {
     file.sync_all()?;
     drop(file);
     let changed = Snapshot::open(&snapshot.root)?;
-    assert!(verify::verify(&changed, &plan, &output).is_err());
+    assert!(verify::verify(
+        &changed,
+        &plan,
+        &output,
+        DecodeBackend::Cpu,
+        &Progress::disabled()
+    )
+    .is_err());
     Ok(())
 }
 
@@ -189,7 +231,7 @@ fn malformed_hgn_geometry_and_unused_shape_slots_are_rejected() -> Result<()> {
     let temporary = tempfile::tempdir()?;
     let (snapshot, plan) = support::fixture(temporary.path())?;
     let output = temporary.path().join("converted");
-    conversion::convert(&snapshot, &plan, &output, &options())?;
+    conversion::convert(&snapshot, &plan, &output, &options(), &Progress::disabled())?;
     let path = output.join("model.hgn");
     let mut bytes = fs::read(&path)?;
     bytes[container::HEADER_SIZE as usize + 120..container::HEADER_SIZE as usize + 128]
@@ -288,8 +330,14 @@ fn ht43_hf_matrix_fixture_converts_with_explicit_canonical_provenance() -> Resul
         ..options()
     };
     let output = temporary.path().join("ht43");
-    let manifest = conversion::convert(&snapshot, &plan, &output, &options)?;
-    let report = verify::verify(&snapshot, &plan, &output)?;
+    let manifest = conversion::convert(&snapshot, &plan, &output, &options, &Progress::disabled())?;
+    let report = verify::verify(
+        &snapshot,
+        &plan,
+        &output,
+        DecodeBackend::Cpu,
+        &Progress::disabled(),
+    )?;
     assert_eq!(manifest.schema, 2);
     assert_eq!(manifest.source_kind, SourceKind::Hf);
     assert!(manifest.index_sha256.is_some());
@@ -350,8 +398,15 @@ fn imported_f32_bf16_boundary_preserves_source_and_rounds_once() -> Result<()> {
         profile: OutputProfile::Ht43,
         ..options()
     };
-    let mut manifest = conversion::convert(&source, &plan, &output, &options)?;
-    let report = verify::verify(&source, &plan, &output)?;
+    let mut manifest =
+        conversion::convert(&source, &plan, &output, &options, &Progress::disabled())?;
+    let report = verify::verify(
+        &source,
+        &plan,
+        &output,
+        DecodeBackend::Cpu,
+        &Progress::disabled(),
+    )?;
     assert_eq!(manifest.source_kind, SourceKind::Hgn);
     assert!(manifest.index_sha256.is_none());
     assert!(serde_json::to_value(&manifest)?
@@ -376,7 +431,14 @@ fn imported_f32_bf16_boundary_preserves_source_and_rounds_once() -> Result<()> {
         output.join("conversion-manifest.json"),
         serde_json::to_vec(&manifest)?,
     )?;
-    assert!(verify::verify(&source, &plan, &output).is_err());
+    assert!(verify::verify(
+        &source,
+        &plan,
+        &output,
+        DecodeBackend::Cpu,
+        &Progress::disabled()
+    )
+    .is_err());
     Ok(())
 }
 
@@ -394,7 +456,7 @@ fn imported_f32_overflow_is_rejected_before_publication() -> Result<()> {
         profile: OutputProfile::Ht43,
         ..options()
     };
-    assert!(conversion::convert(&source, &plan, &output, &options).is_err());
+    assert!(conversion::convert(&source, &plan, &output, &options, &Progress::disabled()).is_err());
     assert!(!output.exists());
     assert_no_staging(temporary.path())?;
     Ok(())
@@ -452,8 +514,14 @@ fn real_gguf_f32_q8_and_integer_metadata_convert_and_verify_ht43() -> Result<()>
         profile: OutputProfile::Ht43,
         ..options()
     };
-    let manifest = conversion::convert(&source, &plan, &output, &options)?;
-    let report = verify::verify(&source, &plan, &output)?;
+    let manifest = conversion::convert(&source, &plan, &output, &options, &Progress::disabled())?;
+    let report = verify::verify(
+        &source,
+        &plan,
+        &output,
+        DecodeBackend::Cpu,
+        &Progress::disabled(),
+    )?;
     assert_eq!(manifest.source_kind, SourceKind::Gguf);
     assert!(manifest.index_sha256.is_none());
     assert_eq!(report.source_tensors, 133);
@@ -487,18 +555,36 @@ fn verification_accepts_hip_metadata_and_schema2_without_backend() -> Result<()>
     let temporary = tempfile::tempdir()?;
     let (snapshot, plan) = support::fixture(temporary.path())?;
     let output = temporary.path().join("converted");
-    let manifest = conversion::convert(&snapshot, &plan, &output, &options())?;
+    let manifest =
+        conversion::convert(&snapshot, &plan, &output, &options(), &Progress::disabled())?;
     assert_eq!(manifest.schema, 2);
     assert_eq!(manifest.options.ht_backend, HtBackend::Cpu);
     assert_eq!(manifest.plan, plan);
-    let current = verify::verify(&snapshot, &plan, &output)?;
+    let current = verify::verify(
+        &snapshot,
+        &plan,
+        &output,
+        DecodeBackend::Cpu,
+        &Progress::disabled(),
+    )?;
+    assert_eq!(verify::manifest_options(&output)?, manifest.options);
     let mut json = serde_json::to_value(&manifest)?;
     json["options"]["ht_backend"] = serde_json::json!("hip");
     fs::write(
         output.join("conversion-manifest.json"),
         serde_json::to_vec_pretty(&json)?,
     )?;
-    verify::verify(&snapshot, &plan, &output)?;
+    assert_eq!(
+        verify::manifest_options(&output)?.ht_backend,
+        HtBackend::Hip
+    );
+    verify::verify(
+        &snapshot,
+        &plan,
+        &output,
+        DecodeBackend::Cpu,
+        &Progress::disabled(),
+    )?;
     json["options"]
         .as_object_mut()
         .expect("options object")
@@ -509,7 +595,13 @@ fn verification_accepts_hip_metadata_and_schema2_without_backend() -> Result<()>
     )?;
     // Exercise the full canonical manifest and fresh-plan verification gate,
     // not only Options deserialization. The genuine CPU payloads are unchanged.
-    let legacy = verify::verify(&snapshot, &plan, &output)?;
+    let legacy = verify::verify(
+        &snapshot,
+        &plan,
+        &output,
+        DecodeBackend::Cpu,
+        &Progress::disabled(),
+    )?;
     assert_eq!(legacy.source_tensors, current.source_tensors);
     assert_eq!(legacy.output_tensors, current.output_tensors);
     assert_eq!(
@@ -521,9 +613,16 @@ fn verification_accepts_hip_metadata_and_schema2_without_backend() -> Result<()>
         output.join("conversion-manifest.json"),
         serde_json::to_vec_pretty(&json)?,
     )?;
-    let error = verify::verify(&snapshot, &plan, &output)
-        .unwrap_err()
-        .to_string();
+    assert!(verify::manifest_options(&output).is_err());
+    let error = verify::verify(
+        &snapshot,
+        &plan,
+        &output,
+        DecodeBackend::Cpu,
+        &Progress::disabled(),
+    )
+    .unwrap_err()
+    .to_string();
     assert!(error.contains("unknown or noncanonical manifest fields"));
     json["options"]
         .as_object_mut()
@@ -534,9 +633,15 @@ fn verification_accepts_hip_metadata_and_schema2_without_backend() -> Result<()>
         output.join("conversion-manifest.json"),
         serde_json::to_vec_pretty(&json)?,
     )?;
-    let error = verify::verify(&snapshot, &plan, &output)
-        .unwrap_err()
-        .to_string();
+    let error = verify::verify(
+        &snapshot,
+        &plan,
+        &output,
+        DecodeBackend::Cpu,
+        &Progress::disabled(),
+    )
+    .unwrap_err()
+    .to_string();
     assert!(error.contains("manifest plan differs from the fresh source plan"));
     Ok(())
 }
@@ -551,7 +656,8 @@ fn hip_conversion_requires_feature_before_staging_or_source_open() -> Result<()>
         ht_backend: HtBackend::Hip,
         ..options()
     };
-    let error = conversion::convert(&snapshot, &plan, &output, &hip).unwrap_err();
+    let error =
+        conversion::convert(&snapshot, &plan, &output, &hip, &Progress::disabled()).unwrap_err();
     assert!(error.to_string().contains("--features hip"));
     assert!(!output.exists());
     assert_no_staging(temporary.path())?;
@@ -566,6 +672,49 @@ fn hip_conversion_requires_feature_before_staging_or_source_open() -> Result<()>
     assert!(result.stdout.is_empty());
     assert!(!output.exists());
     assert_no_staging(temporary.path())?;
+    Ok(())
+}
+
+#[cfg(not(feature = "hip"))]
+#[test]
+fn hip_verification_requires_feature_even_without_eligible_tensors() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let (assets, _) = support::fixture(temporary.path())?;
+    let (hgn, plan) = support::imported_norm_fixture(temporary.path(), &[1.0, -0.0, 3.125])?;
+    let source = support::FixtureAssets {
+        tensors: &hgn,
+        assets: &assets,
+    };
+    assert!(plan
+        .files
+        .iter()
+        .flat_map(|file| &file.tensors)
+        .all(|tensor| {
+            tensor.encoding.ht_bits().is_none()
+                && tensor.encoding != bf16_to_hgn::codec::Encoding::I4r
+        }));
+    let output = temporary.path().join("converted");
+    let opts = Options {
+        profile: OutputProfile::Ht43,
+        ..options()
+    };
+    conversion::convert(&source, &plan, &output, &opts, &Progress::disabled())?;
+    verify::verify(
+        &source,
+        &plan,
+        &output,
+        DecodeBackend::default(),
+        &Progress::default(),
+    )?;
+    let error = verify::verify(
+        &source,
+        &plan,
+        &output,
+        DecodeBackend::Hip,
+        &Progress::disabled(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("--features hip"));
     Ok(())
 }
 
@@ -622,9 +771,16 @@ fn hip_tiny_conversion_matches_cpu_all_containers_and_verifies() -> Result<()> {
             ht_backend: backend,
             ..options()
         };
-        let manifest = conversion::convert(&snapshot, &plan, &output, &opts)?;
+        let manifest =
+            conversion::convert(&snapshot, &plan, &output, &opts, &Progress::disabled())?;
         assert_eq!(manifest.options.ht_backend, backend);
-        verify::verify(&snapshot, &plan, &output)?;
+        verify::verify(
+            &snapshot,
+            &plan,
+            &output,
+            DecodeBackend::Cpu,
+            &Progress::disabled(),
+        )?;
         if let Some(cpu) = &baseline {
             let cpu: &bf16_to_hgn::manifest::Manifest = cpu;
             assert_eq!(cpu.containers, manifest.containers);
@@ -641,6 +797,73 @@ fn hip_tiny_conversion_matches_cpu_all_containers_and_verifies() -> Result<()> {
         } else {
             baseline = Some(manifest);
         }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "hip")]
+#[test]
+#[ignore = "requires an available gfx1151 HIP device; compares complete verification reports"]
+fn hip_full_verification_reports_match_cpu_bitwise() -> Result<()> {
+    for profile in [OutputProfile::V2, OutputProfile::Ht43] {
+        let temporary = tempfile::tempdir()?;
+        let (snapshot, plan) = if profile == OutputProfile::V2 {
+            support::fixture(temporary.path())?
+        } else {
+            support::hip_fixture(temporary.path())?
+        };
+        let opts = Options {
+            profile,
+            ..options()
+        };
+        let output = temporary.path().join("converted");
+        let manifest =
+            conversion::convert(&snapshot, &plan, &output, &opts, &Progress::disabled())?;
+        assert_eq!(manifest.options.ht_backend, HtBackend::Cpu);
+        let encodings: Vec<_> = plan
+            .files
+            .iter()
+            .flat_map(|file| &file.tensors)
+            .map(|tensor| tensor.encoding)
+            .collect();
+        assert!(encodings.contains(&Encoding::Ht));
+        assert!(encodings.contains(&if profile == OutputProfile::V2 {
+            Encoding::I4r
+        } else {
+            Encoding::Ht3
+        }));
+        let cpu = verify::verify(
+            &snapshot,
+            &plan,
+            &output,
+            DecodeBackend::Cpu,
+            &Progress::disabled(),
+        )?;
+        let hip = verify::verify(
+            &snapshot,
+            &plan,
+            &output,
+            DecodeBackend::Hip,
+            &Progress::disabled(),
+        )?;
+        assert_eq!(cpu.manifest_schema, 2);
+        assert!(cpu.provenance_attested);
+        assert_eq!(cpu.errors.len(), hip.errors.len());
+        for (name, reference) in &cpu.errors {
+            let actual = &hip.errors[name];
+            assert_eq!(reference.values, actual.values, "{name}");
+            assert_eq!(
+                reference.source_squared.to_bits(),
+                actual.source_squared.to_bits(),
+                "{name}"
+            );
+            assert_eq!(
+                reference.error_squared.to_bits(),
+                actual.error_squared.to_bits(),
+                "{name}"
+            );
+        }
+        assert_eq!(serde_json::to_value(cpu)?, serde_json::to_value(hip)?);
     }
     Ok(())
 }

@@ -3,7 +3,9 @@ use crate::{
     container::{self, Writer},
     hf::{Dtype, TensorInfo},
     manifest::{AssetRecord, ContainerRecord, Manifest, Options, OutputRecord, SourceRecord},
-    numel, rows_cols,
+    numel,
+    progress::{Progress, Stage, Unit},
+    rows_cols,
     source::{SourceKind, TensorSource, ASSET_NAMES},
     ConversionPlan, Origin, TensorPlan, ENCODER_SHA256, SPEC_COMMIT, SPEC_VERSION,
 };
@@ -343,6 +345,7 @@ pub fn convert(
     plan: &ConversionPlan,
     output: &Path,
     options: &Options,
+    progress: &Progress,
 ) -> Result<Manifest> {
     ensure!(
         cfg!(any(target_os = "linux", target_os = "macos")),
@@ -359,12 +362,21 @@ pub fn convert(
     let staging = tempfile::Builder::new()
         .prefix(".bf16-to-hgn-")
         .tempdir_in(parent)?;
+    let stage = progress.stage(
+        "Convert passes",
+        progress_values(plan, progress, true)?,
+        Unit::Values,
+    );
+    stage.set_item("Preparing rotations");
     let vectors = prepare_rotations(snapshot, plan, options)?;
     let mut source_hashes = BTreeMap::new();
     let mut containers = Vec::new();
     for file in &plan.files {
         let mut writer = Writer::create(&staging.path().join(&file.filename), file)?;
         for (index, tensor) in file.tensors.iter().enumerate() {
+            if stage.is_enabled() {
+                stage.set_item(&format!("encode {}", tensor.name));
+            }
             match &tensor.origin {
                 Origin::Signs { .. } | Origin::HtScales { .. } => {
                     let values = vectors
@@ -376,6 +388,7 @@ pub fn convert(
                             .extend_from_slice(&half::f16::from_f32(value).to_bits().to_le_bytes());
                     }
                     writer.write_at(index, 0, &bytes)?;
+                    stage.advance(values.len() as u64);
                 }
                 Origin::Tensor { name } => {
                     let info = &snapshot.tensors()[name];
@@ -387,6 +400,7 @@ pub fn convert(
                         &mut writer,
                         &vectors,
                         options,
+                        &stage,
                     )?;
                     source_hashes.insert(name.clone(), hash);
                 }
@@ -398,8 +412,12 @@ pub fn convert(
                     &mut writer,
                     &mut source_hashes,
                     options,
+                    &stage,
                 )?,
             }
+        }
+        if stage.is_enabled() {
+            stage.set_item(&format!("hash {}", file.filename));
         }
         let (layout, fingerprints) = writer.finish()?;
         let tensors = layout
@@ -426,13 +444,16 @@ pub fn convert(
             sha256,
         })
         .collect();
+    stage.set_item("Copying assets");
     let assets = copy_assets(snapshot, plan, staging.path())?;
+    stage.set_item("Hashing source metadata");
     let (_, config_sha256) = hash_file(&snapshot.asset_path("config.json")?)?;
     let index_sha256 = if snapshot.kind() == SourceKind::Hf {
         Some(hash_file(&snapshot.asset_path("model.safetensors.index.json")?)?.1)
     } else {
         None
     };
+    stage.set_item("Checking source provenance");
     let source_provenance = snapshot.provenance()?;
     let manifest = Manifest {
         schema: 2,
@@ -452,6 +473,7 @@ pub fn convert(
         assets,
         containers,
     };
+    stage.set_item("Publishing output");
     let manifest_path = staging.path().join("conversion-manifest.json");
     let mut manifest_file = OpenOptions::new()
         .write(true)
@@ -469,6 +491,7 @@ pub fn convert(
             .context("publication sync failed and newly published output cleanup failed")?;
         return Err(error).context("publication sync failed; removed newly published output");
     }
+    stage.finish();
     Ok(manifest)
 }
 
@@ -480,6 +503,7 @@ fn encode_tensor(
     writer: &mut Writer,
     vectors: &BTreeMap<String, Vec<f32>>,
     options: &Options,
+    stage: &Stage,
 ) -> Result<String> {
     let mut hash = Sha256::new();
     if direct_copy(tensor.encoding, info.dtype) {
@@ -495,6 +519,7 @@ fn encode_tensor(
             hash.update(&bytes);
             writer.write_at(index, offset, &bytes)?;
             offset += len as u64;
+            stage.advance((len as u64) / info.dtype.byte_width());
         }
         return Ok(format!("{:x}", hash.finalize()));
     }
@@ -502,7 +527,9 @@ fn encode_tensor(
         && tensor.shape.len() == 3
         && tensor.name.ends_with(".gate_up_proj.weight")
     {
-        return encode_gate_up(snapshot, info, tensor, index, writer, vectors, options);
+        return encode_gate_up(
+            snapshot, info, tensor, index, writer, vectors, options, stage,
+        );
     }
     let (rows, cols) = rows_cols(&tensor.shape)?;
     let layout = codec::payload_layout(tensor.encoding, rows, cols)?;
@@ -555,6 +582,7 @@ fn encode_tensor(
             writer.write_at(index, row as u64 * stride, &block.codes)?;
         }
         row += take;
+        stage.advance((take * cols) as u64);
     }
     Ok(format!("{:x}", hash.finalize()))
 }
@@ -574,6 +602,7 @@ fn encode_gate_up(
     writer: &mut Writer,
     vectors: &BTreeMap<String, Vec<f32>>,
     options: &Options,
+    stage: &Stage,
 ) -> Result<String> {
     let experts = usize::try_from(tensor.shape[0])?;
     let expert_rows = usize::try_from(tensor.shape[1])?;
@@ -634,6 +663,7 @@ fn encode_gate_up(
             offset = offset
                 .checked_add(pair_bytes)
                 .context("expert payload offset overflow")?;
+            stage.advance((2 * MATRIX_ROWS * cols) as u64);
         }
         ensure!(
             up_bytes.len() == buffered,
@@ -712,10 +742,14 @@ fn encode_table(
     writer: &mut Writer,
     hashes: &mut BTreeMap<String, String>,
     options: &Options,
+    stage: &Stage,
 ) -> Result<()> {
     let cols = usize::try_from(tensor.shape[2])?;
     let shard_rows = usize::try_from(tensor.shape[1])?;
     let mut absmax = 0.0f32;
+    if stage.is_enabled() {
+        stage.set_item(&format!("{} (scan FP8 scale)", tensor.name));
+    }
     for name in shards {
         let info = &snapshot.tensors()[name];
         let mut row = 0;
@@ -726,6 +760,7 @@ fn encode_table(
                 absmax = absmax.max(value.abs());
             }
             row += take;
+            stage.advance((take * cols) as u64);
         }
     }
     let scale = if absmax == 0.0 { 1.0 } else { absmax / 448.0 };
@@ -738,6 +773,9 @@ fn encode_table(
         ..QuantMeta::default()
     };
     let mut output_offset = 0;
+    if stage.is_enabled() {
+        stage.set_item(&format!("encode {}", tensor.name));
+    }
     for name in shards {
         let info = &snapshot.tensors()[name];
         let mut hash = Sha256::new();
@@ -755,6 +793,7 @@ fn encode_table(
             writer.write_at(index, output_offset, &block.codes)?;
             output_offset += block.codes.len() as u64;
             row += take;
+            stage.advance((take * cols) as u64);
         }
         hashes.insert(name.clone(), format!("{:x}", hash.finalize()));
     }
@@ -768,6 +807,31 @@ fn encode_table(
     )?;
     writer.write_at(index, layout.len - 4, &scale.to_le_bytes())?;
     Ok(())
+}
+
+/// Count existing value-processing passes only; do no work for hidden bars.
+pub(crate) fn progress_values(
+    plan: &ConversionPlan,
+    progress: &Progress,
+    scan_tables: bool,
+) -> Result<u64> {
+    if !progress.is_enabled() {
+        return Ok(0);
+    }
+    plan.files
+        .iter()
+        .flat_map(|file| &file.tensors)
+        .try_fold(0u64, |total, tensor| {
+            let passes = if scan_tables && matches!(&tensor.origin, Origin::Ngram { .. }) {
+                2
+            } else {
+                1
+            };
+            let values = numel(&tensor.shape)?
+                .checked_mul(passes)
+                .context("progress value count overflow")?;
+            total.checked_add(values).context("progress total overflow")
+        })
 }
 
 pub fn planned_bytes(plan: &ConversionPlan) -> Result<u64> {

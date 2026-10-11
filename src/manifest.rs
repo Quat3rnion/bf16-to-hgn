@@ -30,7 +30,7 @@ pub struct Options {
     pub seed: u64,
     pub threads: usize,
     pub ht_beam: usize,
-    /// Trellis execution backend; decoding and verification are backend-independent.
+    /// Encoding provenance only; verification selects its decode backend at runtime.
     #[serde(default)]
     pub ht_backend: HtBackend,
 }
@@ -138,6 +138,9 @@ impl ErrorTotals {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerifyReport {
+    pub manifest_schema: u32,
+    /// False for historical schema 1, which never attested physical source provenance.
+    pub provenance_attested: bool,
     pub source_tensors: usize,
     pub output_tensors: usize,
     pub payload_bytes: u64,

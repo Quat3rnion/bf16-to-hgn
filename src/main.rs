@@ -2,16 +2,19 @@ use anyhow::{Context, Result};
 use bf16_to_hgn::{
     architecture,
     codec::HtBackend,
-    container, conversion, hf,
-    manifest::{Manifest, Options, OutputProfile},
+    container, conversion,
+    manifest::{Options, OutputProfile},
+    progress::Progress,
     source::{self, SourceKind, SourceOptions, TensorSource},
-    verify, ConversionPlan, SPEC_COMMIT, SPEC_VERSION,
+    verify,
+    verify_gpu::DecodeBackend,
+    ConversionPlan, SPEC_COMMIT, SPEC_VERSION,
 };
 use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 
 #[derive(Parser)]
@@ -62,6 +65,9 @@ enum Command {
         input: InputOptions,
         #[arg(long)]
         output: PathBuf,
+        /// Runtime decoder for HT3/HT4 and I4R; other codecs remain on CPU.
+        #[arg(long, value_enum, default_value_t = DecodeBackend::Cpu)]
+        decode_backend: DecodeBackend,
     },
 }
 
@@ -178,17 +184,33 @@ fn run() -> Result<()> {
             if dry_run {
                 print_json(&plan_report(snapshot.as_ref(), &plan, &options)?)?;
             } else {
-                let manifest = conversion::convert(snapshot.as_ref(), &plan, &output, &options)?;
+                let manifest = conversion::convert(
+                    snapshot.as_ref(),
+                    &plan,
+                    &output,
+                    &options,
+                    &Progress::stderr(),
+                )?;
                 print_json(
                     &json!({ "published": true, "source_tensors": manifest.sources.len(), "output_tensors": manifest.containers.iter().map(|c| c.tensors.len()).sum::<usize>(), "manifest": "conversion-manifest.json", "source_format": manifest.source_kind, "profile": manifest.options.profile, "ht_backend": manifest.options.ht_backend, "policy": manifest.policy }),
                 )?;
             }
         }
-        Command::Verify { input, output } => {
-            let options = verification_options(&output)?;
+        Command::Verify {
+            input,
+            output,
+            decode_backend,
+        } => {
+            let options = verify::manifest_options(&output)?;
             let snapshot = input.open()?;
             let plan = architecture::plan(snapshot.as_ref(), &options)?;
-            let report = verify::verify(snapshot.as_ref(), &plan, &output)?;
+            let report = verify::verify(
+                snapshot.as_ref(),
+                &plan,
+                &output,
+                decode_backend,
+                &Progress::stderr(),
+            )?;
             print_json(&report)?;
         }
     }
@@ -236,14 +258,6 @@ fn plan_report(
     Ok(
         json!({ "summary": summary(snapshot, plan, options)?, "options": options, "plan": plan, "layouts": layouts, "source_config_preserved": true, "quantization": "deterministic conversion from canonical source values; no calibration/upstream recipe or BF16-equivalent requantization claim", "working_set": "bounded source windows, 128-row matrix bands, 8192-row table chunks, <=8MiB raw-copy buffers; native workers additionally allocate per-thread scratch", "disk_reserve": "HGN bytes +5% +64MiB; tokenizer assets copied separately" }),
     )
-}
-
-fn verification_options(output: &Path) -> Result<Options> {
-    let json = hf::read_json(&output.join("conversion-manifest.json"))?;
-    let manifest: Manifest =
-        serde_json::from_value(json).context("reading verification options")?;
-    manifest.options.validate()?;
-    Ok(manifest.options)
 }
 
 fn print_json(value: &impl serde::Serialize) -> Result<()> {
