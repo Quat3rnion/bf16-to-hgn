@@ -31,7 +31,7 @@
 //! shortened. A stopped stage keeps its context so a failure shows where it
 //! stopped; a completed stage collapses to one "done" line.
 
-use crate::codec::{Encoding, HtBackend, I4rBackend};
+use crate::codec::{Encoding, HtBackend, I4rBackend, Q4cpBackend};
 use indicatif::{
     BinaryBytes, FormattedDuration, HumanCount, HumanDuration, ProgressBar, ProgressDrawTarget,
     ProgressState, ProgressStyle,
@@ -164,10 +164,20 @@ impl From<HtBackend> for Device {
     }
 }
 
+impl From<Q4cpBackend> for Device {
+    fn from(backend: Q4cpBackend) -> Self {
+        match backend {
+            Q4cpBackend::Cpu => Self::Cpu,
+            Q4cpBackend::Cuda => Self::Cuda,
+        }
+    }
+}
+
 impl From<I4rBackend> for Device {
     fn from(backend: I4rBackend) -> Self {
         match backend {
             I4rBackend::Cpu => Self::Cpu,
+            I4rBackend::Hip => Self::Hip,
             I4rBackend::Cuda => Self::Cuda,
         }
     }
@@ -186,8 +196,8 @@ pub(crate) enum WorkClass {
 }
 
 const ENCODING_CLASSES: usize = 11;
-/// HT3/HT4 on HIP and CUDA, and I4R on CUDA.
-const GPU_CLASSES: usize = 5;
+/// HT3/HT4 on HIP and CUDA, I4R on HIP and CUDA, and Q4C-P on CUDA.
+const GPU_CLASSES: usize = 7;
 const WORK_CLASSES: usize = ENCODING_CLASSES + GPU_CLASSES + 3 + 2;
 
 impl WorkClass {
@@ -195,11 +205,14 @@ impl WorkClass {
         encoding: Encoding,
         ht_backend: HtBackend,
         i4r_backend: I4rBackend,
+        q4cp_backend: Q4cpBackend,
     ) -> Self {
         let device = if encoding.ht_bits().is_some() {
             ht_backend.into()
         } else if encoding == Encoding::I4r {
             i4r_backend.into()
+        } else if encoding == Encoding::Q4Cp {
+            q4cp_backend.into()
         } else {
             Device::Cpu
         };
@@ -234,8 +247,10 @@ impl WorkClass {
             Self::Encode(Encoding::Ht, Device::Cuda) => ENCODING_CLASSES + 2,
             Self::Encode(Encoding::Ht3, Device::Cuda) => ENCODING_CLASSES + 3,
             Self::Encode(Encoding::I4r, Device::Cuda) => ENCODING_CLASSES + 4,
+            Self::Encode(Encoding::I4r, Device::Hip) => ENCODING_CLASSES + 5,
+            Self::Encode(Encoding::Q4Cp, Device::Cuda) => ENCODING_CLASSES + 6,
             Self::Encode(_, Device::Hip | Device::Cuda) => {
-                unreachable!("only HT and I4R encoding run on a GPU")
+                unreachable!("only HT, I4R and Q4C-P encoding run on a GPU")
             }
             Self::Copy(Encoding::Bf16) => ENCODING_CLASSES + GPU_CLASSES,
             Self::Copy(Encoding::F32) => ENCODING_CLASSES + GPU_CLASSES + 1,
@@ -1067,6 +1082,7 @@ mod tests {
     const HT4: WorkClass = WorkClass::Encode(Encoding::Ht, Device::Cpu);
     const I4R: WorkClass = WorkClass::Encode(Encoding::I4r, Device::Cpu);
     const I4R_CUDA: WorkClass = WorkClass::Encode(Encoding::I4r, Device::Cuda);
+    const I4R_HIP: WorkClass = WorkClass::Encode(Encoding::I4r, Device::Hip);
 
     fn plan(classes: &[(WorkClass, u64)]) -> WorkEstimate {
         let mut estimate = WorkEstimate::default();
@@ -1124,17 +1140,18 @@ mod tests {
         let cpu = I4rBackend::Cpu;
         let classes = [
             HT4,
-            WorkClass::encode(Encoding::Ht, HtBackend::Hip, cpu),
-            WorkClass::encode(Encoding::Ht3, HtBackend::Cpu, cpu),
-            WorkClass::encode(Encoding::Ht3, HtBackend::Hip, cpu),
-            WorkClass::encode(Encoding::Ht, HtBackend::Cuda, cpu),
-            WorkClass::encode(Encoding::Ht3, HtBackend::Cuda, cpu),
+            WorkClass::encode(Encoding::Ht, HtBackend::Hip, cpu, Q4cpBackend::Cpu),
+            WorkClass::encode(Encoding::Ht3, HtBackend::Cpu, cpu, Q4cpBackend::Cpu),
+            WorkClass::encode(Encoding::Ht3, HtBackend::Hip, cpu, Q4cpBackend::Cpu),
+            WorkClass::encode(Encoding::Ht, HtBackend::Cuda, cpu, Q4cpBackend::Cpu),
+            WorkClass::encode(Encoding::Ht3, HtBackend::Cuda, cpu, Q4cpBackend::Cpu),
             I4R,
             I4R_CUDA,
-            WorkClass::encode(Encoding::Fp8G128, HtBackend::Hip, I4rBackend::Cuda),
+            I4R_HIP,
+            WorkClass::encode(Encoding::Fp8G128, HtBackend::Hip, I4rBackend::Cuda, Q4cpBackend::Cpu),
             WorkClass::ScanFp8Scale,
             WorkClass::Copy(Encoding::Bf16),
-            WorkClass::encode(Encoding::Bf16, HtBackend::Hip, I4rBackend::Cuda),
+            WorkClass::encode(Encoding::Bf16, HtBackend::Hip, I4rBackend::Cuda, Q4cpBackend::Cpu),
             WorkClass::WriteRotation,
         ];
         let mut estimate = WorkEstimate::default();
@@ -1161,24 +1178,35 @@ mod tests {
     #[test]
     fn ht_and_i4r_backends_select_devices_independently() {
         for ht in [HtBackend::Cpu, HtBackend::Hip, HtBackend::Cuda] {
-            assert_eq!(WorkClass::encode(Encoding::I4r, ht, I4rBackend::Cpu), I4R);
+            assert_eq!(WorkClass::encode(Encoding::I4r, ht, I4rBackend::Cpu, Q4cpBackend::Cpu), I4R);
             assert_eq!(
-                WorkClass::encode(Encoding::I4r, ht, I4rBackend::Cuda),
+                WorkClass::encode(Encoding::I4r, ht, I4rBackend::Cuda, Q4cpBackend::Cpu),
                 I4R_CUDA
             );
-            for i4r in [I4rBackend::Cpu, I4rBackend::Cuda] {
+            assert_eq!(
+                WorkClass::encode(Encoding::I4r, ht, I4rBackend::Hip, Q4cpBackend::Cpu),
+                I4R_HIP
+            );
+            for i4r in [I4rBackend::Cpu, I4rBackend::Hip, I4rBackend::Cuda] {
                 for encoding in [Encoding::Ht, Encoding::Ht3] {
-                    let class = WorkClass::encode(encoding, ht, i4r);
+                    let class = WorkClass::encode(encoding, ht, i4r, Q4cpBackend::Cpu);
                     assert_eq!(class, WorkClass::Encode(encoding, ht.into()));
                     assert_eq!(class.backend_label(), ht.label());
                 }
                 for encoding in [Encoding::Fp8G128, Encoding::Q4Cp, Encoding::Bf16] {
-                    assert_eq!(WorkClass::encode(encoding, ht, i4r).backend_label(), "CPU");
+                    assert_eq!(WorkClass::encode(encoding, ht, i4r, Q4cpBackend::Cpu).backend_label(), "CPU");
                 }
             }
         }
         assert_eq!(I4R.backend_label(), "CPU");
         assert_eq!(I4R_CUDA.backend_label(), "CUDA");
+        assert_eq!(I4R_HIP.backend_label(), "HIP");
+        assert_ne!(I4R_HIP.index(), I4R_CUDA.index());
+        assert_ne!(I4R_HIP.index(), I4R.index());
+        assert_ne!(
+            I4R_HIP.index(),
+            WorkClass::Encode(Encoding::Ht, Device::Hip).index()
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-// CUDA HT/I4R encoders and independent verification decode/unrotation.
+// CUDA HT/I4R/Q4C-P encoders and independent verification decode/unrotation.
 // The CPU implementations remain the references; this file never calls them.
 //
 // Selection below is an independent implementation of the observable
@@ -11,9 +11,11 @@
 // -ffp-contract=off without fast math for the host compiler.
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <math_constants.h>
 
 #include <array>
 #include <cfenv>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -50,9 +52,9 @@ constexpr int kStates = 65536;
 constexpr int kLength = 256;
 constexpr int kMaxBeam = 256;
 constexpr int kThreads = 256;
-// Several blocks per SM on a 76-SM RTX 4090 Laptop, without unbounded VRAM.
-// Workspace capacity, not the input length, determines each request's batch.
-constexpr int kBatch = 512;
+// Tiles per launch. Blocks are persistent: the grid is bounded by co-resident
+// blocks and workspace slots, not by this batch, so a band is one launch.
+constexpr int kBatch = 4096;
 constexpr size_t kWorkspaceBytes = 128u * 1024u * 1024u;
 constexpr uint16_t kMissing = 0xffff;
 
@@ -73,21 +75,23 @@ struct TileStatus {
 struct TileWorkspace {
     Path *expanded;
     Path *candidates;
+    Path *previous; // The prior step's candidates, kept for exact tie replay.
     uint16_t *wrong_left;
     uint16_t *wrong_right;
     Trace *trace;
 };
 __host__ __device__ constexpr size_t tile_workspace_bytes(int bits, int beam) {
-    return size_t(kStates >> bits) * (2 * sizeof(Path) + 2 * sizeof(uint16_t))
+    return size_t(kStates >> bits) * (3 * sizeof(Path) + 2 * sizeof(uint16_t))
         + size_t(kLength) * size_t(beam) * sizeof(Trace);
 }
 __device__ __forceinline__ TileWorkspace tile_workspace(uint8_t *bytes, int histories) {
     Path *expanded = reinterpret_cast<Path *>(bytes);
     Path *candidates = expanded + histories;
-    uint16_t *wrong_left = reinterpret_cast<uint16_t *>(candidates + histories);
+    Path *previous = candidates + histories;
+    uint16_t *wrong_left = reinterpret_cast<uint16_t *>(previous + histories);
     uint16_t *wrong_right = wrong_left + histories;
     Trace *trace = reinterpret_cast<Trace *>(wrong_right + histories);
-    return {expanded, candidates, wrong_left, wrong_right, trace};
+    return {expanded, candidates, previous, wrong_left, wrong_right, trace};
 }
 struct DeviceStorage {
     float codebook[kStates];
@@ -98,13 +102,14 @@ struct DeviceStorage {
 };
 static_assert(sizeof(Path) == 8 && sizeof(Trace) == 4);
 static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559);
-// One persistent allocation: 128 MiB arena plus 923,648 B for codebook/I/O.
-// Per-tile layout uses 20*histories + 1024*beam bytes, all naturally aligned.
-// HT3 beam256: 315 tiles; HT3 beam128: 455; HT4 beam256: 390; HT4 beam128: 512.
+// One persistent allocation: 128 MiB arena plus codebook/I/O for kBatch tiles.
+// Per-slot layout uses 20*histories + 1024*beam bytes, all naturally aligned.
+// Slots: HT3 beam256: 315; HT3 beam128: 455; HT4 beam256: 390; HT4 beam128: 615.
 // Changing bits/beam only reinterprets this arena after the preceding sync.
-static_assert(sizeof(DeviceStorage) == 135141376);
+static_assert(sizeof(DeviceStorage) == kStates * 4 + size_t(kBatch) * kLength * 5
+              + size_t(kBatch) * sizeof(TileStatus) + kWorkspaceBytes);
 static_assert(kWorkspaceBytes / tile_workspace_bytes(3, kMaxBeam) >= 256);
-static_assert(sizeof(DeviceStorage) <= 130u * 1024u * 1024u);
+static_assert(sizeof(DeviceStorage) <= 134u * 1024u * 1024u);
 
 // Decode uses two FP64 axis passes, with only 16 independent 128-point
 // transforms in shared memory at once. The complete 128x128 block would require 128 KiB.
@@ -151,6 +156,28 @@ struct I4rStorage {
 static_assert(sizeof(I4rStorage) == 52756488);
 static_assert(sizeof(DeviceStorage) + sizeof(DecodeStorage) + sizeof(I4rStorage)
               <= 256u * 1024u * 1024u);
+
+// Q4C-P groups of 32 values are independent; batches are flat group runs,
+// never rows, so arbitrarily wide or short matrices need no strided copies.
+// The host scatters compact half scales into its padded scale rows.
+constexpr int kQ4Group = 32;
+constexpr int kQ4Groups = 1 << 18;
+constexpr int kQ4Threads = 128;
+constexpr int kQ4Candidates = 5;
+constexpr int kQ4ScaleOverflow = -6;
+struct Q4Params {
+    float codebook[16];
+    float midpoints[15];
+    float cmax;
+};
+struct Q4Storage {
+    float values[kQ4Groups * kQ4Group];
+    uint8_t codes[kQ4Groups * kQ4Group / 2];
+    uint16_t scales[kQ4Groups];
+    unsigned scale_overflow;
+};
+static_assert(kQ4Groups % kQ4Threads == 0);
+static_assert(sizeof(Q4Storage) <= 38u * 1024u * 1024u);
 
 __device__ __forceinline__ float decode_half(uint16_t bits) {
     const unsigned sign = unsigned(bits & 0x8000) << 16;
@@ -391,19 +418,107 @@ __global__ __launch_bounds__(kI4rThreads) void i4r_quantize(I4rStorage *storage)
     }
 }
 
+__device__ __forceinline__ int q4_code(float normalized, const Q4Params &params) {
+    // CPU partition_point over nondecreasing midpoints: the count of
+    // midpoints strictly below the value, so exact ties select the lower level.
+    int code = 0;
+    #pragma unroll
+    for (int index = 0; index < 15; ++index) code += params.midpoints[index] < normalized;
+    return code;
+}
+
+// One thread owns one 32-value group. The five candidate scales and each
+// candidate's FP64 error sum stay sequential, matching the CPU's rounding
+// order and its strict first-win comparison.
+__global__ __launch_bounds__(kQ4Threads) void q4_quantize(Q4Storage *storage, Q4Params params,
+                                                         int groups) {
+    // Stride 33 removes the 32-way bank conflict of per-thread group rows.
+    __shared__ float values[kQ4Threads * (kQ4Group + 1)];
+    const int thread = int(threadIdx.x);
+    const int base = int(blockIdx.x) * kQ4Threads;
+    const int active = groups - base < kQ4Threads ? groups - base : kQ4Threads;
+    for (int index = thread; index < active * kQ4Group; index += kQ4Threads)
+        values[(index / kQ4Group) * (kQ4Group + 1) + index % kQ4Group]
+            = storage->values[size_t(base) * kQ4Group + index];
+    __syncthreads();
+    if (thread >= active) return;
+    const float *group = values + thread * (kQ4Group + 1);
+    float absmax = 0.0f;
+    for (int index = 0; index < kQ4Group; ++index) absmax = fmaxf(absmax, fabsf(group[index]));
+    const float multipliers[kQ4Candidates] = {1.0f, 0.95f, 0.9f, 0.85f, 0.8f};
+    const float ratio = __fdiv_rn(absmax, params.cmax);
+    double best_error = CUDART_INF;
+    uint16_t best_half = 0;
+    for (int candidate = 0; candidate < kQ4Candidates; ++candidate) {
+        const uint16_t half_bits = __half_as_ushort(__float2half_rn(__fmul_rn(ratio, multipliers[candidate])));
+        if ((half_bits & 0x7c00) == 0x7c00) {
+            // The host reruns the CPU encoder for its exact first-group error.
+            atomicExch(&storage->scale_overflow, 1u);
+            return;
+        }
+        const float scale = decode_half(half_bits);
+        const float divisor = scale == 0.0f ? 1.0f : scale;
+        double error = 0.0;
+        #pragma unroll 1
+        for (int index = 0; index < kQ4Group; ++index) {
+            const float value = group[index];
+            const int code = q4_code(__fdiv_rn(value, divisor), params);
+            const double delta = __dsub_rn(__dmul_rn(double(params.codebook[code]), double(scale)),
+                                           double(value));
+            error = __dadd_rn(error, __dmul_rn(delta, delta));
+        }
+        if (error < best_error) {
+            best_error = error;
+            best_half = half_bits;
+        }
+    }
+    const float scale = decode_half(best_half);
+    const float divisor = scale == 0.0f ? 1.0f : scale;
+    const size_t group_index = size_t(base) + size_t(thread);
+    alignas(16) uint8_t packed[kQ4Group / 2];
+    for (int index = 0; index < kQ4Group / 2; ++index) {
+        const int first = q4_code(__fdiv_rn(group[2 * index], divisor), params);
+        const int second = q4_code(__fdiv_rn(group[2 * index + 1], divisor), params);
+        packed[index] = uint8_t(first | (second << 4));
+    }
+    *reinterpret_cast<uint4 *>(storage->codes + group_index * (kQ4Group / 2))
+        = *reinterpret_cast<const uint4 *>(packed);
+    storage->scales[group_index] = best_half;
+}
+
+// Introselect ranges at most this long finish on one warp in shared memory.
+constexpr int kWarpSelect = 256;
+struct WarpSelect {
+    Path values[kWarpSelect];
+    uint16_t wrong_left[kWarpSelect];
+    uint16_t wrong_right[kWarpSelect];
+};
+
 template<int Bits> struct BlockState {
     static constexpr int histories = kStates >> Bits;
     static constexpr int groups = histories >> Bits;
     Path active[kMaxBeam];
-    uint16_t position[histories];
+    // Per-group parent lists: head[group] -> active index -> next[index].
+    // List order is arbitrary; expansion's result does not depend on it.
+    unsigned head[groups]; // 32-bit: CUDA has no 16-bit atomicExch.
+    uint16_t next[kMaxBeam];
     uint16_t ordered_groups[groups];
     unsigned touched[(groups + 31) / 32];
     unsigned warp_sums[kThreads / 32];
+    WarpSelect select;
+    unsigned histogram[256];
+    uint16_t exact_rank[kMaxBeam];
+    unsigned long long key_or;
+    unsigned long long key_and;
+    int digit;
+    int rank;
+    int stop;
+    int end;
     int count;
     int boundary;
 };
-static_assert(sizeof(BlockState<3>) <= 24u * 1024u);
-static_assert(sizeof(BlockState<4>) <= 24u * 1024u);
+static_assert(sizeof(BlockState<3>) <= 14u * 1024u);
+static_assert(sizeof(BlockState<4>) <= 10u * 1024u);
 
 __device__ __forceinline__ uint64_t key(const Path &p) {
     // Finite squared-error costs are nonnegative. Masking the sign treats
@@ -516,6 +631,101 @@ __device__ void insertion_finish(Path *a, int first, int last) {
     }
 }
 
+__device__ __forceinline__ unsigned warp_inclusive_sum(unsigned value) {
+    const int lane = int(threadIdx.x) % warpSize;
+    for (int distance = 1; distance < warpSize; distance <<= 1) {
+        const unsigned earlier = __shfl_up_sync(0xffffffffU, value, distance, warpSize);
+        if (lane >= distance) value += earlier;
+    }
+    return value;
+}
+
+// The median-of-three pivot step shared by the block and warp phases.
+// Indices are relative to the array passed in, so the same arithmetic gives
+// the same choice on a shared copy of [first, last) rebased to zero.
+__device__ __forceinline__ void place_median(Path *a, int first, int last) {
+    int lower = first + 1;
+    int middle = first + (last - first) / 2;
+    int upper = last - 1;
+    if (before(a[middle], a[lower])) {
+        const int swap = lower; lower = middle; middle = swap;
+    }
+    if (before(a[upper], a[middle])) {
+        const int swap = middle; middle = upper; upper = swap;
+    }
+    if (before(a[middle], a[lower])) {
+        const int swap = lower; lower = middle; middle = swap;
+    }
+    exchange(a, first, middle);
+}
+
+// Warp 0 continues the identical introselect (same depth budget, pivots,
+// Hoare pair swaps, heap fallback and insertion finish) on a shared-memory
+// copy of a short range. Every index rule is translation invariant, so the
+// rebased copy receives exactly the permutation the block phase would apply.
+// Only __syncwarp is needed: no other warp touches the copy.
+__device__ void warp_select(Path *a, int first, int last, int nth, int depth, WarpSelect &scratch) {
+    const int lane = int(threadIdx.x) % warpSize;
+    const int size = last - first;
+    Path *values = scratch.values;
+    for (int index = lane; index < size; index += warpSize) values[index] = a[first + index];
+    __syncwarp();
+    int low = 0;
+    int high = size;
+    const int target = nth - first;
+    bool heap = false;
+    while (high - low > 3) {
+        if (depth == 0) {
+            heap = true;
+            break;
+        }
+        --depth;
+        if (lane == 0) place_median(values, low, high);
+        __syncwarp();
+        const uint64_t pivot = key(values[low]);
+        const int span = high - low - 1;
+        const int begin = low + 1 + span * lane / warpSize;
+        const int end = low + 1 + span * (lane + 1) / warpSize;
+        unsigned less = 0;
+        for (int position = begin; position < end; ++position)
+            less += key(values[position]) < pivot;
+        const int cut = low + 1 + int(__shfl_sync(0xffffffffU, warp_inclusive_sum(less), warpSize - 1));
+        unsigned left_count = 0;
+        unsigned right_count = 0;
+        for (int position = begin; position < end; ++position) {
+            const uint64_t candidate = key(values[position]);
+            left_count += position < cut && candidate > pivot;
+            right_count += position >= cut && candidate < pivot;
+        }
+        const unsigned packed = left_count | (right_count << 16);
+        const unsigned inclusive = warp_inclusive_sum(packed);
+        const unsigned total = __shfl_sync(0xffffffffU, inclusive, warpSize - 1);
+        unsigned left_rank = (inclusive - packed) & 0xffffU;
+        unsigned right_rank = (inclusive - packed) >> 16;
+        const unsigned pairs = total & 0xffffU;
+        const unsigned right_total = total >> 16;
+        for (int position = begin; position < end; ++position) {
+            const uint64_t candidate = key(values[position]);
+            if (position < cut && candidate > pivot)
+                scratch.wrong_left[left_rank++] = uint16_t(position);
+            if (position >= cut && candidate < pivot)
+                scratch.wrong_right[right_total - 1 - right_rank++] = uint16_t(position);
+        }
+        __syncwarp();
+        for (unsigned pair = unsigned(lane); pair < pairs; pair += warpSize)
+            exchange(values, scratch.wrong_left[pair], scratch.wrong_right[pair]);
+        __syncwarp();
+        if (cut <= target) low = cut;
+        else high = cut;
+    }
+    if (lane == 0) {
+        if (heap) heap_finish(values, low, target, high);
+        else insertion_finish(values, low, high);
+    }
+    __syncwarp();
+    for (int index = lane; index < size; index += warpSize) a[first + index] = values[index];
+}
+
 // Candidates have unique histories, hence unique (cost, history) keys.
 // With the median moved to first, there is no pivot-equal key in the scanned
 // range. Its Hoare cut is first+1+count(key<pivot). The serial scanner pairs
@@ -523,9 +733,9 @@ __device__ void insertion_finish(Path *a, int first, int last) {
 // with misplaced positions above it in decreasing order. Those pairs are
 // disjoint: collecting and swapping them in parallel preserves *every*
 // serial swap and the entire output permutation, not just the top-k set.
-__device__ void select_prefix(Path *a, int nth, int size,
+__device__ __noinline__ void select_prefix(Path *a, int nth, int size,
                               uint16_t *wrong_left, uint16_t *wrong_right,
-                              unsigned *sums) {
+                              unsigned *sums, WarpSelect &scratch) {
     const int thread = int(threadIdx.x);
     int first = 0;
     int last = size;
@@ -537,23 +747,17 @@ __device__ void select_prefix(Path *a, int nth, int size,
             __syncthreads();
             return;
         }
+        if (last - first <= kWarpSelect) {
+            // Short ranges are barrier-bound on the block: finish on warp 0.
+            if (thread < warpSize) warp_select(a, first, last, nth, depth, scratch);
+            __syncthreads();
+            return;
+        }
         --depth;
         if (thread == 0) {
             // Find the median of these three *distinct* keys by sorting
             // their indices only; only the eventual pivot swap is applied.
-            int lower = first + 1;
-            int middle = first + (last - first) / 2;
-            int upper = last - 1;
-            if (before(a[middle], a[lower])) {
-                const int swap = lower; lower = middle; middle = swap;
-            }
-            if (before(a[upper], a[middle])) {
-                const int swap = middle; middle = upper; upper = swap;
-            }
-            if (before(a[middle], a[lower])) {
-                const int swap = lower; lower = middle; middle = swap;
-            }
-            exchange(a, first, middle);
+            place_median(a, first, last);
         }
         __syncthreads();
         const uint64_t pivot = key(a[first]);
@@ -597,27 +801,270 @@ __device__ void select_prefix(Path *a, int nth, int size,
     __syncthreads();
 }
 
+// Stable top-k: candidates have unique (cost, history) keys, so the k smallest
+// form a unique set regardless of any permutation. A most-significant-digit
+// radix search finds the k-th key; the set is then compacted in history
+// order. This is NOT libstdc++'s nth_element order: the caller replays that
+// exact permutation whenever an order-dependent equal-cost decision arises.
+// Each warp owns a contiguous segment walked by interleaved lanes (coalesced),
+// and Cached > 0 keeps that many keys per lane in registers.
+constexpr int kCachedKeys = 8;
+template<int Bits, int Cached>
+__device__ __forceinline__ void select_set(const Path *candidates, int size, int count,
+                                           BlockState<Bits> &shared, Trace *trace, bool record,
+                                           const uint64_t (&provided)[kCachedKeys]) {
+    static_assert(Cached == 0 || Cached == kCachedKeys, "cached keys come from expansion");
+    constexpr int symbols = 1 << Bits;
+    constexpr int warps = kThreads / 32;
+    constexpr int Slots = Cached > 0 ? Cached : 1;
+    const int thread = int(threadIdx.x);
+    const int lane = thread % warpSize;
+    const int warp = thread / warpSize;
+    const int segment_begin = size * warp / warps;
+    const int segment_end = size * (warp + 1) / warps;
+    const int rounds = (segment_end - segment_begin + warpSize - 1) / warpSize;
+    auto load = [&](int index) -> uint64_t {
+        const int position = segment_begin + index * warpSize + lane;
+        if (position >= segment_end) return ~uint64_t(0);
+        // Expanded arrays keep non-finite (unreached) histories in place.
+        const Path candidate = candidates[position];
+        return finite_cost(candidate.cost) ? key(candidate) : ~uint64_t(0);
+    };
+    uint64_t keys[Slots];
+    if (Cached > 0) {
+        #pragma unroll
+        for (int index = 0; index < Slots; ++index) keys[index] = provided[index];
+    }
+    // OR and AND over valid keys: their XOR marks every bit that differs
+    // between some pair, and all bits above the highest one are common.
+    uint64_t any_bits = 0;
+    uint64_t all_bits = ~uint64_t(0);
+    const int scans = Cached > 0 ? Slots : rounds;
+    #pragma unroll
+    for (int index = 0; index < scans; ++index) {
+        const uint64_t value = Cached > 0 ? keys[index] : load(index);
+        if (value != ~uint64_t(0)) {
+            any_bits |= value;
+            all_bits &= value;
+        }
+    }
+    for (int distance = warpSize / 2; distance > 0; distance /= 2) {
+        any_bits |= __shfl_xor_sync(0xffffffffU, any_bits, distance);
+        all_bits &= __shfl_xor_sync(0xffffffffU, all_bits, distance);
+    }
+    if (thread == 0) {
+        shared.key_or = 0;
+        shared.key_and = ~0ULL;
+    }
+    __syncthreads();
+    if (lane == 0) {
+        atomicOr(&shared.key_or, (unsigned long long)any_bits);
+        atomicAnd(&shared.key_and, (unsigned long long)all_bits);
+    }
+    __syncthreads();
+    // At least two unique valid keys guarantee a differing bit. Keys use 47
+    // bits, so the all-ones invalid marker never matches a selected prefix.
+    int shift = 64 - __clzll((long long)(shared.key_or ^ shared.key_and));
+    uint64_t high = shared.key_or >> shift;
+    int rank = count - 1;
+    while (shift > 0) {
+        const int width = shift < 8 ? shift : 8;
+        shift -= width;
+        const unsigned mask = (1U << width) - 1U;
+        shared.histogram[thread] = 0;
+        __syncthreads();
+        const int passes = Cached > 0 ? Slots : rounds;
+        #pragma unroll
+        for (int index = 0; index < passes; ++index) {
+            const uint64_t value = Cached > 0 ? keys[index] : load(index);
+            const bool valid = value != ~uint64_t(0) && (value >> (shift + width)) == high;
+            const unsigned digit = unsigned(value >> shift) & mask;
+            // Plain shared atomics: replaying same-bin conflicts is far
+            // cheaper than __match_any_sync aggregation (measured 2x per band).
+            if (valid) atomicAdd(&shared.histogram[digit], 1U);
+        }
+        __syncthreads();
+        if (thread < warpSize) {
+            // Eight bins per lane in ascending order; find the bin holding rank.
+            unsigned local = 0;
+            for (int bin = lane * 8; bin < lane * 8 + 8; ++bin) local += shared.histogram[bin];
+            const unsigned inclusive = warp_inclusive_sum(local);
+            const unsigned exclusive = inclusive - local;
+            if (unsigned(rank) >= exclusive && unsigned(rank) < inclusive) {
+                unsigned before_bin = exclusive;
+                for (int bin = lane * 8; bin < lane * 8 + 8; ++bin) {
+                    const unsigned here = shared.histogram[bin];
+                    if (unsigned(rank) < before_bin + here) {
+                        shared.digit = bin;
+                        shared.rank = rank - int(before_bin);
+                        // The rank'th key is this bin's largest: the whole
+                        // bin is selected, so lower digits cannot matter.
+                        shared.stop = unsigned(rank) - before_bin + 1U == here;
+                        break;
+                    }
+                    before_bin += here;
+                }
+            }
+        }
+        __syncthreads();
+        high = (high << width) | uint64_t(shared.digit);
+        rank = shared.rank;
+        const bool stop = shared.stop;
+        __syncthreads();
+        if (stop) break;
+    }
+    // Selected: every valid key whose prefix above `shift` is <= high. The
+    // invalid marker's prefix exceeds any 47-bit key prefix.
+    auto chosen = [&](uint64_t value) { return (value >> shift) <= high; };
+    // Stable compaction: warp offsets from per-warp totals, ballot ranks inside.
+    unsigned selected = 0;
+    const int passes = Cached > 0 ? Slots : rounds;
+    #pragma unroll
+    for (int index = 0; index < passes; ++index)
+        selected += chosen(Cached > 0 ? keys[index] : load(index));
+    for (int distance = warpSize / 2; distance > 0; distance /= 2)
+        selected += __shfl_xor_sync(0xffffffffU, selected, distance);
+    if (lane == 0) shared.warp_sums[warp] = selected;
+    __syncthreads();
+    unsigned slot = 0;
+    for (int other = 0; other < warp; ++other) slot += shared.warp_sums[other];
+    const unsigned earlier_lanes = (1U << lane) - 1U;
+    #pragma unroll
+    for (int index = 0; index < passes; ++index) {
+        const uint64_t value = Cached > 0 ? keys[index] : load(index);
+        const bool keep = chosen(value);
+        const unsigned kept = __ballot_sync(0xffffffffU, keep);
+        if (keep) {
+            const Path candidate = candidates[segment_begin + index * warpSize + lane];
+            const unsigned target = slot + __popc(kept & earlier_lanes);
+            shared.active[target] = candidate;
+            if (record) trace[target] = {candidate.parent, uint16_t(candidate.state & (symbols - 1))};
+        }
+        slot += __popc(kept);
+    }
+    __syncthreads();
+}
+
+// Stable block-wide compaction of finite paths (ascending history order is
+// kept). Optionally records each kept path's trace entry at the same slot.
+// Must be called by the whole block; returns the number kept.
 template<int Bits>
-__global__ __launch_bounds__(kThreads) void encode_tiles(DeviceStorage *storage, int width) {
+__device__ int compact_finite(const Path *source, int size, Path *destination, Trace *trace,
+                              BlockState<Bits> &shared) {
+    constexpr int symbols = 1 << Bits;
+    constexpr int warps = kThreads / 32;
+    const int thread = int(threadIdx.x);
+    const int lane = thread % warpSize;
+    const int warp = thread / warpSize;
+    const int segment_begin = size * warp / warps;
+    const int segment_end = size * (warp + 1) / warps;
+    unsigned finite = 0;
+    for (int position = segment_begin + lane; position < segment_end; position += warpSize)
+        finite += finite_cost(source[position].cost);
+    for (int distance = warpSize / 2; distance > 0; distance /= 2)
+        finite += __shfl_xor_sync(0xffffffffU, finite, distance);
+    if (lane == 0) shared.warp_sums[warp] = finite;
+    __syncthreads();
+    unsigned slot = 0;
+    unsigned total = 0;
+    for (int other = 0; other < warps; ++other) {
+        const unsigned here = shared.warp_sums[other];
+        slot += other < warp ? here : 0;
+        total += here;
+    }
+    const unsigned earlier_lanes = (1U << lane) - 1U;
+    for (int base = segment_begin; base < segment_end; base += warpSize) {
+        const int position = base + lane;
+        Path candidate{};
+        bool keep = false;
+        if (position < segment_end) {
+            candidate = source[position];
+            keep = finite_cost(candidate.cost);
+        }
+        const unsigned kept = __ballot_sync(0xffffffffU, keep);
+        if (keep) {
+            const unsigned target = slot + __popc(kept & earlier_lanes);
+            destination[target] = candidate;
+            if (trace) trace[target] = {candidate.parent, uint16_t(candidate.state & (symbols - 1))};
+        }
+        slot += __popc(kept);
+    }
+    __syncthreads();
+    return int(total);
+}
+
+// Exact libstdc++ positions of the previous step's selection, indexed by the
+// fast (history-ordered) active position. The step's candidate keys alone
+// determine nth_element's permutation, so replaying it on the saved array
+// reproduces the CPU order. This path is rare, so a linear state search over
+// the (unique-state) active array maps each exact position to its fast index.
+template<int Bits>
+__device__ void exact_ranks(const TileWorkspace &workspace, const Path *saved, int saved_size,
+                            Path *scratch, int available, int count, BlockState<Bits> &shared) {
+    const int thread = int(threadIdx.x);
+    if (count < available) {
+        // The saved step is an expanded array with unreached gaps; the CPU's
+        // nth_element saw its finite entries in the same ascending order.
+        compact_finite<Bits>(saved, saved_size, scratch, nullptr, shared);
+        select_prefix(scratch, count, available, workspace.wrong_left, workspace.wrong_right,
+                      shared.warp_sums, shared.select);
+        for (int index = thread; index < count; index += kThreads) {
+            const uint16_t state = scratch[index].state;
+            int fast = 0;
+            while (shared.active[fast].state != state) ++fast;
+            shared.exact_rank[fast] = uint16_t(index);
+        }
+    } else {
+        // No nth_element call: the CPU kept ascending history order too.
+        for (int index = thread; index < count; index += kThreads)
+            shared.exact_rank[index] = uint16_t(index);
+    }
+    __syncthreads();
+}
+
+// The standard HT codebook entry, as ht_codebook_value computes it: byte sum
+// of state*0x83dcd12d, an exact int->f32 conversion (|v| < 2^24), an exact
+// power-of-two scale, then binary16 RNE. Used only after the host has checked
+// that the supplied table equals this function bit for bit.
+__host__ __device__ __forceinline__ float standard_codebook(unsigned state) {
+    const unsigned hash = state * 0x83dcd12dU;
+#ifdef __CUDA_ARCH__
+    const int sum = int(__dp4a(hash, 0x01010101U, 0U));
+#else
+    const int sum = int((hash & 255) + ((hash >> 8) & 255) + ((hash >> 16) & 255) + (hash >> 24));
+#endif
+    const float value = float(1774 * sum - 905216) * 0x1p-18f;
+    return __half2float(__float2half_rn(value));
+}
+
+// One complete two-pass tile search. Every early return is block-uniform.
+// The workspace slot belongs to the calling block, not to the tile: a
+// persistent block reuses it serially for each tile it owns.
+template<int Bits, bool Standard>
+__device__ void encode_tile(DeviceStorage *storage, int width, int tile, int slot,
+                            BlockState<Bits> &shared) {
     constexpr int symbols = 1 << Bits;
     constexpr int histories = kStates >> Bits;
     constexpr int groups = histories >> Bits;
     constexpr int closing_symbols = (16 - Bits + Bits - 1) / Bits;
     constexpr int group_words = (groups + 31) / 32;
-    __shared__ BlockState<Bits> shared;
     const int thread = int(threadIdx.x);
-    const int tile = int(blockIdx.x);
     const float *x = storage->tiles + tile * kLength;
     const float *cb = storage->codebook;
     const TileWorkspace workspace = tile_workspace(
-        storage->workspace + size_t(tile) * tile_workspace_bytes(Bits, width), histories);
-    for (int h = thread; h < histories; h += kThreads) shared.position[h] = kMissing;
+        storage->workspace + size_t(slot) * tile_workspace_bytes(Bits, width), histories);
+    for (int group = thread; group < groups; group += kThreads) shared.head[group] = kMissing;
     if (thread == 0) {
         storage->status[tile] = {0, 0, 0};
         shared.boundary = 0;
     }
     __syncthreads();
     for (int pass = 0; pass < 2; ++pass) {
+        Path *current = workspace.candidates;
+        Path *previous = workspace.previous;
+        // Pass one starts from one fixed parent: no selection preceded it.
+        int previous_available = 1;
+        int previous_size = 1;
         if (thread == 0) {
             // Pass one's initial H paths are implicit (state=position,
             // cost=0); later active arrays never exceed the requested beam.
@@ -632,8 +1079,8 @@ __global__ __launch_bounds__(kThreads) void encode_tiles(DeviceStorage *storage,
             __syncthreads();
             if (!initial && thread < shared.count) {
                 const int state = shared.active[thread].state;
-                shared.position[state] = uint16_t(thread);
                 const int group = state & (groups - 1);
+                shared.next[thread] = uint16_t(atomicExch(&shared.head[group], unsigned(thread)));
                 atomicOr(&shared.touched[group >> 5], 1U << (group & 31));
             }
             __syncthreads();
@@ -662,75 +1109,169 @@ __global__ __launch_bounds__(kThreads) void encode_tiles(DeviceStorage *storage,
                 closure_value = (shared.boundary >> shift) & closure_mask;
             }
             const int expanded_count = int(group_ranks.total) * symbols;
-            const int begin = expanded_count * thread / kThreads;
-            const int end = expanded_count * (thread + 1) / kThreads;
+            // Each warp owns one contiguous segment; its lanes walk it
+            // interleaved. Adjacent lanes then share a group (broadcast
+            // parent reads) and touch adjacent codebook/expanded entries,
+            // while ballot ranks keep the compaction in history order.
+            const int lane = thread % warpSize;
+            const int warp = thread / warpSize;
+            constexpr int warps = kThreads / 32;
+            const int segment_begin = expanded_count * warp / warps;
+            const int segment_end = expanded_count * (warp + 1) / warps;
             const float value = x[t];
             unsigned finite = 0;
-            for (int position = begin; position < end; ++position) {
-                const int group = shared.ordered_groups[position >> Bits];
-                const int symbol = position & (symbols - 1);
-                const int history = (group << Bits) | symbol;
-                Path best = {kMissing, uint16_t(history), __int_as_float(0x7f800000)};
-                // HT3's first closing symbol constrains only its low bit;
-                // its other two bits remain free. Subsequent symbols are
-                // fully fixed, just as d += mask+1 in the CPU loop.
-                if ((symbol & closure_mask) == closure_value) {
-                    for (int high = 0; high < symbols; ++high) {
-                        const int previous = group | (high << (16 - 2 * Bits));
-                        const int parent = initial ? previous : shared.position[previous];
-                        if (parent == kMissing) continue;
-                        const float prior = initial ? 0.f : shared.active[parent].cost;
-                        const int state = (previous << Bits) | symbol;
-                        const float delta = __fsub_rn(value, cb[state]);
-                        const float squared = __fmul_rn(delta, delta);
-                        const float cost = __fadd_rn(prior, squared);
-                        // The scan is by state, NOT by active-array position.
-                        // Resolve equal costs explicitly to the lower parent
-                        // position to reproduce the CPU's strict update.
-                        if (cost < best.cost || (cost == best.cost && parent < best.parent)) {
-                            best.cost = cost;
-                            best.parent = uint16_t(parent);
+            uint64_t keys[kCachedKeys];
+            // Fast pass: break equal costs by fast position and only flag
+            // them. Without a minimal-cost tie, the winner is independent of
+            // active order. With one, replay the exact order and redo it.
+            for (int exact = 0; exact < 2; ++exact) {
+                int tied = 0;
+                finite = 0;
+                // Same warp-segment/lane mapping as select_set: round i of
+                // this lane is select_set's cached key i, kept in registers.
+                auto expand = [&](int position) -> Path {
+                    const int group = shared.ordered_groups[position >> Bits];
+                    const int symbol = position & (symbols - 1);
+                    const int history = (group << Bits) | symbol;
+                    Path best = {kMissing, uint16_t(history), __int_as_float(0x7f800000)};
+                    unsigned best_order = 0xffffffffU;
+                    bool best_tied = false;
+                    // HT3's first closing symbol constrains only its low bit;
+                    // its other two bits remain free. Subsequent symbols are
+                    // fully fixed, just as d += mask+1 in the CPU loop.
+                    // Initial: all histories of the group are parents with zero
+                    // cost; the parent index is the history itself. Later:
+                    // walk only this group's actual parents.
+                    const bool open = (symbol & closure_mask) == closure_value;
+                    int high = 0;
+                    int parent = open ? (initial ? group : int(shared.head[group])) : int(kMissing);
+                    while (parent != kMissing) {
+                        {
+                            const int previous = initial ? parent : int(shared.active[parent].state);
+                            const float prior = initial ? 0.f : shared.active[parent].cost;
+                            const int state = (previous << Bits) | symbol;
+                            const float entry = Standard ? standard_codebook(unsigned(state)) : cb[state];
+                            const float delta = __fsub_rn(value, entry);
+                            const float squared = __fmul_rn(delta, delta);
+                            const float cost = __fadd_rn(prior, squared);
+                            // The CPU visits parents in active order with a
+                            // strict update: minimum cost, then lowest order.
+                            const unsigned order = exact ? shared.exact_rank[parent] : unsigned(parent);
+                            if (cost < best.cost) {
+                                best.cost = cost;
+                                best.parent = uint16_t(parent);
+                                best_order = order;
+                                best_tied = false;
+                            } else if (cost == best.cost) {
+                                best_tied = true;
+                                if (order < best_order) {
+                                    best.parent = uint16_t(parent);
+                                    best_order = order;
+                                }
+                            }
+                        }
+                        if (initial) {
+                            ++high;
+                            parent = high < symbols ? (group | (high << (16 - 2 * Bits))) : int(kMissing);
+                        } else {
+                            parent = shared.next[parent];
                         }
                     }
+                    current[position] = best;
+                    finite += finite_cost(best.cost);
+                    // Initial parents are in exact (identity) order already.
+                    tied |= best_tied && !initial && finite_cost(best.cost);
+                    return best;
+                };
+                #pragma unroll
+                for (int round = 0; round < kCachedKeys; ++round) {
+                    const int position = segment_begin + lane + round * warpSize;
+                    keys[round] = ~uint64_t(0);
+                    if (position < segment_end) {
+                        const Path best = expand(position);
+                        if (finite_cost(best.cost)) keys[round] = key(best);
+                    }
                 }
-                workspace.expanded[position] = best;
-                finite += finite_cost(best.cost);
+                for (int position = segment_begin + lane + kCachedKeys * warpSize; position < segment_end;
+                     position += warpSize)
+                    expand(position);
+                if (exact || !__syncthreads_or(tied)) break;
+                exact_ranks<Bits>(workspace, previous, previous_size, workspace.expanded,
+                                  previous_available, shared.count, shared);
             }
-            const Prefix candidate_ranks = prefix_sum(finite, shared.warp_sums);
-            unsigned candidate_slot = candidate_ranks.offset;
-            for (int position = begin; position < end; ++position) {
-                const Path candidate = workspace.expanded[position];
-                if (finite_cost(candidate.cost)) workspace.candidates[candidate_slot++] = candidate;
-            }
+            for (int distance = warpSize / 2; distance > 0; distance /= 2)
+                finite += __shfl_xor_sync(0xffffffffU, finite, distance);
+            if (lane == 0) shared.warp_sums[warp] = finite;
+            __syncthreads();
+            unsigned available_total = 0;
+            for (int other = 0; other < warps; ++other) available_total += shared.warp_sums[other];
+            // No compaction: selection reads the expanded array directly and
+            // skips unreached histories, which keeps ascending history order.
             // Remove the old position map before overwriting active. Only
             // touched entries need clearing, not all H entries every step.
             if (!initial && thread < shared.count)
-                shared.position[shared.active[thread].state] = kMissing;
+                shared.head[shared.active[thread].state & (groups - 1)] = kMissing;
             __syncthreads();
-            const int available = int(candidate_ranks.total);
+            const int available = int(available_total);
             if (available == 0) {
                 if (thread == 0) storage->status[tile] = {1, pass, t};
                 return;
             }
             const int count = width < available ? width : available;
-            if (count < available)
-                select_prefix(workspace.candidates, count, available,
-                              workspace.wrong_left, workspace.wrong_right, shared.warp_sums);
-            if (thread < count) {
-                const Path selected = workspace.candidates[thread];
-                shared.active[thread] = selected;
-                if (pass == 1)
-                    workspace.trace[t * width + thread] = {
-                        selected.parent, uint16_t(selected.state & (symbols - 1))
-                    };
+            Trace *trace = workspace.trace + t * width;
+            if (count < available) {
+                // Register-cached keys cover every steady-state beam<=128 step.
+                if (expanded_count <= kCachedKeys * kThreads)
+                    select_set<Bits, kCachedKeys>(current, expanded_count, count, shared, trace, pass == 1, keys);
+                else
+                    select_set<Bits, 0>(current, expanded_count, count, shared, trace, pass == 1, keys);
+            } else {
+                compact_finite<Bits>(current, expanded_count, shared.active, pass == 1 ? trace : nullptr, shared);
             }
             if (thread == 0) shared.count = count;
+            previous_available = available;
+            previous_size = expanded_count;
+            Path *const swap = previous;
+            previous = current;
+            current = swap;
+            __syncthreads();
+        }
+        // First minimal cost in exact active order. Without an equal-cost
+        // competitor, any order finds the same unique minimum.
+        if (thread == 0) {
+            int end = 0;
+            bool tied = false;
+            for (int position = 1; position < shared.count; ++position) {
+                if (shared.active[position].cost < shared.active[end].cost) {
+                    end = position;
+                    tied = false;
+                } else if (shared.active[position].cost == shared.active[end].cost) {
+                    tied = true;
+                }
+            }
+            shared.end = tied ? -1 - end : end;
+        }
+        __syncthreads();
+        if (shared.end < 0 && shared.count < previous_available) {
+            // Replay the last step's exact permutation on scratch storage.
+            Path *scratch = workspace.expanded;
+            compact_finite<Bits>(previous, previous_size, scratch, nullptr, shared);
+            select_prefix(scratch, shared.count, previous_available, workspace.wrong_left,
+                          workspace.wrong_right, shared.warp_sums, shared.select);
+            if (thread == 0) {
+                const float minimum = shared.active[-1 - shared.end].cost;
+                int exact_state = -1;
+                for (int position = 0; position < shared.count && exact_state < 0; ++position)
+                    if (scratch[position].cost == minimum) exact_state = scratch[position].state;
+                int end = 0;
+                while (shared.active[end].state != exact_state) ++end;
+                shared.end = end;
+            }
             __syncthreads();
         }
         if (thread == 0) {
-            int end = 0;
-            for (int position = 1; position < shared.count; ++position)
-                if (shared.active[position].cost < shared.active[end].cost) end = position;
+            // A tie with no nth_element call keeps history (= fast) order.
+            int end = shared.end < 0 ? -1 - shared.end : shared.end;
             if (pass == 0) {
                 shared.boundary = shared.active[end].state;
             } else {
@@ -741,6 +1282,21 @@ __global__ __launch_bounds__(kThreads) void encode_tiles(DeviceStorage *storage,
                 }
             }
         }
+        __syncthreads();
+    }
+}
+
+// Persistent grid: launch only as many blocks as are co-resident (and have
+// workspace slots); each strides over the batch. Every tile still runs the
+// identical search, so this changes scheduling, never encoded bytes. It
+// removes the partially filled second wave of a one-block-per-tile launch.
+// Four blocks per SM (<= 64 registers) measured fastest on the RTX 4090
+// Laptop for HT3 and HT4 at beam 128; fewer registers spill into latency.
+template<int Bits, bool Standard>
+__global__ __launch_bounds__(kThreads, 4) void encode_tiles(DeviceStorage *storage, int width, int count) {
+    __shared__ BlockState<Bits> shared;
+    for (int tile = int(blockIdx.x); tile < count; tile += int(gridDim.x)) {
+        encode_tile<Bits, Standard>(storage, width, tile, int(blockIdx.x), shared);
         __syncthreads();
     }
 }
@@ -771,19 +1327,25 @@ struct Context {
     DeviceStorage *storage = nullptr;
     DecodeStorage *decode_storage = nullptr;
     I4rStorage *i4r_storage = nullptr;
+    Q4Storage *q4_storage = nullptr;
     std::array<float, kStates> cached_codebook;
     std::array<float, kStates> decode_cached_codebook;
     // Remains alive while an error path drains a queued D2H transfer.
     std::array<TileStatus, kBatch> tile_status;
     I4rStatus i4r_status{};
+    unsigned q4_status = 0;
     bool codebook_valid = false;
     bool decode_codebook_valid = false;
+    int multiprocessors = 0;
+    int resident_ht[2][2] = {}; // Co-resident blocks: [bits-3][standard codebook].
+    bool standard_codebook_cached = false; // cached_codebook is the standard table.
 
     int initialize() {
         if (stream) return 0;
         cudaDeviceProp properties{};
         cudaError_t error = cudaGetDeviceProperties(&properties, 0);
         if (error != cudaSuccess) return cuda_failure(error, "query CUDA device 0");
+        multiprocessors = properties.multiProcessorCount;
         if (properties.major < 6 || properties.maxThreadsPerBlock < kThreads) {
             std::snprintf(last_error, sizeof(last_error),
                           "CUDA encoding/verification requires compute capability >= 6.0 and %d-thread blocks; "
@@ -798,15 +1360,18 @@ struct Context {
             const void *function;
             int threads;
         } kernels[] = {
-            {reinterpret_cast<const void *>(encode_tiles<3>), kThreads},
-            {reinterpret_cast<const void *>(encode_tiles<4>), kThreads},
+            {reinterpret_cast<const void *>(encode_tiles<3, false>), kThreads},
+            {reinterpret_cast<const void *>(encode_tiles<4, false>), kThreads},
+            {reinterpret_cast<const void *>(encode_tiles<3, true>), kThreads},
+            {reinterpret_cast<const void *>(encode_tiles<4, true>), kThreads},
             {reinterpret_cast<const void *>(decode_row_axis<0>), kThreads},
             {reinterpret_cast<const void *>(decode_row_axis<3>), kThreads},
             {reinterpret_cast<const void *>(decode_row_axis<4>), kThreads},
             {reinterpret_cast<const void *>(decode_column_axis), kThreads},
             {reinterpret_cast<const void *>(i4r_forward_rows), kThreads},
             {reinterpret_cast<const void *>(i4r_forward_columns), kThreads},
-            {reinterpret_cast<const void *>(i4r_quantize), kI4rThreads}
+            {reinterpret_cast<const void *>(i4r_quantize), kI4rThreads},
+            {reinterpret_cast<const void *>(q4_quantize), kQ4Threads}
         };
         for (const auto &kernel : kernels) {
             cudaFuncAttributes attributes{};
@@ -834,7 +1399,7 @@ struct Context {
         const cudaError_t error = cudaMalloc(reinterpret_cast<void **>(&storage), sizeof(DeviceStorage));
         if (error != cudaSuccess) {
             storage = nullptr;
-            return cuda_failure(error, "allocate bounded 135,141,376-byte CUDA workspace");
+            return cuda_failure(error, "allocate bounded CUDA HT workspace");
         }
         return 0;
     }
@@ -859,10 +1424,20 @@ struct Context {
         return 0;
     }
 
+    int ensure_q4_encoder() {
+        if (q4_storage) return 0;
+        const cudaError_t error = cudaMalloc(reinterpret_cast<void **>(&q4_storage), sizeof(Q4Storage));
+        if (error != cudaSuccess) {
+            q4_storage = nullptr;
+            return cuda_failure(error, "allocate bounded CUDA Q4C-P workspace");
+        }
+        return 0;
+    }
+
     ~Context() {
         // The CUDA runtime can already be unloading at static destruction.
         // Best-effort silent cleanup; never reset a device shared by services.
-        if (!stream && !storage && !decode_storage && !i4r_storage) return;
+        if (!stream && !storage && !decode_storage && !i4r_storage && !q4_storage) return;
         int previous = 0;
         if (cudaGetDevice(&previous) != cudaSuccess) return;
         if (previous != 0 && cudaSetDevice(0) != cudaSuccess) return;
@@ -870,6 +1445,7 @@ struct Context {
         if (storage) cudaFree(storage);
         if (decode_storage) cudaFree(decode_storage);
         if (i4r_storage) cudaFree(i4r_storage);
+        if (q4_storage) cudaFree(q4_storage);
         if (stream) cudaStreamDestroy(stream);
         if (previous != 0) cudaSetDevice(previous);
     }
@@ -958,17 +1534,44 @@ int encode(Context &state, const float *tiles, const float *codebook,
                                                codebook_bytes, cudaMemcpyHostToDevice, state.stream);
         if (error != cudaSuccess) return cuda_failure(error, "upload CUDA codebook");
         state.codebook_valid = true;
+        bool standard = true;
+        for (unsigned entry = 0; entry < unsigned(kStates) && standard; ++entry) {
+            const float expected = standard_codebook(entry);
+            standard = std::memcmp(&expected, &state.cached_codebook[entry], sizeof(float)) == 0;
+        }
+        state.standard_codebook_cached = standard;
     }
     auto &status = state.tile_status;
     const size_t total = size_t(count);
-    void *arguments[] = {&state.storage, &beam};
+    // A bit-identical standard table lets the kernel compute entries instead
+    // of loading them; any other table uses the uploaded copy.
+    const bool standard = state.standard_codebook_cached;
     const void *kernel = bits == 3
-        ? reinterpret_cast<const void *>(encode_tiles<3>)
-        : reinterpret_cast<const void *>(encode_tiles<4>);
-    const size_t capacity = kWorkspaceBytes / tile_workspace_bytes(bits, beam);
-    const size_t batch_limit = capacity < size_t(kBatch) ? capacity : size_t(kBatch);
+        ? (standard ? reinterpret_cast<const void *>(encode_tiles<3, true>)
+                    : reinterpret_cast<const void *>(encode_tiles<3, false>))
+        : (standard ? reinterpret_cast<const void *>(encode_tiles<4, true>)
+                    : reinterpret_cast<const void *>(encode_tiles<4, false>));
+    int &resident = state.resident_ht[bits - 3][standard];
+    if (resident == 0) {
+        // Block state lives in shared memory; prefer the largest carveout so
+        // shared capacity does not cap residency below the register limit.
+        cudaError_t error = cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                                 int(cudaSharedmemCarveoutMaxShared));
+        if (error != cudaSuccess) return cuda_failure(error, "set CUDA HT shared-memory carveout");
+        int per_multiprocessor = 0;
+        error = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_multiprocessor, kernel, kThreads, 0);
+        if (error != cudaSuccess) return cuda_failure(error, "query CUDA HT occupancy");
+        resident = per_multiprocessor * state.multiprocessors;
+        if (resident < 1) return fail(-2, "CUDA HT kernel cannot be resident on device 0");
+    }
+    // Grid: one persistent block per workspace slot, at most one full wave.
+    const size_t slots = kWorkspaceBytes / tile_workspace_bytes(bits, beam);
+    const size_t grid_limit = slots < size_t(resident) ? slots : size_t(resident);
+    const size_t batch_limit = size_t(kBatch);
     for (size_t base = 0; base < total; base += batch_limit) {
-        const int batch = int(total - base < batch_limit ? total - base : batch_limit);
+        int batch = int(total - base < batch_limit ? total - base : batch_limit);
+        const unsigned grid = unsigned(size_t(batch) < grid_limit ? size_t(batch) : grid_limit);
+        void *arguments[] = {&state.storage, &beam, &batch};
         const size_t elements = size_t(batch) * kLength;
         cudaError_t error = cudaMemcpyAsync(state.storage->tiles, tiles + base * kLength,
                                          elements * sizeof(float), cudaMemcpyHostToDevice, state.stream);
@@ -976,7 +1579,7 @@ int encode(Context &state, const float *tiles, const float *codebook,
         // Check this launch's direct status: an earlier recoverable runtime
         // error must not become a false launch failure via cudaGetLastError.
         // Fatal asynchronous device errors still fail; never reset the GPU.
-        error = cudaLaunchKernel(kernel, dim3(batch), dim3(kThreads), arguments, 0, state.stream);
+        error = cudaLaunchKernel(kernel, dim3(grid), dim3(kThreads), arguments, 0, state.stream);
         if (error != cudaSuccess) return cuda_failure(error, "launch CUDA beam-search batch");
         error = cudaMemcpyAsync(status.data(), state.storage->status, size_t(batch) * sizeof(TileStatus),
                                cudaMemcpyDeviceToHost, state.stream);
@@ -1103,6 +1706,44 @@ int encode_i4r(Context &state, const float *source, const float *su, const float
             "CUDA I4R quantization scale exceeds finite f16 range in band rectangle starting at "
             "band %zu, column %zu; value cannot be represented as a finite f16", scale_band, scale_col);
         return -4;
+    }
+    return 0;
+}
+
+int encode_q4(Context &state, const float *source, const Q4Params &params,
+              uint8_t *codes, uint16_t *scales, size_t groups) {
+    const int allocation = state.ensure_q4_encoder();
+    if (allocation != 0) return allocation;
+    Q4Storage *storage = state.q4_storage;
+    for (size_t base = 0; base < groups; base += size_t(kQ4Groups)) {
+        int batch = int(groups - base < size_t(kQ4Groups) ? groups - base : size_t(kQ4Groups));
+        cudaError_t error = cudaMemsetAsync(&storage->scale_overflow, 0, sizeof(unsigned), state.stream);
+        if (error != cudaSuccess) return cuda_failure(error, "clear CUDA Q4C-P batch status");
+        error = cudaMemcpyAsync(storage->values, source + base * kQ4Group,
+                                size_t(batch) * kQ4Group * sizeof(float), cudaMemcpyHostToDevice, state.stream);
+        if (error != cudaSuccess) return cuda_failure(error, "upload CUDA Q4C-P source groups");
+        void *arguments[] = {&storage, const_cast<Q4Params *>(&params), &batch};
+        error = cudaLaunchKernel(reinterpret_cast<const void *>(q4_quantize),
+            dim3(unsigned((batch + kQ4Threads - 1) / kQ4Threads)), dim3(kQ4Threads),
+            arguments, 0, state.stream);
+        if (error != cudaSuccess) return cuda_failure(error, "launch CUDA Q4C-P quantizer");
+        error = cudaMemcpyAsync(&state.q4_status, &storage->scale_overflow, sizeof(unsigned),
+                                cudaMemcpyDeviceToHost, state.stream);
+        if (error != cudaSuccess) return cuda_failure(error, "download CUDA Q4C-P batch status");
+        error = cudaMemcpyAsync(codes + base * (kQ4Group / 2), storage->codes,
+                                size_t(batch) * (kQ4Group / 2), cudaMemcpyDeviceToHost, state.stream);
+        if (error != cudaSuccess) return cuda_failure(error, "download CUDA Q4C-P codes");
+        error = cudaMemcpyAsync(scales + base, storage->scales, size_t(batch) * sizeof(uint16_t),
+                                cudaMemcpyDeviceToHost, state.stream);
+        if (error != cudaSuccess) return cuda_failure(error, "download CUDA Q4C-P half scales");
+        error = cudaStreamSynchronize(state.stream);
+        if (error != cudaSuccess) return cuda_failure(error, "complete CUDA Q4C-P batch");
+        if (state.q4_status) {
+            std::snprintf(last_error, sizeof(last_error),
+                "CUDA Q4C-P quantization scale exceeds finite f16 range in group batch starting at group %zu",
+                base);
+            return kQ4ScaleOverflow;
+        }
     }
     return 0;
 }
@@ -1270,6 +1911,42 @@ extern "C" int hgn_cuda_encode_i4r(const float *source, const float *su, const f
         return fail(-1, "CUDA I4R encode buffer extent overflows the host address space");
     return with_context([&](Context &state) {
         return encode_i4r(state, source, su, sv, codes, scales, bands, cols);
+    });
+}
+
+extern "C" int hgn_cuda_q4cp_preflight() {
+    last_error[0] = '\0';
+    return with_context([](Context &state) { return state.ensure_q4_encoder(); });
+}
+
+// codebook: 16 strictly increasing finite values; midpoints: the 15 host-rounded
+// binary32 midpoints. codes receive groups*16 bytes and scales groups half
+// words in group order. Returns -6 when a candidate scale is not a finite
+// half; callers rerun the CPU reference for its exact error.
+extern "C" int hgn_cuda_encode_q4cp(const float *source, const float *codebook,
+                                   const float *midpoints, uint8_t *codes, uint16_t *scales,
+                                   size_t groups) {
+    last_error[0] = '\0';
+    if (groups == 0) return 0;
+    if (!source || !codebook || !midpoints || !codes || !scales)
+        return fail(-1, "CUDA Q4C-P encode requires nonnull buffers");
+    if (groups > std::numeric_limits<size_t>::max() / kQ4Group / sizeof(float))
+        return fail(-1, "CUDA Q4C-P encode shape overflows the host address space");
+    if (address_overflows(source, groups * kQ4Group * sizeof(float))
+        || address_overflows(codes, groups * (kQ4Group / 2))
+        || address_overflows(scales, groups * sizeof(uint16_t)))
+        return fail(-1, "CUDA Q4C-P encode buffer extent overflows the host address space");
+    Q4Params params{};
+    std::memcpy(params.codebook, codebook, sizeof(params.codebook));
+    std::memcpy(params.midpoints, midpoints, sizeof(params.midpoints));
+    for (int index = 0; index < 16; ++index)
+        if (!std::isfinite(params.codebook[index]) || (index > 0 && !(params.codebook[index - 1] < params.codebook[index])))
+            return fail(-1, "CUDA Q4C-P codebook must be finite and strictly increasing");
+    const float low = std::fabs(params.codebook[0]);
+    const float high = std::fabs(params.codebook[15]);
+    params.cmax = low > high ? low : high;
+    return with_context([&](Context &state) {
+        return encode_q4(state, source, params, codes, scales, groups);
     });
 }
 

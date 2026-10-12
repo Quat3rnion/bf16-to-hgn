@@ -1,5 +1,5 @@
 use crate::{
-    codec::{HtBackend, I4rBackend},
+    codec::{HtBackend, I4rBackend, Q4cpBackend},
     hf,
     manifest::{AssetRecord, ContainerRecord, Manifest, Options, OutputProfile, SourceRecord},
     source::SourceKind,
@@ -100,6 +100,7 @@ pub(crate) fn read_manifest(
                     ht_beam: legacy.options.ht_beam,
                     ht_backend: HtBackend::Cpu,
                     i4r_backend: I4rBackend::Cpu,
+                    q4cp_backend: Q4cpBackend::Cpu,
                 },
                 source_kind: SourceKind::Hf,
                 source_provenance: None,
@@ -117,7 +118,7 @@ pub(crate) fn read_manifest(
             // those recursively, permitting backend omissions only for older
             // schema-2 writers; both absent selections reconstruct as CPU.
             let mut canonical = serde_json::to_value(&current)?;
-            for field in ["ht_backend", "i4r_backend"] {
+            for field in ["ht_backend", "i4r_backend", "q4cp_backend"] {
                 if json["options"]
                     .as_object()
                     .is_some_and(|options| !options.contains_key(field))

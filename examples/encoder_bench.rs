@@ -9,19 +9,21 @@
 //!
 //! JSONL sample elapsed_ns covers only public encoding calls and insertion
 //! into a preallocated result vector. It includes validation, codec allocation,
-//! and rotation; CUDA also includes H2D/kernel/D2H and synchronization. Source
+//! and rotation; HIP/CUDA also include H2D/kernel/D2H and synchronization. Source
 //! reads/generation, sign/RMS preparation, CPU reference, warmup, hashing,
 //! printing, result-vector allocation, and output destruction are excluded.
 //! All returned code/scale bytes, padding, codebook/global scale, and rotation
 //! side planes are fingerprinted; every iteration, thread count and backend must agree.
 //! GPU preflight durations are recorded separately per selected backend.
-//! --backends remains HT-only. I4R independently uses --i4r-backends cpu,cuda
+//! --backends remains HT-only. I4R independently uses --i4r-backends cpu,hip,cuda
 //! and --i4r-bands 1..=32; each iteration encodes the entire batch in one call.
+//! NF4/Q4C-P likewise uses --q4cp-backends cpu,cuda and --q4cp-bands 1..=32.
 
 use anyhow::{bail, ensure, Context, Result};
 use bf16_to_hgn::codec::{
     encode_ht_gate_up_bands, encode_rows, fp8_decode, generate_signs, ht_row_scales,
-    payload_layout, EncodedBlock, Encoding, HtBackend, I4rBackend, QuantMeta, NF4_CODEBOOK,
+    payload_layout, EncodedBlock, Encoding, HtBackend, I4rBackend, Q4cpBackend, QuantMeta,
+    NF4_CODEBOOK,
 };
 use bf16_to_hgn::hf::{Dtype, Snapshot};
 use clap::{Parser, ValueEnum};
@@ -172,6 +174,12 @@ struct Args {
     /// I4R bands per public call (1..=32), still subject to the input value limit.
     #[arg(long, default_value_t = 1)]
     i4r_bands: usize,
+    /// Independent NF4/Q4C-P backend axis; no CPU fallback.
+    #[arg(long, value_enum, value_delimiter = ',', default_value = "cpu")]
+    q4cp_backends: Vec<Q4cpBackend>,
+    /// NF4/Q4C-P 128-row bands per public call (1..=32), subject to the input value limit.
+    #[arg(long, default_value_t = 1)]
+    q4cp_bands: usize,
     /// Timed calls per sample; retained outputs are limited to 128 MiB.
     #[arg(long, default_value_t = 1)]
     iterations: usize,
@@ -329,6 +337,8 @@ fn load_real(args: &Args, cases: &[Case]) -> Result<Option<RealBands>> {
     let rows = ROWS
         * if cases.contains(&Case::I4r) {
             args.i4r_bands
+        } else if cases.contains(&Case::Nf4) {
+            args.q4cp_bands
         } else {
             1
         };
@@ -639,6 +649,8 @@ fn prepare<'a>(
     };
     let rows = if case == Case::I4r {
         ROWS * args.i4r_bands
+    } else if case == Case::Nf4 && timing {
+        ROWS * args.q4cp_bands
     } else if case == Case::Fp8g128 && timing {
         args.fp8_rows
     } else if !timing && !case.rotated() {
@@ -753,6 +765,7 @@ fn encode(
     beam: usize,
     backend: HtBackend,
     i4r_backend: I4rBackend,
+    q4cp_backend: Q4cpBackend,
 ) -> Result<EncodedBlock> {
     let meta = QuantMeta {
         su: &work.su,
@@ -762,6 +775,7 @@ fn encode(
         ht_beam: beam,
         ht_backend: backend,
         i4r_backend,
+        q4cp_backend,
         ..QuantMeta::default()
     };
     let encoding = work.case.encoding();
@@ -989,8 +1003,22 @@ fn run_workload(
     });
     let cpu_reference = if work.case == Case::I4r {
         Some(i4r_cpu_reference(work)?)
+    } else if work.case == Case::Nf4 && args.q4cp_backends.iter().any(|b| b.is_gpu()) {
+        Some(encode(
+            work,
+            1,
+            args.timing_beam,
+            HtBackend::Cpu,
+            I4rBackend::Cpu,
+            Q4cpBackend::Cpu,
+        )?)
     } else {
         None
+    };
+    let q4cp_backends: &[Q4cpBackend] = if work.case == Case::Nf4 {
+        &args.q4cp_backends
+    } else {
+        &[Q4cpBackend::Cpu]
     };
     let i4r_backends: &[I4rBackend] = if work.case == Case::I4r {
         &args.i4r_backends
@@ -1006,15 +1034,23 @@ fn run_workload(
             work.cols
         );
         // Neither backend nor threads is part of the equality key.
-        for (backend, i4r_backend) in args
+        for (backend, i4r_backend, q4cp_backend) in args
             .backends
             .iter()
             .copied()
             .flat_map(|backend| i4r_backends.iter().copied().map(move |i4r| (backend, i4r)))
+            .flat_map(|(backend, i4r)| {
+                q4cp_backends
+                    .iter()
+                    .copied()
+                    .map(move |q4cp| (backend, i4r, q4cp))
+            })
         {
             let ht_backend = if ht { backend } else { HtBackend::Cpu };
             let effective_backend = if work.case == Case::I4r {
                 json!(i4r_backend)
+            } else if work.case == Case::Nf4 {
+                json!(q4cp_backend)
             } else {
                 json!(ht_backend)
             };
@@ -1022,17 +1058,19 @@ fn run_workload(
                 "public_encoding": true, "validation": true, "codec_allocations": true,
                 "rotation": work.case.rotated(), "input_setup": false, "sign_generation": false,
                 "row_rms": false, "hashing": false, "output_destruction": false,
-                "gpu_host_device_copies_and_synchronization": ht_backend.is_gpu() || i4r_backend.is_gpu(),
+                "gpu_host_device_copies_and_synchronization": ht_backend.is_gpu() || i4r_backend.is_gpu() || q4cp_backend.is_gpu(),
                 "gpu_device_preflight": false, "preallocated_result_push": true,
                 "cpu_reference_and_byte_comparison": false,
             });
             for &threads in &args.threads {
                 for _ in 0..warmup {
-                    let block = encode(work, threads, beam, ht_backend, i4r_backend)?;
+                    let block =
+                        encode(work, threads, beam, ht_backend, i4r_backend, q4cp_backend)?;
                     if let Some(reference) = &cpu_reference {
                         ensure!(
                             &block == reference,
-                            "I4R code or scale bytes differ from single-band CPU reference"
+                            "{} code or scale bytes differ from the CPU reference",
+                            work.case.name()
                         );
                     }
                     check_output(expected, &key, fingerprint(work, &block)?)?;
@@ -1047,6 +1085,7 @@ fn run_workload(
                             beam,
                             ht_backend,
                             i4r_backend,
+                            q4cp_backend,
                         )?));
                     }
                     let elapsed_ns = ns(start)?;
@@ -1055,7 +1094,8 @@ fn run_workload(
                         if let Some(reference) = &cpu_reference {
                             ensure!(
                                 block == reference,
-                                "I4R code or scale bytes differ from single-band CPU reference"
+                                "{} code or scale bytes differ from the CPU reference",
+                                work.case.name()
                             );
                         }
                         output_fingerprint =
@@ -1076,7 +1116,9 @@ fn run_workload(
                             "selected_backend": backend, "effective_backend": effective_backend,
                             "selected_i4r_backend": if work.case == Case::I4r { Some(i4r_backend) } else { None },
                             "i4r_bands_per_call": if work.case == Case::I4r { Some(work.rows / ROWS) } else { None },
-                            "verified_single_band_cpu_reference_codes_and_scales": cpu_reference.is_some(),
+                            "selected_q4cp_backend": if work.case == Case::Nf4 { Some(q4cp_backend) } else { None },
+                            "verified_single_band_cpu_reference_codes_and_scales": cpu_reference.is_some() && work.case == Case::I4r,
+                            "verified_cpu_reference_codes_and_scales": cpu_reference.is_some(),
                             "sample": sample, "iterations": iterations, "repetitions": repetitions, "warmup": warmup,
                             "elapsed_ns": elapsed_ns, "ns_per_iteration": elapsed_ns as f64 / iterations as f64,
                             "values_per_second": values_per_iteration as f64 * iterations as f64 * 1.0e9 / elapsed_ns.max(1) as f64,
@@ -1145,6 +1187,10 @@ fn main() -> Result<()> {
         (1..=32).contains(&args.i4r_bands),
         "--i4r-bands must be in 1..=32"
     );
+    ensure!(
+        !args.q4cp_backends.is_empty() && (1..=32).contains(&args.q4cp_bands),
+        "select at least one Q4C-P backend; --q4cp-bands must be in 1..=32"
+    );
     let mut gpu_preflight = Vec::new();
     for backend in [HtBackend::Hip, HtBackend::Cuda] {
         if !args.backends.contains(&backend) {
@@ -1159,11 +1205,21 @@ fn main() -> Result<()> {
         backend.preflight()?;
         gpu_preflight.push(json!({"backend": backend, "elapsed_ns": ns(start)?}));
     }
-    if args.i4r_backends.contains(&I4rBackend::Cuda) {
+    for backend in [I4rBackend::Hip, I4rBackend::Cuda] {
+        if !args.i4r_backends.contains(&backend) {
+            continue;
+        }
         let start = Instant::now();
-        I4rBackend::Cuda.preflight()?;
+        backend.preflight()?;
         gpu_preflight.push(json!({
-            "backend": I4rBackend::Cuda, "encoding": "i4r", "elapsed_ns": ns(start)?,
+            "backend": backend, "encoding": "i4r", "elapsed_ns": ns(start)?,
+        }));
+    }
+    if args.q4cp_backends.contains(&Q4cpBackend::Cuda) {
+        let start = Instant::now();
+        Q4cpBackend::Cuda.preflight()?;
+        gpu_preflight.push(json!({
+            "backend": Q4cpBackend::Cuda, "encoding": "q4cp", "elapsed_ns": ns(start)?,
         }));
     }
     if args.hf.is_none()
@@ -1195,6 +1251,7 @@ fn main() -> Result<()> {
             "debug_assertions": cfg!(debug_assertions), "cases": cases.iter().map(|case| case.name()).collect::<Vec<_>>(),
             "threads": args.threads, "backends": args.backends,
             "i4r_backends": args.i4r_backends, "i4r_bands": args.i4r_bands,
+            "q4cp_backends": args.q4cp_backends, "q4cp_bands": args.q4cp_bands,
             "timing_beam": args.timing_beam, "corpus_beams": args.corpus_beams,
             "iterations": args.iterations, "repetitions": args.repetitions, "warmup": args.warmup,
             "synthetic_cols": args.cols, "fp8_rows": args.fp8_rows, "seed": args.seed,
@@ -1289,21 +1346,28 @@ mod tests {
     }
 
     #[test]
-    fn i4r_backend_axis_has_only_explicit_cpu_and_cuda_values() {
+    fn i4r_backend_axis_has_explicit_cpu_hip_and_cuda_values() {
         let defaults = Args::parse_from(["encoder_bench"]);
         assert_eq!(defaults.i4r_backends, vec![I4rBackend::Cpu]);
         assert_eq!(defaults.i4r_bands, 1);
-        let args = Args::parse_from([
-            "encoder_bench",
-            "--i4r-backends",
-            "cpu,cuda",
-            "--i4r-bands",
-            "32",
-        ]);
-        assert_eq!(args.backends, vec![HtBackend::Cpu]);
-        assert_eq!(args.i4r_backends, vec![I4rBackend::Cpu, I4rBackend::Cuda]);
-        assert_eq!(args.i4r_bands, 32);
-        for invalid in ["hip", "gpu", "CUDA"] {
+        for (selection, backend) in [("cpu,hip", I4rBackend::Hip), ("cpu,cuda", I4rBackend::Cuda)] {
+            let args = Args::parse_from([
+                "encoder_bench",
+                "--i4r-backends",
+                selection,
+                "--i4r-bands",
+                "32",
+            ]);
+            assert_eq!(args.backends, vec![HtBackend::Cpu]);
+            assert_eq!(args.i4r_backends, vec![I4rBackend::Cpu, backend]);
+            assert_eq!(args.i4r_bands, 32);
+        }
+        let all = Args::parse_from(["encoder_bench", "--i4r-backends", "cpu,hip,cuda"]);
+        assert_eq!(
+            all.i4r_backends,
+            vec![I4rBackend::Cpu, I4rBackend::Hip, I4rBackend::Cuda]
+        );
+        for invalid in ["gpu", "HIP", "CUDA"] {
             assert!(Args::try_parse_from(["encoder_bench", "--i4r-backends", invalid]).is_err());
         }
     }

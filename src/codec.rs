@@ -156,6 +156,7 @@ impl HtBackend {
 pub enum I4rBackend {
     #[default]
     Cpu,
+    Hip,
     Cuda,
 }
 
@@ -163,18 +164,34 @@ impl I4rBackend {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Cpu => "CPU",
+            Self::Hip => "HIP",
             Self::Cuda => "CUDA",
         }
     }
 
     pub const fn is_gpu(self) -> bool {
-        matches!(self, Self::Cuda)
+        !matches!(self, Self::Cpu)
     }
 
     /// Validate I4R device availability without allocating an HT workspace.
     pub fn preflight(self) -> Result<()> {
         match self {
             Self::Cpu => Ok(()),
+            Self::Hip => {
+                #[cfg(feature = "hip")]
+                {
+                    // SAFETY: preflight takes no pointers and synchronizes native context access.
+                    let result = unsafe { hgn_hip_i4r_preflight() };
+                    ensure!(
+                        result == 0,
+                        "HIP I4R preflight failed: {}",
+                        hip_last_error()
+                    );
+                    Ok(())
+                }
+                #[cfg(not(feature = "hip"))]
+                bail!("HIP I4R backend requires a build with --features hip");
+            }
             Self::Cuda => {
                 #[cfg(feature = "cuda")]
                 {
@@ -194,6 +211,50 @@ impl I4rBackend {
     }
 }
 
+/// Encoding backend for Q4C-P group quantization, independent of HT and I4R.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum Q4cpBackend {
+    #[default]
+    Cpu,
+    Cuda,
+}
+
+impl Q4cpBackend {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU",
+            Self::Cuda => "CUDA",
+        }
+    }
+
+    pub const fn is_gpu(self) -> bool {
+        !matches!(self, Self::Cpu)
+    }
+
+    /// Validate Q4C-P device availability without allocating other workspaces.
+    pub fn preflight(self) -> Result<()> {
+        match self {
+            Self::Cpu => Ok(()),
+            Self::Cuda => {
+                #[cfg(feature = "cuda")]
+                {
+                    // SAFETY: preflight takes no pointers and synchronizes native context access.
+                    let result = unsafe { hgn_cuda_q4cp_preflight() };
+                    ensure!(
+                        result == 0,
+                        "CUDA Q4C-P preflight failed: {}",
+                        cuda_last_error()
+                    );
+                    Ok(())
+                }
+                #[cfg(not(feature = "cuda"))]
+                bail!("CUDA Q4C-P backend requires a build with --features cuda");
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct QuantMeta<'a> {
     /// Input signs for the current matrix/expert; exactly `cols` values.
@@ -207,6 +268,7 @@ pub struct QuantMeta<'a> {
     pub ht_beam: usize,
     pub ht_backend: HtBackend,
     pub i4r_backend: I4rBackend,
+    pub q4cp_backend: Q4cpBackend,
 }
 
 impl Default for QuantMeta<'_> {
@@ -220,6 +282,7 @@ impl Default for QuantMeta<'_> {
             ht_beam: 128,
             ht_backend: HtBackend::Cpu,
             i4r_backend: I4rBackend::Cpu,
+            q4cp_backend: Q4cpBackend::Cpu,
         }
     }
 }
@@ -582,15 +645,71 @@ fn round_small_code(value: f32, lower: f32, upper: f32) -> i32 {
     (value.clamp(lower, upper) + 12_582_912.0) as i32 - 12_582_912
 }
 
+fn q4_midpoints(cb: &[f32; 16]) -> [f32; 15] {
+    let mut mids = [0.0f32; 15];
+    for (i, midpoint) in mids.iter_mut().enumerate() {
+        *midpoint = (cb[i] as f64 * 0.5 + cb[i + 1] as f64 * 0.5) as f32;
+    }
+    mids
+}
+
+fn encode_q4_cuda(input: &[f32], rows: usize, cols: usize, cb: &[f32; 16]) -> Result<EncodedBlock> {
+    #[cfg(feature = "cuda")]
+    {
+        validate_codebook(cb)?;
+        let stride = pad((cols / 16) as u64, 16)? as usize;
+        let groups = input.len() / 32;
+        let mids = q4_midpoints(cb);
+        let mut codes = vec![0u8; input.len() / 2];
+        let mut halves = vec![0u16; groups];
+        // SAFETY: input holds groups*32 finite values (checked by the caller);
+        // exclusive outputs hold exactly groups*16 bytes and groups half words.
+        // Native CUDA synchronizes before return and retains no host pointers.
+        let result = unsafe {
+            hgn_cuda_encode_q4cp(
+                input.as_ptr(),
+                cb.as_ptr(),
+                mids.as_ptr(),
+                codes.as_mut_ptr(),
+                halves.as_mut_ptr(),
+                groups,
+            )
+        };
+        if result == CUDA_Q4CP_SCALE_OVERFLOW {
+            // Reproduce the CPU reference's exact first-group error message.
+            encode_q4(input, rows, cols, cb)?;
+            bail!("CUDA Q4C-P reported a non-finite f16 scale that the CPU reference accepted");
+        }
+        ensure!(
+            result == 0,
+            "CUDA Q4C-P encoding failed: {}",
+            cuda_last_error()
+        );
+        let per_row = cols / 32;
+        let mut scales = vec![0u8; rows * stride];
+        for (out, row_halves) in scales
+            .chunks_exact_mut(stride)
+            .zip(halves.chunks_exact(per_row))
+        {
+            for (g, half) in row_halves.iter().enumerate() {
+                out[2 * g..2 * g + 2].copy_from_slice(&half.to_le_bytes());
+            }
+        }
+        Ok(EncodedBlock { codes, scales })
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (input, rows, cols, cb);
+        bail!("CUDA Q4C-P backend requires a build with --features cuda");
+    }
+}
+
 fn encode_q4(input: &[f32], rows: usize, cols: usize, cb: &[f32; 16]) -> Result<EncodedBlock> {
     validate_codebook(cb)?;
     let stride = pad((cols / 16) as u64, 16)? as usize;
     let mut codes = vec![0; input.len() / 2];
     let mut scales = vec![0; rows * stride];
-    let mut mids = [0.0f32; 15];
-    for (i, midpoint) in mids.iter_mut().enumerate() {
-        *midpoint = (cb[i] as f64 * 0.5 + cb[i + 1] as f64 * 0.5) as f32;
-    }
+    let mids = q4_midpoints(cb);
     let cmax = cb[0].abs().max(cb[15].abs());
     for (group_index, group) in input.chunks_exact(32).enumerate() {
         let absmax = group.iter().fold(0.0f32, |a, x| a.max(x.abs()));
@@ -780,6 +899,16 @@ unsafe extern "C" {
     ) -> c_int;
     fn ht_hip_last_error() -> *const std::ffi::c_char;
     fn ht_hip_preflight() -> c_int;
+    fn hgn_hip_i4r_preflight() -> c_int;
+    fn hgn_hip_encode_i4r(
+        src: *const f32,
+        su: *const f32,
+        sv: *const f32,
+        codes: *mut u8,
+        scales: *mut u8,
+        bands: c_int,
+        cols: c_int,
+    ) -> c_int;
 }
 
 #[cfg(feature = "hip")]
@@ -807,6 +936,15 @@ unsafe extern "C" {
     ) -> c_int;
     fn ht_cuda_last_error() -> *const std::ffi::c_char;
     fn ht_cuda_preflight() -> c_int;
+    fn hgn_cuda_q4cp_preflight() -> c_int;
+    fn hgn_cuda_encode_q4cp(
+        src: *const f32,
+        codebook: *const f32,
+        midpoints: *const f32,
+        codes: *mut u8,
+        scales: *mut u16,
+        groups: usize,
+    ) -> c_int;
     fn hgn_cuda_i4r_preflight() -> c_int;
     fn hgn_cuda_encode_i4r(
         src: *const f32,
@@ -818,6 +956,9 @@ unsafe extern "C" {
         cols: c_int,
     ) -> c_int;
 }
+
+#[cfg(feature = "cuda")]
+const CUDA_Q4CP_SCALE_OVERFLOW: c_int = -6;
 
 #[cfg(feature = "cuda")]
 fn cuda_last_error() -> String {
@@ -832,22 +973,67 @@ fn cuda_last_error() -> String {
         .into_owned()
 }
 
-fn native_i4r_shape(rows: usize, cols: usize) -> Result<(c_int, c_int)> {
+fn native_i4r_shape(rows: usize, cols: usize, backend: I4rBackend) -> Result<(c_int, c_int)> {
     ensure!(
         rows > 0 && cols > 0 && rows % 128 == 0 && cols % 128 == 0,
         "I4R encoding requires complete 128-by-128 blocks"
     );
     let count = rows
         .checked_mul(cols)
-        .context("CUDA I4R matrix element count overflow")?;
+        .with_context(|| format!("{} I4R matrix element count overflow", backend.label()))?;
     ensure!(
         count <= isize::MAX as usize / std::mem::size_of::<f32>(),
-        "CUDA I4R block exceeds addressable buffer size"
+        "{} I4R block exceeds addressable buffer size",
+        backend.label()
     );
-    let bands =
-        c_int::try_from(rows / 128).context("CUDA I4R band count exceeds signed-int range")?;
-    let cols = c_int::try_from(cols).context("CUDA I4R column count exceeds signed-int range")?;
+    let bands = c_int::try_from(rows / 128).with_context(|| {
+        format!(
+            "{} I4R band count exceeds signed-int range",
+            backend.label()
+        )
+    })?;
+    let cols = c_int::try_from(cols).with_context(|| {
+        format!(
+            "{} I4R column count exceeds signed-int range",
+            backend.label()
+        )
+    })?;
     Ok((bands, cols))
+}
+
+fn encode_i4r_hip(
+    input: &[f32],
+    meta: &QuantMeta<'_>,
+    bands: c_int,
+    cols: c_int,
+) -> Result<EncodedBlock> {
+    #[cfg(feature = "hip")]
+    {
+        let mut codes = vec![0; input.len() / 2];
+        let mut scales = vec![0; input.len() / 64];
+        // SAFETY: shape, finite source values, and complete +/-1 sign planes
+        // were checked before this call. Exclusive output planes have exactly
+        // values/2 and values/64 bytes. Native HIP synchronizes before return
+        // and retains no host pointers; failed output is never exposed.
+        let result = unsafe {
+            hgn_hip_encode_i4r(
+                input.as_ptr(),
+                meta.su.as_ptr(),
+                meta.sv.as_ptr(),
+                codes.as_mut_ptr(),
+                scales.as_mut_ptr(),
+                bands,
+                cols,
+            )
+        };
+        ensure!(result == 0, "HIP I4R encoding failed: {}", hip_last_error());
+        Ok(EncodedBlock { codes, scales })
+    }
+    #[cfg(not(feature = "hip"))]
+    {
+        let _ = (input, meta, bands, cols);
+        bail!("HIP I4R backend requires a build with --features hip");
+    }
 }
 
 fn encode_i4r_cuda(
@@ -1072,8 +1258,8 @@ pub fn encode_rows(
         ht_band_value_count(rows, cols, false)?;
         validate_ht_backend(meta)?;
     }
-    let i4r_cuda_shape = if encoding == Encoding::I4r && meta.i4r_backend == I4rBackend::Cuda {
-        Some(native_i4r_shape(rows, cols)?)
+    let i4r_gpu_shape = if encoding == Encoding::I4r && meta.i4r_backend.is_gpu() {
+        Some(native_i4r_shape(rows, cols, meta.i4r_backend)?)
     } else {
         None
     };
@@ -1102,7 +1288,10 @@ pub fn encode_rows(
             })
         }
         Encoding::I64 => bail!("I64 cannot be encoded through f32; preserve source integer bytes"),
-        Encoding::Q4Cp => encode_q4(input, rows, cols, meta.codebook),
+        Encoding::Q4Cp => match meta.q4cp_backend {
+            Q4cpBackend::Cpu => encode_q4(input, rows, cols, meta.codebook),
+            Q4cpBackend::Cuda => encode_q4_cuda(input, rows, cols, meta.codebook),
+        },
         Encoding::Q8G64 => encode_affine(input, rows, cols, 8),
         Encoding::Q6G64 => encode_affine(input, rows, cols, 6),
         Encoding::Fp8G128 => {
@@ -1139,8 +1328,12 @@ pub fn encode_rows(
         }
         Encoding::I4r => {
             validate_rotation(rows, cols, meta, true)?;
-            if let Some((bands, cols)) = i4r_cuda_shape {
-                encode_i4r_cuda(input, meta, bands, cols)
+            if let Some((bands, cols)) = i4r_gpu_shape {
+                match meta.i4r_backend {
+                    I4rBackend::Hip => encode_i4r_hip(input, meta, bands, cols),
+                    I4rBackend::Cuda => encode_i4r_cuda(input, meta, bands, cols),
+                    I4rBackend::Cpu => unreachable!("CPU I4R does not use a native shape"),
+                }
             } else {
                 let mut rotated = vec![0.0; count];
                 rotate_into(input, rows, cols, meta, RotationOrder::Rows, &mut rotated)?;
@@ -2792,8 +2985,9 @@ mod backend_tests {
     #[cfg(any(feature = "hip", feature = "cuda"))]
     fn native_batches_and_changed_codebooks_match_cpu(backend: HtBackend) {
         backend.preflight().unwrap();
-        // Cross each implementation's largest bounded tile batch.
-        let tiles_per_call = if backend == HtBackend::Cuda { 513 } else { 65 };
+        // Cross each implementation's largest tile batch; CUDA also crosses its
+        // persistent-grid stride (fewer resident blocks than tiles).
+        let tiles_per_call = if backend == HtBackend::Cuda { 4097 } else { 65 };
         let tiles: Vec<f32> = (0..tiles_per_call * 256)
             .map(|i| ((i * 17 % 97) as f32 - 48.0) / 32.0)
             .collect();

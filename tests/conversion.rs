@@ -323,7 +323,11 @@ fn legacy_options_default_to_v2_and_profiles_serialize_explicitly() -> Result<()
         (HtBackend::Hip, "hip"),
         (HtBackend::Cuda, "cuda"),
     ] {
-        for (i4r_backend, i4r_name) in [(I4rBackend::Cpu, "cpu"), (I4rBackend::Cuda, "cuda")] {
+        for (i4r_backend, i4r_name) in [
+            (I4rBackend::Cpu, "cpu"),
+            (I4rBackend::Hip, "hip"),
+            (I4rBackend::Cuda, "cuda"),
+        ] {
             let selected = Options {
                 ht_backend,
                 i4r_backend,
@@ -340,7 +344,7 @@ fn legacy_options_default_to_v2_and_profiles_serialize_explicitly() -> Result<()
         r#"{"seed":7,"threads":1,"ht_beam":8,"ht_backend":"unknown-device"}"#
     )
     .is_err());
-    for invalid in ["hip", "CUDA", "gpu", "unknown-device"] {
+    for invalid in ["CPU", "HIP", "CUDA", "gpu", "unknown-device"] {
         let mut json = serde_json::to_value(options())?;
         json["i4r_backend"] = serde_json::json!(invalid);
         assert!(
@@ -651,7 +655,11 @@ fn verification_accepts_gpu_provenance_and_schema2_without_backends() -> Result<
         (HtBackend::Hip, "hip"),
         (HtBackend::Cuda, "cuda"),
     ] {
-        for (i4r_backend, i4r_name) in [(I4rBackend::Cpu, "cpu"), (I4rBackend::Cuda, "cuda")] {
+        for (i4r_backend, i4r_name) in [
+            (I4rBackend::Cpu, "cpu"),
+            (I4rBackend::Hip, "hip"),
+            (I4rBackend::Cuda, "cuda"),
+        ] {
             json["options"]["ht_backend"] = serde_json::json!(ht_name);
             json["options"]["i4r_backend"] = serde_json::json!(i4r_name);
             fs::write(
@@ -780,6 +788,19 @@ fn cuda_conversion_requires_feature_before_staging_or_source_open() -> Result<()
         },
         "--ht-backend",
         "cuda",
+    )
+}
+
+#[cfg(not(feature = "hip"))]
+#[test]
+fn i4r_hip_conversion_requires_feature_before_staging_or_source_open() -> Result<()> {
+    conversion_requires_feature_before_staging_or_source_open(
+        Options {
+            i4r_backend: I4rBackend::Hip,
+            ..options()
+        },
+        "--i4r-backend",
+        "hip",
     )
 }
 
@@ -948,6 +969,15 @@ fn describing_cuda_does_not_initialize_a_device_or_bypass_architecture() -> Resu
 }
 
 #[test]
+fn describing_i4r_hip_does_not_initialize_a_device_or_bypass_architecture() -> Result<()> {
+    describing_backend_does_not_initialize_a_device_or_bypass_architecture(
+        "--i4r-backend",
+        "hip",
+        "HIP I4R",
+    )
+}
+
+#[test]
 fn describing_i4r_cuda_does_not_initialize_a_device_or_bypass_architecture() -> Result<()> {
     describing_backend_does_not_initialize_a_device_or_bypass_architecture(
         "--i4r-backend",
@@ -975,6 +1005,8 @@ fn describing_backend_does_not_initialize_a_device_or_bypass_architecture(
         let result = cli.output()?;
         assert_eq!(result.status.code(), Some(2)); // Structural config remains rejected.
         let error = String::from_utf8(result.stderr)?;
+        assert!(!error.contains("unexpected argument"), "{error}");
+        assert!(!error.contains("invalid value"), "{error}");
         assert!(!error.contains(&format!("--features {backend}")));
         assert!(!error.contains(&format!("{label} preflight")));
         assert!(result.stdout.is_empty());
@@ -1138,17 +1170,19 @@ fn full_verification_reports_match_cpu_bitwise(backend: DecodeBackend) -> Result
         assert_eq!(serde_json::to_value(&cpu)?, serde_json::to_value(gpu)?);
         // Encoding provenance never chooses the runtime decoder, including I4R.
         let mut json = serde_json::to_value(&manifest)?;
-        for provenance in ["hip", "cuda"] {
-            json["options"]["ht_backend"] = serde_json::json!(provenance);
-            json["options"]["i4r_backend"] = serde_json::json!("cuda");
-            fs::write(
-                output.join("conversion-manifest.json"),
-                serde_json::to_vec_pretty(&json)?,
-            )?;
-            for runtime in [DecodeBackend::Cpu, backend] {
-                let report =
-                    verify::verify(&snapshot, &plan, &output, runtime, &Progress::disabled())?;
-                assert_eq!(serde_json::to_value(report)?, serde_json::to_value(&cpu)?);
+        for ht_provenance in ["hip", "cuda"] {
+            for i4r_provenance in ["hip", "cuda"] {
+                json["options"]["ht_backend"] = serde_json::json!(ht_provenance);
+                json["options"]["i4r_backend"] = serde_json::json!(i4r_provenance);
+                fs::write(
+                    output.join("conversion-manifest.json"),
+                    serde_json::to_vec_pretty(&json)?,
+                )?;
+                for runtime in [DecodeBackend::Cpu, backend] {
+                    let report =
+                        verify::verify(&snapshot, &plan, &output, runtime, &Progress::disabled())?;
+                    assert_eq!(serde_json::to_value(report)?, serde_json::to_value(&cpu)?);
+                }
             }
         }
     }
@@ -1161,6 +1195,9 @@ fn backend_selection_preserves_semantic_option_limits() -> Result<()> {
         (HtBackend::Cpu, I4rBackend::Cpu),
         (HtBackend::Hip, I4rBackend::Cpu),
         (HtBackend::Cuda, I4rBackend::Cpu),
+        (HtBackend::Cpu, I4rBackend::Hip),
+        (HtBackend::Hip, I4rBackend::Hip),
+        (HtBackend::Cuda, I4rBackend::Hip),
         (HtBackend::Cpu, I4rBackend::Cuda),
         (HtBackend::Hip, I4rBackend::Cuda),
         (HtBackend::Cuda, I4rBackend::Cuda),
@@ -1213,6 +1250,7 @@ fn backend_labels_and_defaults_are_available_independently_of_features() {
     }
     for (backend, label, gpu) in [
         (I4rBackend::Cpu, "CPU", false),
+        (I4rBackend::Hip, "HIP", true),
         (I4rBackend::Cuda, "CUDA", true),
     ] {
         assert_eq!(backend.label(), label);
@@ -1228,7 +1266,7 @@ fn backend_labels_and_defaults_are_available_independently_of_features() {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "hip", feature = "cuda"))]
 fn i4r_batched_fixture(
     parent: &std::path::Path,
 ) -> Result<(Snapshot, bf16_to_hgn::ConversionPlan)> {
@@ -1317,14 +1355,38 @@ fn i4r_batched_fixture(
     plan.files[0].tensors.sort_by(|a, b| a.name.cmp(&b.name));
     // Existing I4R wire semantics intentionally share su across experts and
     // restart the expert-local sv plane. Distinct expert su is tested through
-    // separate public encode_rows calls in i4r_cuda.rs, not a changed format.
+    // separate public encode_rows calls in i4r_gpu.rs, not a changed format.
     Ok((Snapshot::open(&snapshot.root)?, plan))
+}
+
+#[cfg(feature = "hip")]
+#[test]
+#[ignore = "requires an available HIP device; publishes multi-batch I4R experts with CPU and HIP HT"]
+fn hip_i4r_conversion_matches_cpu_all_containers_and_verifies() -> Result<()> {
+    i4r_conversion_matches_cpu_all_containers_and_verifies(
+        I4rBackend::Hip,
+        HtBackend::Hip,
+        DecodeBackend::Hip,
+    )
 }
 
 #[cfg(feature = "cuda")]
 #[test]
-#[ignore = "requires an available CUDA device; publishes multi-batch I4R experts with CPU HT"]
+#[ignore = "requires an available CUDA device; publishes multi-batch I4R experts with CPU and CUDA HT"]
 fn cuda_i4r_conversion_matches_cpu_all_containers_and_verifies() -> Result<()> {
+    i4r_conversion_matches_cpu_all_containers_and_verifies(
+        I4rBackend::Cuda,
+        HtBackend::Cuda,
+        DecodeBackend::Cuda,
+    )
+}
+
+#[cfg(any(feature = "hip", feature = "cuda"))]
+fn i4r_conversion_matches_cpu_all_containers_and_verifies(
+    gpu_backend: I4rBackend,
+    ht_backend: HtBackend,
+    decode_backend: DecodeBackend,
+) -> Result<()> {
     let temporary = tempfile::tempdir()?;
     let (snapshot, plan) = i4r_batched_fixture(temporary.path())?;
     assert_eq!(plan.files.len(), 3);
@@ -1352,29 +1414,39 @@ fn cuda_i4r_conversion_matches_cpu_all_containers_and_verifies() -> Result<()> {
         serde_json::Value,
         std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
     )> = None;
-    for i4r_backend in [I4rBackend::Cpu, I4rBackend::Cuda] {
-        let output = temporary
-            .path()
-            .join(i4r_backend.label().to_ascii_lowercase());
+    for (ht_backend, i4r_backend) in [
+        (HtBackend::Cpu, I4rBackend::Cpu),
+        (ht_backend, I4rBackend::Cpu),
+        (HtBackend::Cpu, gpu_backend),
+        (ht_backend, gpu_backend),
+    ] {
+        let output = temporary.path().join(format!(
+            "{}-{}",
+            ht_backend.label().to_ascii_lowercase(),
+            i4r_backend.label().to_ascii_lowercase()
+        ));
         let opts = Options {
-            ht_backend: HtBackend::Cpu,
+            ht_backend,
             i4r_backend,
             ..options()
         };
         let manifest =
             conversion::convert(&snapshot, &plan, &output, &opts, &Progress::disabled())?;
-        assert_eq!(manifest.options.ht_backend, HtBackend::Cpu);
+        assert_eq!(manifest.options.ht_backend, ht_backend);
         assert_eq!(manifest.options.i4r_backend, i4r_backend);
         assert_eq!(verify::manifest_options(&output)?, opts);
         let serialized: serde_json::Value =
             serde_json::from_slice(&fs::read(output.join("conversion-manifest.json"))?)?;
-        assert_eq!(serialized["options"]["ht_backend"], "cpu");
+        assert_eq!(
+            serialized["options"]["ht_backend"],
+            ht_backend.label().to_ascii_lowercase()
+        );
         assert_eq!(
             serialized["options"]["i4r_backend"],
             i4r_backend.label().to_ascii_lowercase()
         );
         // Always verify against the original BF16 source with the CPU decoder,
-        // including the publication carrying CUDA encoding provenance.
+        // including publications carrying HIP or CUDA encoding provenance.
         let report = verify::verify(
             &snapshot,
             &plan,
@@ -1385,6 +1457,14 @@ fn cuda_i4r_conversion_matches_cpu_all_containers_and_verifies() -> Result<()> {
         assert_eq!(report.source_tensors, snapshot.tensors.len());
         assert!(report.provenance_attested);
         let report = serde_json::to_value(report)?;
+        let gpu_report = verify::verify(
+            &snapshot,
+            &plan,
+            &output,
+            decode_backend,
+            &Progress::disabled(),
+        )?;
+        assert_eq!(serde_json::to_value(gpu_report)?, report);
         let mut files = publication_bytes(&output)?;
         assert!(files
             .remove(std::path::Path::new("conversion-manifest.json"))
@@ -1415,27 +1495,52 @@ fn cuda_i4r_conversion_matches_cpu_all_containers_and_verifies() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "hip")]
+#[test]
+fn hip_i4r_device_unavailable_fails_before_source_open_or_staging() -> Result<()> {
+    i4r_device_unavailable_fails_before_source_open_or_staging(
+        I4rBackend::Hip,
+        "HIP_VISIBLE_DEVICES",
+        "-1",
+    )
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 fn cuda_i4r_device_unavailable_fails_before_source_open_or_staging() -> Result<()> {
+    i4r_device_unavailable_fails_before_source_open_or_staging(
+        I4rBackend::Cuda,
+        "CUDA_VISIBLE_DEVICES",
+        "",
+    )
+}
+
+#[cfg(any(feature = "hip", feature = "cuda"))]
+fn i4r_device_unavailable_fails_before_source_open_or_staging(
+    backend: I4rBackend,
+    visibility: &str,
+    hidden: &str,
+) -> Result<()> {
     let temporary = tempfile::tempdir()?;
     let output = temporary.path().join("converted");
+    let label = backend.label();
+    let backend = label.to_ascii_lowercase();
     for occupied in [false, true] {
         if occupied {
             fs::create_dir(&output)?;
             fs::write(output.join("keep.bin"), b"existing output")?;
         }
         // Hide devices only in this fresh CLI child, never in the test process
-        // or another test's initialized CUDA context. This is a real runtime
+        // or another test's initialized GPU context. This is a real runtime
         // availability failure, not a mocked encoder or substituted payload.
         let result = std::process::Command::new(env!("CARGO_BIN_EXE_bf16-to-hgn"))
-            .env("CUDA_VISIBLE_DEVICES", "")
+            .env(visibility, hidden)
             .args([
                 "convert",
                 "--ht-backend",
                 "cpu",
                 "--i4r-backend",
-                "cuda",
+                &backend,
                 "--source",
             ])
             .arg(temporary.path().join("missing-source"))
@@ -1445,8 +1550,11 @@ fn cuda_i4r_device_unavailable_fails_before_source_open_or_staging() -> Result<(
         assert_eq!(result.status.code(), Some(2));
         assert!(result.stdout.is_empty());
         let error = String::from_utf8(result.stderr)?;
-        assert!(error.contains("CUDA I4R preflight failed:"), "{error}");
-        assert!(!error.contains("CUDA HT preflight"), "{error}");
+        assert!(
+            error.contains(&format!("{label} I4R preflight failed:")),
+            "{error}"
+        );
+        assert!(!error.contains(&format!("{label} HT preflight")), "{error}");
         if occupied {
             assert_eq!(fs::read(output.join("keep.bin"))?, b"existing output");
             assert_eq!(fs::read_dir(&output)?.count(), 1);

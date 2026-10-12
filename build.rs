@@ -122,6 +122,8 @@ fn main() {
             .flag("-ffp-contract=off")
             .flag("-fno-fast-math")
             .flag("-fno-gpu-flush-denormals-to-zero")
+            // I4R code selection requires an IEEE RNE binary32 quotient.
+            .flag("-fhip-fp32-correctly-rounded-divide-sqrt")
             .compile("hgn_trellis_hip");
         println!(
             "cargo:rustc-link-search=native={}",

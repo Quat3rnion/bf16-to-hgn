@@ -20,7 +20,9 @@ use std::{
 
 const COPY_CHUNK: usize = 8 * 1024 * 1024;
 const MATRIX_ROWS: usize = 128;
-const I4R_CUDA_BATCH_BANDS: usize = 32;
+const I4R_GPU_BATCH_BANDS: usize = 32;
+/// Host values per GPU Q4C-P call: 32 MiB of f32, one native device batch.
+const Q4CP_GPU_BATCH_VALUES: usize = 1 << 23;
 const TABLE_ROWS: usize = 8192;
 
 pub fn validate_plan(
@@ -675,7 +677,7 @@ fn encode_tensor(
     }
     let mut row = 0;
     while row < rows {
-        let take = matrix_batch_rows(tensor, options.i4r_backend, row, rows)?;
+        let take = matrix_batch_rows(tensor, options, row, rows)?;
         if stage.is_enabled() {
             tensor_progress::rows(
                 stage,
@@ -699,6 +701,7 @@ fn encode_tensor(
             ht_beam: options.ht_beam,
             ht_backend: options.ht_backend,
             i4r_backend: options.i4r_backend,
+            q4cp_backend: options.q4cp_backend,
             ..QuantMeta::default()
         };
         let block = codec::encode_rows(tensor.encoding, &values, take, cols, &meta)
@@ -753,17 +756,20 @@ pub(crate) fn direct_copy(encoding: Encoding, dtype: Dtype) -> bool {
 }
 
 fn encode_backend(tensor: &TensorPlan, options: &Options) -> &'static str {
-    WorkClass::encode(tensor.encoding, options.ht_backend, options.i4r_backend).backend_label()
+    WorkClass::encode(tensor.encoding, options.ht_backend, options.i4r_backend, options.q4cp_backend).backend_label()
 }
 
 fn matrix_batch_rows(
     tensor: &TensorPlan,
-    i4r_backend: codec::I4rBackend,
+    options: &Options,
     row: usize,
     rows: usize,
 ) -> Result<usize> {
     ensure!(row < rows, "matrix batch starts beyond tensor");
-    if tensor.encoding != Encoding::I4r || i4r_backend == codec::I4rBackend::Cpu {
+    if tensor.encoding == Encoding::Q4Cp && options.q4cp_backend.is_gpu() {
+        return q4cp_gpu_batch_rows(tensor, row, rows);
+    }
+    if tensor.encoding != Encoding::I4r || !options.i4r_backend.is_gpu() {
         return Ok(MATRIX_ROWS.min(rows - row));
     }
     let expert_rows = if tensor.shape.len() == 3 {
@@ -786,7 +792,34 @@ fn matrix_batch_rows(
     };
     // One bounded host batch shares su. sv restarts at each expert, and the
     // gate/up half boundary is also kept intact for truthful portion progress.
-    Ok((I4R_CUDA_BATCH_BANDS * MATRIX_ROWS)
+    Ok((I4R_GPU_BATCH_BANDS * MATRIX_ROWS)
+        .min(portion_rows - row % portion_rows)
+        .min(rows - row))
+}
+
+/// Q4C-P groups are independent, so GPU batches need no band alignment.
+/// Bound the host batch by values, and keep expert/projection portions
+/// intact so row progress stays truthful.
+fn q4cp_gpu_batch_rows(tensor: &TensorPlan, row: usize, rows: usize) -> Result<usize> {
+    let cols = usize::try_from(*tensor.shape.last().context("Q4C-P tensor has no shape")?)?;
+    ensure!(cols > 0, "Q4C-P batch requires positive columns");
+    let portion_rows = if tensor.shape.len() == 3 {
+        let expert_rows = usize::try_from(tensor.shape[1])?;
+        if tensor.name.ends_with(".gate_up_proj.weight") {
+            ensure!(
+                expert_rows % 2 == 0,
+                "Q4C-P gate/up requires complete projection halves"
+            );
+            expert_rows / 2
+        } else {
+            expert_rows
+        }
+    } else {
+        rows
+    };
+    ensure!(portion_rows > 0, "Q4C-P batch requires positive rows");
+    let budget = (Q4CP_GPU_BATCH_VALUES / cols).max(1);
+    Ok(budget
         .min(portion_rows - row % portion_rows)
         .min(rows - row))
 }
@@ -795,7 +828,7 @@ fn source_work(encoding: Encoding, dtype: Dtype, options: &Options) -> WorkClass
     if direct_copy(encoding, dtype) {
         WorkClass::Copy(encoding)
     } else {
-        WorkClass::encode(encoding, options.ht_backend, options.i4r_backend)
+        WorkClass::encode(encoding, options.ht_backend, options.i4r_backend, options.q4cp_backend)
     }
 }
 
@@ -821,7 +854,7 @@ fn conversion_work(
                 WorkClass::encode(
                     Encoding::Fp8G128,
                     codec::HtBackend::Cpu,
-                    codec::I4rBackend::Cpu,
+                    codec::I4rBackend::Cpu, codec::Q4cpBackend::Cpu
                 )
             }
         };
@@ -842,7 +875,7 @@ fn encode_gate_up(
     options: &Options,
     stage: &Stage,
 ) -> Result<String> {
-    let class = WorkClass::encode(tensor.encoding, options.ht_backend, options.i4r_backend);
+    let class = WorkClass::encode(tensor.encoding, options.ht_backend, options.i4r_backend, options.q4cp_backend);
     let experts = usize::try_from(tensor.shape[0])?;
     let expert_rows = usize::try_from(tensor.shape[1])?;
     let cols = usize::try_from(tensor.shape[2])?;
@@ -894,6 +927,7 @@ fn encode_gate_up(
                 ht_beam: options.ht_beam,
                 ht_backend: options.ht_backend,
                 i4r_backend: options.i4r_backend,
+                q4cp_backend: options.q4cp_backend,
                 ..QuantMeta::default()
             };
             let up_meta = QuantMeta {
@@ -1062,6 +1096,7 @@ fn encode_table(
         ht_beam: options.ht_beam,
         ht_backend: options.ht_backend,
         i4r_backend: options.i4r_backend,
+        q4cp_backend: options.q4cp_backend,
         ..QuantMeta::default()
     };
     let mut output_offset = 0;
@@ -1111,7 +1146,7 @@ fn encode_table(
                 WorkClass::encode(
                     Encoding::Fp8G128,
                     codec::HtBackend::Cpu,
-                    codec::I4rBackend::Cpu,
+                    codec::I4rBackend::Cpu, codec::Q4cpBackend::Cpu
                 ),
                 (take * cols) as u64,
                 started,

@@ -161,13 +161,21 @@ fn i4r_backend_is_explicit_lowercase_and_independent_of_ht() -> Result<()> {
     assert_eq!(QuantMeta::default().i4r_backend, I4rBackend::Cpu);
     assert_eq!(
         I4rBackend::value_variants(),
-        &[I4rBackend::Cpu, I4rBackend::Cuda]
+        &[I4rBackend::Cpu, I4rBackend::Hip, I4rBackend::Cuda]
     );
-    for (name, backend) in [("cpu", I4rBackend::Cpu), ("cuda", I4rBackend::Cuda)] {
+    for (name, backend) in [
+        ("cpu", I4rBackend::Cpu),
+        ("hip", I4rBackend::Hip),
+        ("cuda", I4rBackend::Cuda),
+    ] {
         assert_eq!(serde_json::to_value(backend)?, name);
         assert_eq!(I4rBackend::from_str(name, false).unwrap(), backend);
+        assert_eq!(
+            serde_json::from_value::<I4rBackend>(serde_json::json!(name))?,
+            backend
+        );
     }
-    for name in ["hip", "gpu", "CPU", "CUDA", "nvidia"] {
+    for name in ["gpu", "CPU", "HIP", "CUDA", "amd", "nvidia"] {
         assert!(I4rBackend::from_str(name, false).is_err());
         assert!(serde_json::from_value::<I4rBackend>(serde_json::json!(name)).is_err());
     }
@@ -195,25 +203,28 @@ fn i4r_backend_is_explicit_lowercase_and_independent_of_ht() -> Result<()> {
             &expected,
         );
     }
-    // Merely recording CUDA encoding provenance never initializes a decoder.
-    let provenance = QuantMeta {
-        i4r_backend: I4rBackend::Cuda,
-        ..meta
-    };
-    assert_float_bits(
-        &decode_rows(Encoding::I4r, &expected, BAND, BAND, &provenance)?,
-        &decode_rows(Encoding::I4r, &expected, BAND, BAND, &meta)?,
-    );
+    // Merely recording GPU encoding provenance never initializes a decoder.
+    let decoded = decode_rows(Encoding::I4r, &expected, BAND, BAND, &meta)?;
+    for i4r_backend in [I4rBackend::Hip, I4rBackend::Cuda] {
+        let provenance = QuantMeta {
+            i4r_backend,
+            ..meta
+        };
+        assert_float_bits(
+            &decode_rows(Encoding::I4r, &expected, BAND, BAND, &provenance)?,
+            &decoded,
+        );
+    }
     for encoding in [Encoding::Bf16, Encoding::Ht, Encoding::Ht3] {
         let cpu = QuantMeta { ht_beam: 1, ..meta };
-        let selected = QuantMeta {
-            i4r_backend: I4rBackend::Cuda,
-            ..cpu
-        };
-        assert_planes(
-            &encode_rows(encoding, &input, BAND, BAND, &selected)?,
-            &encode_rows(encoding, &input, BAND, BAND, &cpu)?,
-        );
+        let expected = encode_rows(encoding, &input, BAND, BAND, &cpu)?;
+        for i4r_backend in [I4rBackend::Hip, I4rBackend::Cuda] {
+            let selected = QuantMeta { i4r_backend, ..cpu };
+            assert_planes(
+                &encode_rows(encoding, &input, BAND, BAND, &selected)?,
+                &expected,
+            );
+        }
     }
     Ok(())
 }
@@ -291,7 +302,7 @@ fn i4r_rejects_invalid_inputs_before_any_native_backend_call() -> Result<()> {
     let input = mixed_values(rows, cols, 1);
     let su = vec![1.0; cols];
     let sv = vec![1.0; rows];
-    for i4r_backend in [I4rBackend::Cpu, I4rBackend::Cuda] {
+    for i4r_backend in [I4rBackend::Cpu, I4rBackend::Hip, I4rBackend::Cuda] {
         let meta = QuantMeta {
             su: &su,
             sv: &sv,
@@ -401,53 +412,91 @@ fn i4r_rejects_invalid_inputs_before_any_native_backend_call() -> Result<()> {
 
 #[cfg(target_pointer_width = "64")]
 #[test]
-fn i4r_cuda_rejects_unrepresentable_native_dimensions_without_allocation() {
-    let meta = QuantMeta {
-        i4r_backend: I4rBackend::Cuda,
-        ..QuantMeta::default()
-    };
-    for (rows, cols, message) in [
-        (
-            (i32::MAX as usize + 1) * BAND,
-            BAND,
-            "band count exceeds signed-int",
-        ),
-        (
-            BAND,
-            i32::MAX as usize + 1,
-            "column count exceeds signed-int",
-        ),
-    ] {
-        let error = encode_rows(Encoding::I4r, &[], rows, cols, &meta).unwrap_err();
-        assert!(error.to_string().contains(message), "{error:#}");
+fn i4r_gpu_rejects_unrepresentable_native_dimensions_without_allocation() {
+    for i4r_backend in [I4rBackend::Hip, I4rBackend::Cuda] {
+        let meta = QuantMeta {
+            i4r_backend,
+            ..QuantMeta::default()
+        };
+        for (rows, cols, message) in [
+            (
+                (i32::MAX as usize + 1) * BAND,
+                BAND,
+                "band count exceeds signed-int",
+            ),
+            (
+                BAND,
+                i32::MAX as usize + 1,
+                "column count exceeds signed-int",
+            ),
+        ] {
+            let error = encode_rows(Encoding::I4r, &[], rows, cols, &meta).unwrap_err();
+            assert!(error.to_string().contains(message), "{error:#}");
+            assert!(error.to_string().contains(i4r_backend.label()), "{error:#}");
+        }
     }
+}
+
+#[cfg(not(feature = "hip"))]
+#[test]
+fn i4r_hip_requires_feature_without_falling_back_to_cpu() {
+    requires_feature_without_falling_back_to_cpu(I4rBackend::Hip, "hip");
 }
 
 #[cfg(not(feature = "cuda"))]
 #[test]
 fn i4r_cuda_requires_feature_without_falling_back_to_cpu() {
+    requires_feature_without_falling_back_to_cpu(I4rBackend::Cuda, "cuda");
+}
+
+#[cfg(any(not(feature = "hip"), not(feature = "cuda")))]
+fn requires_feature_without_falling_back_to_cpu(backend: I4rBackend, feature: &str) {
     let signs = [1.0; BAND];
     let input = vec![0.0; BAND * BAND];
     let meta = QuantMeta {
         su: &signs,
         sv: &signs,
-        i4r_backend: I4rBackend::Cuda,
+        i4r_backend: backend,
         ..QuantMeta::default()
     };
     for error in [
-        I4rBackend::Cuda.preflight().unwrap_err(),
+        backend.preflight().unwrap_err(),
         encode_rows(Encoding::I4r, &input, BAND, BAND, &meta).unwrap_err(),
     ] {
-        assert!(error.to_string().contains("CUDA I4R"), "{error:#}");
-        assert!(error.to_string().contains("--features cuda"), "{error:#}");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("{} I4R", backend.label())),
+            "{error:#}"
+        );
+        assert!(
+            error.to_string().contains(&format!("--features {feature}")),
+            "{error:#}"
+        );
     }
 }
 
-#[cfg(feature = "cuda")]
-mod cuda {
+#[cfg(any(feature = "hip", feature = "cuda"))]
+mod gpu {
     use super::*;
     use std::ffi::{c_char, c_int, CStr};
 
+    #[cfg(feature = "hip")]
+    unsafe extern "C" {
+        fn hgn_hip_encode_i4r(
+            source: *const f32,
+            su: *const f32,
+            sv: *const f32,
+            codes: *mut u8,
+            scales: *mut u8,
+            bands: c_int,
+            cols: c_int,
+        ) -> c_int;
+        fn ht_hip_last_error() -> *const c_char;
+        fn hipSetDevice(device: c_int) -> c_int;
+    }
+
+    #[cfg(feature = "cuda")]
     unsafe extern "C" {
         fn hgn_cuda_encode_i4r(
             source: *const f32,
@@ -462,16 +511,43 @@ mod cuda {
         fn cudaSetDevice(device: c_int) -> c_int;
     }
 
-    fn last_error() -> String {
+    type NativeEncoder = unsafe extern "C" fn(
+        *const f32,
+        *const f32,
+        *const f32,
+        *mut u8,
+        *mut u8,
+        c_int,
+        c_int,
+    ) -> c_int;
+
+    fn native_encoder(backend: I4rBackend) -> NativeEncoder {
+        match backend {
+            #[cfg(feature = "hip")]
+            I4rBackend::Hip => hgn_hip_encode_i4r,
+            #[cfg(feature = "cuda")]
+            I4rBackend::Cuda => hgn_cuda_encode_i4r,
+            _ => panic!("{} encoder feature is not enabled", backend.label()),
+        }
+    }
+
+    fn last_error(backend: I4rBackend) -> String {
+        let accessor = match backend {
+            #[cfg(feature = "hip")]
+            I4rBackend::Hip => ht_hip_last_error as unsafe extern "C" fn() -> *const c_char,
+            #[cfg(feature = "cuda")]
+            I4rBackend::Cuda => ht_cuda_last_error as unsafe extern "C" fn() -> *const c_char,
+            _ => panic!("{} encoder feature is not enabled", backend.label()),
+        };
         // SAFETY: the native thread-local NUL-terminated string is copied before
         // the next native call on this thread can invalidate it.
-        unsafe { CStr::from_ptr(ht_cuda_last_error()) }
+        unsafe { CStr::from_ptr(accessor()) }
             .to_string_lossy()
             .into_owned()
     }
 
-    #[test]
-    fn cuda_i4r_native_rejects_shapes_nulls_and_extents_without_a_device() {
+    fn native_rejects_shapes_nulls_and_extents_without_a_device(backend: I4rBackend) {
+        let encode = native_encoder(backend);
         let value = 1.0f32;
         let mut code = 0u8;
         let mut scale = 0u8;
@@ -482,13 +558,16 @@ mod cuda {
             (1, 129, "multiple-of-128"),
             (i32::MAX, i32::MAX - 127, "shape overflows"),
         ] {
-            // SAFETY: all shapes are rejected before any buffer access or CUDA
+            // SAFETY: all shapes are rejected before any buffer access or GPU
             // initialization. The maximum dimensions require no large allocation.
-            let status = unsafe {
-                hgn_cuda_encode_i4r(&value, &value, &value, &mut code, &mut scale, bands, cols)
-            };
+            let status =
+                unsafe { encode(&value, &value, &value, &mut code, &mut scale, bands, cols) };
             assert_eq!(status, -1);
-            assert!(last_error().contains(message), "{}", last_error());
+            assert!(
+                last_error(backend).contains(message),
+                "{}",
+                last_error(backend)
+            );
         }
         for pointer in 0..5 {
             let mut source = &value as *const f32;
@@ -506,9 +585,9 @@ mod cuda {
             }
             // SAFETY: a null required buffer is rejected before dereferencing
             // any of the other deliberately undersized buffers.
-            let status = unsafe { hgn_cuda_encode_i4r(source, su, sv, codes, scales, 1, 128) };
+            let status = unsafe { encode(source, su, sv, codes, scales, 1, 128) };
             assert_eq!(status, -1);
-            assert!(last_error().contains("nonnull buffers"));
+            assert!(last_error(backend).contains("nonnull buffers"));
         }
         for pointer in 0..5 {
             let mut source = &value as *const f32;
@@ -527,16 +606,14 @@ mod cuda {
             }
             // SAFETY: each overflowing byte extent must be rejected by the ABI
             // before pointer access or device discovery; no allocation is made.
-            let status = unsafe { hgn_cuda_encode_i4r(source, su, sv, codes, scales, 1, 128) };
+            let status = unsafe { encode(source, su, sv, codes, scales, 1, 128) };
             assert_eq!(status, -1);
-            assert!(last_error().contains("buffer extent overflows"));
+            assert!(last_error(backend).contains("buffer extent overflows"));
         }
     }
 
-    #[test]
-    #[ignore = "requires an available CUDA device; compares exact I4R codes and half-scale bits"]
-    fn cuda_i4r_corner_corpus_matches_public_cpu_oracle() -> Result<()> {
-        I4rBackend::Cuda.preflight()?;
+    fn corner_corpus_matches_public_cpu_oracle(backend: I4rBackend) -> Result<()> {
+        backend.preflight()?;
         for alternate in [false, true] {
             let su = if alternate {
                 codec::generate_signs(17, "corner.su", BAND)
@@ -550,23 +627,33 @@ mod cuda {
             };
             for sign in [1.0, -1.0] {
                 let input = source_for_rotated_row(&extreme_and_rne_row(sign), &su, &sv);
-                assert_batch(&input, BAND, BAND, &su, &sv, I4rBackend::Cuda)?;
+                assert_batch(&input, BAND, BAND, &su, &sv, backend)?;
                 for (first, second) in [(1, 127), (7, 8), (31, 32), (63, 64), (126, 127)] {
                     let mut target = [0.0; BAND];
                     target[first] = -8.0 * sign;
                     target[second] = 8.0 * sign;
                     let input = source_for_rotated_row(&target, &su, &sv);
-                    assert_batch(&input, BAND, BAND, &su, &sv, I4rBackend::Cuda)?;
+                    assert_batch(&input, BAND, BAND, &su, &sv, backend)?;
+                }
+            }
+            for bits in [0x0001, 0x03ff, 0x0400, 0x7bff] {
+                for sign in [1.0, -1.0] {
+                    let mut target = [0.0; BAND];
+                    target[0] = -8.0 * half::f16::from_bits(bits).to_f32() * sign;
+                    let input = source_for_rotated_row(&target, &su, &sv);
+                    assert_batch(&input, BAND, BAND, &su, &sv, backend)?;
                 }
             }
             for lower in [0x0000, 0x0001, 0x03ff, 0x3c00, 0x3c01] {
                 let midpoint = (half::f16::from_bits(lower).to_f32()
                     + half::f16::from_bits(lower + 1).to_f32())
                     / 2.0;
-                let mut target = [0.0; BAND];
-                target[0] = -8.0 * midpoint;
-                let input = source_for_rotated_row(&target, &su, &sv);
-                assert_batch(&input, BAND, BAND, &su, &sv, I4rBackend::Cuda)?;
+                for sign in [1.0, -1.0] {
+                    let mut target = [0.0; BAND];
+                    target[0] = -8.0 * midpoint * sign;
+                    let input = source_for_rotated_row(&target, &su, &sv);
+                    assert_batch(&input, BAND, BAND, &su, &sv, backend)?;
+                }
             }
             for value in [
                 0.0,
@@ -576,34 +663,18 @@ mod cuda {
                 f32::MIN_POSITIVE,
                 1.0e-20,
             ] {
-                assert_batch(
-                    &vec![value; BAND * BAND],
-                    BAND,
-                    BAND,
-                    &su,
-                    &sv,
-                    I4rBackend::Cuda,
-                )?;
+                assert_batch(&vec![value; BAND * BAND], BAND, BAND, &su, &sv, backend)?;
             }
             let target = std::array::from_fn(|i| (((5 * i + 3) % 16) as f32 - 8.0) / 64.0);
             let input = source_for_rotated_row(&target, &su, &sv);
-            assert_batch(&input, BAND, BAND, &su, &sv, I4rBackend::Cuda)?;
-            assert_batch(
-                &mixed_values(BAND, BAND, 53),
-                BAND,
-                BAND,
-                &su,
-                &sv,
-                I4rBackend::Cuda,
-            )?;
+            assert_batch(&input, BAND, BAND, &su, &sv, backend)?;
+            assert_batch(&mixed_values(BAND, BAND, 53), BAND, BAND, &su, &sv, backend)?;
         }
         Ok(())
     }
 
-    #[test]
-    #[ignore = "requires an available CUDA device; crosses bounded native row and column batches"]
-    fn cuda_i4r_multiband_tails_and_wide_rows_match_cpu_planes() -> Result<()> {
-        I4rBackend::Cuda.preflight()?;
+    fn multiband_tails_and_wide_rows_match_cpu_planes(backend: I4rBackend) -> Result<()> {
+        backend.preflight()?;
         for (bands, cols) in [
             (1, 128),
             (3, 256),
@@ -612,6 +683,7 @@ mod cuda {
             (33, 256),
             (16, 2560), // 12 + 4 bands in the native 256-block workspace.
             (257, 128), // 256 + 1 bands with a single block per row.
+            (1, 32768), // Exactly the native 256-block workspace column limit.
             (1, 32896), // 32768 + 128 columns, preserving row-major plane strides.
         ] {
             let rows = bands * BAND;
@@ -623,16 +695,14 @@ mod cuda {
                 cols,
                 &su,
                 &sv,
-                I4rBackend::Cuda,
+                backend,
             )?;
         }
         Ok(())
     }
 
-    #[test]
-    #[ignore = "requires an available CUDA device; exercises independent expert signs and HT settings"]
-    fn cuda_i4r_expert_portions_keep_their_signs_and_ignore_ht_beam() -> Result<()> {
-        I4rBackend::Cuda.preflight()?;
+    fn expert_portions_keep_their_signs_and_ignore_ht_beam(backend: I4rBackend) -> Result<()> {
+        backend.preflight()?;
         let cols = 2 * BAND;
         let half_rows = 33 * BAND;
         let rows = 2 * half_rows;
@@ -663,7 +733,7 @@ mod cuda {
                             HtBackend::Cuda
                         },
                         ht_beam: usize::MAX,
-                        i4r_backend: I4rBackend::Cuda,
+                        i4r_backend: backend,
                         ..QuantMeta::default()
                     };
                     let actual = encode_rows(
@@ -682,10 +752,10 @@ mod cuda {
         Ok(())
     }
 
-    #[test]
-    #[ignore = "requires an available CUDA device; injects real numerical and prior runtime errors"]
-    fn cuda_i4r_reports_numerical_errors_and_recovers_without_stale_status() -> Result<()> {
-        I4rBackend::Cuda.preflight()?;
+    fn reports_numerical_errors_and_recovers_without_stale_status(
+        backend: I4rBackend,
+    ) -> Result<()> {
+        backend.preflight()?;
         let signs = [1.0; BAND];
         let cpu = QuantMeta {
             su: &signs,
@@ -693,7 +763,7 @@ mod cuda {
             ..QuantMeta::default()
         };
         let gpu = QuantMeta {
-            i4r_backend: I4rBackend::Cuda,
+            i4r_backend: backend,
             ..cpu
         };
         let valid = mixed_values(BAND, BAND, 71);
@@ -701,28 +771,75 @@ mod cuda {
         // Follow the existing HT regression: leave a reported runtime error
         // pending, without changing the selected device or injecting output.
         // SAFETY: a negative ordinal is rejected without changing the device.
-        assert_ne!(unsafe { cudaSetDevice(-1) }, 0);
+        let status = unsafe {
+            match backend {
+                #[cfg(feature = "hip")]
+                I4rBackend::Hip => hipSetDevice(-1),
+                #[cfg(feature = "cuda")]
+                I4rBackend::Cuda => cudaSetDevice(-1),
+                _ => unreachable!(),
+            }
+        };
+        assert_ne!(status, 0);
         assert_planes(
             &encode_rows(Encoding::I4r, &valid, BAND, BAND, &gpu)?,
             &expected,
         );
-        assert!(last_error().is_empty());
+        assert!(last_error(backend).is_empty());
         for (value, detail) in [(f32::MAX, "rotation overflows f32"), (4096.0, "finite f16")] {
             let invalid = vec![value; BAND * BAND];
             let reference = encode_rows(Encoding::I4r, &invalid, BAND, BAND, &cpu).unwrap_err();
             let error = encode_rows(Encoding::I4r, &invalid, BAND, BAND, &gpu).unwrap_err();
             assert!(reference.to_string().contains(detail), "{reference:#}");
             assert!(
-                error.to_string().contains("CUDA I4R encoding failed"),
+                error
+                    .to_string()
+                    .contains(&format!("{} I4R encoding failed", backend.label())),
                 "{error:#}"
             );
             assert!(error.to_string().contains(detail), "{error:#}");
-            assert!(last_error().contains(detail));
+            assert!(last_error(backend).contains(detail));
             assert_planes(
                 &encode_rows(Encoding::I4r, &valid, BAND, BAND, &gpu)?,
                 &expected,
             );
-            assert!(last_error().is_empty());
+            assert!(last_error(backend).is_empty());
+        }
+        // Eight lanes quantize each row group. On wave64, rows 4..7 and
+        // 12..15 occupy the upper halves of the first and second waves.
+        // The source row signs below place -8*scale at rotated[row][0] only.
+        // +/-65520 is the f16 overflow midpoint, unlike finite +/-65504.
+        let mut invalid = vec![0.0; BAND * BAND];
+        for rotated_row in [4, 5, 6, 7, 12, 13, 14, 15] {
+            for scale in [65520.0f32, -65520.0] {
+                for (row, values) in invalid.chunks_exact_mut(BAND).enumerate() {
+                    let sign = if (row & rotated_row).count_ones() % 2 == 0 {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    values.fill(-scale / 16.0 * sign);
+                }
+                let reference = encode_rows(Encoding::I4r, &invalid, BAND, BAND, &cpu).unwrap_err();
+                let error = encode_rows(Encoding::I4r, &invalid, BAND, BAND, &gpu).unwrap_err();
+                assert!(
+                    reference.to_string().contains("finite f16"),
+                    "{reference:#}"
+                );
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&format!("{} I4R encoding failed", backend.label())),
+                    "row={rotated_row} scale={scale}: {error:#}"
+                );
+                assert!(error.to_string().contains("finite f16"), "{error:#}");
+                assert!(last_error(backend).contains("finite f16"));
+                assert_planes(
+                    &encode_rows(Encoding::I4r, &valid, BAND, BAND, &gpu)?,
+                    &expected,
+                );
+                assert!(last_error(backend).is_empty());
+            }
         }
         // CPU rotates the entire request before quantization. A later rotation
         // overflow must win over a prior half-scale failure across native chunks.
@@ -737,7 +854,7 @@ mod cuda {
         }
         let su = vec![1.0; cols];
         let sv = vec![1.0; rows];
-        for i4r_backend in [I4rBackend::Cpu, I4rBackend::Cuda] {
+        for i4r_backend in [I4rBackend::Cpu, backend] {
             let meta = QuantMeta {
                 su: &su,
                 sv: &sv,
@@ -754,9 +871,67 @@ mod cuda {
             &encode_rows(Encoding::I4r, &valid, BAND, BAND, &gpu)?,
             &expected,
         );
-        assert!(last_error().is_empty());
-        I4rBackend::Cuda.preflight()?;
-        assert!(last_error().is_empty());
+        assert!(last_error(backend).is_empty());
+        backend.preflight()?;
+        assert!(last_error(backend).is_empty());
         Ok(())
     }
+
+    macro_rules! gpu_device_tests {
+        ($feature:literal, $backend:expr,
+         $invalid:ident, $corpus:ident, $batches:ident, $experts:ident, $recovery:ident) => {
+            #[cfg(feature = $feature)]
+            #[test]
+            fn $invalid() {
+                native_rejects_shapes_nulls_and_extents_without_a_device($backend);
+            }
+
+            #[cfg(feature = $feature)]
+            #[test]
+            #[ignore = "requires the selected GPU; compares exact I4R codes and half-scale bits"]
+            fn $corpus() -> Result<()> {
+                corner_corpus_matches_public_cpu_oracle($backend)
+            }
+
+            #[cfg(feature = $feature)]
+            #[test]
+            #[ignore = "requires the selected GPU; crosses bounded native row and column batches"]
+            fn $batches() -> Result<()> {
+                multiband_tails_and_wide_rows_match_cpu_planes($backend)
+            }
+
+            #[cfg(feature = $feature)]
+            #[test]
+            #[ignore = "requires the selected GPU; exercises independent expert signs and HT settings"]
+            fn $experts() -> Result<()> {
+                expert_portions_keep_their_signs_and_ignore_ht_beam($backend)
+            }
+
+            #[cfg(feature = $feature)]
+            #[test]
+            #[ignore = "requires the selected GPU; injects real numerical and prior runtime errors"]
+            fn $recovery() -> Result<()> {
+                reports_numerical_errors_and_recovers_without_stale_status($backend)
+            }
+        };
+    }
+
+    gpu_device_tests!(
+        "hip",
+        I4rBackend::Hip,
+        hip_i4r_native_rejects_shapes_nulls_and_extents_without_a_device,
+        hip_i4r_corner_corpus_matches_public_cpu_oracle,
+        hip_i4r_multiband_tails_and_wide_rows_match_cpu_planes,
+        hip_i4r_expert_portions_keep_their_signs_and_ignore_ht_beam,
+        hip_i4r_reports_numerical_errors_and_recovers_without_stale_status
+    );
+    gpu_device_tests!(
+        "cuda",
+        I4rBackend::Cuda,
+        cuda_i4r_native_rejects_shapes_nulls_and_extents_without_a_device,
+        cuda_i4r_corner_corpus_matches_public_cpu_oracle,
+        cuda_i4r_multiband_tails_and_wide_rows_match_cpu_planes,
+        cuda_i4r_expert_portions_keep_their_signs_and_ignore_ht_beam,
+        cuda_i4r_reports_numerical_errors_and_recovers_without_stale_status
+    );
 }

@@ -295,7 +295,7 @@ fn conversion_work_counts_ngram_passes_and_rotation_writes_not_preparation() {
             estimate.planned_values(WorkClass::encode(
                 Encoding::Fp8G128,
                 backend,
-                codec::I4rBackend::Cpu,
+                codec::I4rBackend::Cpu, codec::Q4cpBackend::Cpu
             )),
             320
         );
@@ -305,7 +305,7 @@ fn conversion_work_counts_ngram_passes_and_rotation_writes_not_preparation() {
                 estimate.planned_values(WorkClass::encode(
                     encoding,
                     backend,
-                    codec::I4rBackend::Cpu,
+                    codec::I4rBackend::Cpu, codec::Q4cpBackend::Cpu
                 )),
                 0
             );
@@ -323,7 +323,11 @@ fn conversion_work_classifies_copy_reencoding_and_actual_backend() {
         codec::HtBackend::Hip,
         codec::HtBackend::Cuda,
     ] {
-        for i4r in [codec::I4rBackend::Cpu, codec::I4rBackend::Cuda] {
+        for i4r in [
+            codec::I4rBackend::Cpu,
+            codec::I4rBackend::Hip,
+            codec::I4rBackend::Cuda,
+        ] {
             let options = Options {
                 ht_backend: ht,
                 i4r_backend: i4r,
@@ -341,15 +345,15 @@ fn conversion_work_classifies_copy_reencoding_and_actual_backend() {
             // Imported F32 values converted back to BF16 are encoding work, not copies.
             assert_eq!(
                 source_work(Encoding::Bf16, Dtype::F32, &options),
-                WorkClass::encode(Encoding::Bf16, ht, i4r)
+                WorkClass::encode(Encoding::Bf16, ht, i4r, codec::Q4cpBackend::Cpu)
             );
             for encoding in [Encoding::Ht, Encoding::Ht3] {
                 let class = source_work(encoding, Dtype::Bf16, &options);
-                assert_eq!(class, WorkClass::encode(encoding, ht, i4r));
+                assert_eq!(class, WorkClass::encode(encoding, ht, i4r, codec::Q4cpBackend::Cpu));
                 assert_eq!(class.backend_label(), ht.label());
             }
             let class = source_work(Encoding::I4r, Dtype::Bf16, &options);
-            assert_eq!(class, WorkClass::encode(Encoding::I4r, ht, i4r));
+            assert_eq!(class, WorkClass::encode(Encoding::I4r, ht, i4r, codec::Q4cpBackend::Cpu));
             assert_eq!(class.backend_label(), i4r.label());
             for encoding in [
                 Encoding::F16,
@@ -361,7 +365,7 @@ fn conversion_work_classifies_copy_reencoding_and_actual_backend() {
                 Encoding::Q6G64,
             ] {
                 let class = source_work(encoding, Dtype::Bf16, &options);
-                assert_eq!(class, WorkClass::encode(encoding, ht, i4r));
+                assert_eq!(class, WorkClass::encode(encoding, ht, i4r, codec::Q4cpBackend::Cpu));
                 assert_eq!(class.backend_label(), "CPU");
             }
         }
@@ -389,19 +393,21 @@ fn conversion_work_slots_keep_cpu_hip_cuda_and_nonencoding_classes_distinct() {
         classes.push(WorkClass::encode(
             encoding,
             codec::HtBackend::Cpu,
-            codec::I4rBackend::Cpu,
+            codec::I4rBackend::Cpu, codec::Q4cpBackend::Cpu
         ));
     }
     for backend in [codec::HtBackend::Hip, codec::HtBackend::Cuda] {
         for encoding in [Encoding::Ht, Encoding::Ht3] {
-            classes.push(WorkClass::encode(encoding, backend, codec::I4rBackend::Cpu));
+            classes.push(WorkClass::encode(encoding, backend, codec::I4rBackend::Cpu, codec::Q4cpBackend::Cpu));
         }
     }
-    classes.push(WorkClass::encode(
-        Encoding::I4r,
-        codec::HtBackend::Cpu,
-        codec::I4rBackend::Cuda,
-    ));
+    for backend in [codec::I4rBackend::Hip, codec::I4rBackend::Cuda] {
+        classes.push(WorkClass::encode(
+            Encoding::I4r,
+            codec::HtBackend::Cpu,
+            backend, codec::Q4cpBackend::Cpu
+        ));
+    }
     for encoding in [Encoding::Bf16, Encoding::F32, Encoding::I64] {
         classes.push(WorkClass::Copy(encoding));
     }
@@ -410,7 +416,7 @@ fn conversion_work_slots_keep_cpu_hip_cuda_and_nonencoding_classes_distinct() {
     for (index, &class) in classes.iter().enumerate() {
         estimate.add(class, index as u64 + 1).unwrap();
     }
-    assert_eq!(estimate.total(), 231);
+    assert_eq!(estimate.total(), 253);
     for (index, &class) in classes.iter().enumerate() {
         assert_eq!(
             estimate.planned_values(class),
@@ -421,7 +427,13 @@ fn conversion_work_slots_keep_cpu_hip_cuda_and_nonencoding_classes_distinct() {
 }
 
 #[test]
-fn i4r_cuda_batches_respect_expert_portion_and_tail_boundaries() {
+fn i4r_gpu_batches_respect_expert_portion_and_tail_boundaries() {
+    for backend in [codec::I4rBackend::Hip, codec::I4rBackend::Cuda] {
+        assert_i4r_gpu_batch_boundaries(backend);
+    }
+}
+
+fn assert_i4r_gpu_batch_boundaries(backend: codec::I4rBackend) {
     let mut tensor = TensorPlan {
         name: "layers.0.mlp.experts.gate_up_proj.weight".into(),
         shape: vec![2, 70 * 128, 128],
@@ -444,7 +456,7 @@ fn i4r_cuda_batches_respect_expert_portion_and_tail_boundaries() {
     let mut row = 0;
     let mut bands = Vec::new();
     while row < rows {
-        let take = matrix_batch_rows(&tensor, codec::I4rBackend::Cuda, row, rows).unwrap();
+        let take = matrix_batch_rows(&tensor, &i4r_options(backend), row, rows).unwrap();
         assert_eq!(row / (70 * 128), (row + take - 1) / (70 * 128));
         assert_eq!(row / (35 * 128), (row + take - 1) / (35 * 128));
         let (batch_su, batch_sv) = rotation_slice(&tensor, &vectors, row, take).unwrap();
@@ -456,7 +468,7 @@ fn i4r_cuda_batches_respect_expert_portion_and_tail_boundaries() {
     }
     assert_eq!(bands, [32, 3, 32, 3, 32, 3, 32, 3]);
     assert_eq!(
-        matrix_batch_rows(&tensor, codec::I4rBackend::Cpu, 0, rows).unwrap(),
+        matrix_batch_rows(&tensor, &Options::default(), 0, rows).unwrap(),
         128
     );
 
@@ -466,21 +478,18 @@ fn i4r_cuda_batches_respect_expert_portion_and_tail_boundaries() {
     let mut row = 0;
     let mut bands = Vec::new();
     while row < rows {
-        let take = matrix_batch_rows(&tensor, codec::I4rBackend::Cuda, row, rows).unwrap();
+        let take = matrix_batch_rows(&tensor, &i4r_options(backend), row, rows).unwrap();
         assert_eq!(row / (35 * 128), (row + take - 1) / (35 * 128));
         bands.push(take / 128);
         row += take;
     }
     assert_eq!(bands, [32, 3, 32, 3, 32, 3]);
     tensor.encoding = Encoding::Ht;
-    assert_eq!(
-        matrix_batch_rows(&tensor, codec::I4rBackend::Cuda, 0, rows).unwrap(),
-        128
-    );
+    assert_eq!(matrix_batch_rows(&tensor, &i4r_options(backend), 0, rows).unwrap(), 128);
 }
 
 #[test]
-fn i4r_cuda_matrix_batch_rejects_partial_bands() {
+fn i4r_gpu_matrix_batch_rejects_partial_bands() {
     let tensor = TensorPlan {
         name: "matrix".into(),
         shape: vec![129, 128],
@@ -490,7 +499,82 @@ fn i4r_cuda_matrix_batch_rejects_partial_bands() {
         },
         rotation: None,
     };
-    assert!(matrix_batch_rows(&tensor, codec::I4rBackend::Cuda, 0, 129).is_err());
-    assert!(matrix_batch_rows(&tensor, codec::I4rBackend::Cuda, 1, 128).is_err());
-    assert!(matrix_batch_rows(&tensor, codec::I4rBackend::Cuda, 128, 128).is_err());
+    for backend in [codec::I4rBackend::Hip, codec::I4rBackend::Cuda] {
+        assert!(matrix_batch_rows(&tensor, &i4r_options(backend), 0, 129).is_err());
+        assert!(matrix_batch_rows(&tensor, &i4r_options(backend), 1, 128).is_err());
+        assert!(matrix_batch_rows(&tensor, &i4r_options(backend), 128, 128).is_err());
+    }
+}
+
+fn i4r_options(backend: codec::I4rBackend) -> Options {
+    Options {
+        i4r_backend: backend,
+        ..Options::default()
+    }
+}
+
+#[test]
+fn q4cp_gpu_batches_respect_value_budget_portions_and_short_matrices() {
+    let options = Options {
+        q4cp_backend: codec::Q4cpBackend::Cuda,
+        ..Options::default()
+    };
+    let mut tensor = TensorPlan {
+        name: "embed_tokens.weight".into(),
+        shape: vec![5000, 4096],
+        encoding: Encoding::Q4Cp,
+        origin: Origin::Tensor {
+            name: "embed".into(),
+        },
+        rotation: None,
+    };
+    let budget = Q4CP_GPU_BATCH_VALUES / 4096;
+    let mut row = 0;
+    let mut takes = Vec::new();
+    while row < 5000 {
+        let take = matrix_batch_rows(&tensor, &options, row, 5000).unwrap();
+        takes.push(take);
+        row += take;
+    }
+    assert_eq!(takes, [budget, budget, 5000 - 2 * budget]);
+    // Non-band row counts are valid: Q4C-P groups run along columns only.
+    tensor.shape = vec![48, 4096];
+    assert_eq!(matrix_batch_rows(&tensor, &options, 0, 48).unwrap(), 48);
+    // CPU keeps the ordinary 128-row band.
+    tensor.shape = vec![5000, 4096];
+    assert_eq!(
+        matrix_batch_rows(&tensor, &Options::default(), 0, 5000).unwrap(),
+        128
+    );
+    tensor.name = "mtp.layers.0.mlp.experts.gate_up_proj.weight".into();
+    tensor.shape = vec![3, 2 * 300, 4096];
+    let rows = 3 * 600;
+    let mut row = 0;
+    while row < rows {
+        let take = matrix_batch_rows(&tensor, &options, row, rows).unwrap();
+        assert_eq!(row / 300, (row + take - 1) / 300, "batch crosses a projection half");
+        row += take;
+    }
+}
+
+#[test]
+fn q4cp_backend_selects_only_q4cp_device() {
+    let options = Options {
+        q4cp_backend: codec::Q4cpBackend::Cuda,
+        ..Options::default()
+    };
+    let class = source_work(Encoding::Q4Cp, Dtype::Bf16, &options);
+    assert_eq!(class.backend_label(), "CUDA");
+    for encoding in [Encoding::Q8G64, Encoding::Q6G64, Encoding::Ht, Encoding::I4r] {
+        assert_eq!(
+            source_work(encoding, Dtype::Bf16, &options).backend_label(),
+            "CPU"
+        );
+    }
+    let mut estimate = WorkEstimate::default();
+    estimate.add(class, 7).unwrap();
+    estimate
+        .add(source_work(Encoding::Q4Cp, Dtype::Bf16, &Options::default()), 3)
+        .unwrap();
+    assert_eq!(estimate.planned_values(class), 7);
 }

@@ -1,5 +1,5 @@
 use crate::{
-    codec::{HtBackend, I4rBackend},
+    codec::{HtBackend, I4rBackend, Q4cpBackend},
     container::{Entry, Fingerprint, Layout},
     hf::TensorInfo,
     source::SourceKind,
@@ -36,6 +36,9 @@ pub struct Options {
     /// Independent I4R encoding provenance; never selects the verification device.
     #[serde(default)]
     pub i4r_backend: I4rBackend,
+    /// Independent Q4C-P encoding provenance; never selects the verification device.
+    #[serde(default)]
+    pub q4cp_backend: Q4cpBackend,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -46,6 +49,7 @@ impl Default for Options {
             ht_beam: 128,
             ht_backend: HtBackend::Cpu,
             i4r_backend: I4rBackend::Cpu,
+            q4cp_backend: Q4cpBackend::Cpu,
         }
     }
 }
@@ -67,7 +71,8 @@ impl Options {
     pub fn validate_for_execution(&self) -> anyhow::Result<()> {
         self.validate()?;
         self.ht_backend.preflight()?;
-        self.i4r_backend.preflight()
+        self.i4r_backend.preflight()?;
+        self.q4cp_backend.preflight()
     }
 }
 
