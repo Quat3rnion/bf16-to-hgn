@@ -900,6 +900,18 @@ unsafe extern "C" {
     fn ht_hip_last_error() -> *const std::ffi::c_char;
     fn ht_hip_preflight() -> c_int;
     fn hgn_hip_i4r_preflight() -> c_int;
+    fn hgn_hip_encode_ht(
+        sources: *const *const f32,
+        su: *const f32,
+        svs: *const *const f32,
+        parts: c_int,
+        codebook: *const f32,
+        symbols: *mut u8,
+        bands: c_int,
+        cols: c_int,
+        beam: c_int,
+        bits: c_int,
+    ) -> c_int;
     fn hgn_hip_encode_i4r(
         src: *const f32,
         su: *const f32,
@@ -1117,12 +1129,14 @@ fn validate_ht_backend(meta: &QuantMeta<'_>) -> Result<()> {
     Ok(())
 }
 
-/// CUDA HT with GPU rotation. `parts` are (source, row scales) pairs sharing
-/// `su`: one part of complete bands, or a gate band and an up band. Returns
-/// None when the device rejects the rotation; the caller then reruns the CPU
-/// rotation, which reports the exact error.
-#[cfg(feature = "cuda")]
-fn encode_ht_cuda_rotated(
+/// GPU HT (CUDA or HIP) with GPU rotation. `parts` are (source, row scales)
+/// pairs sharing `su`: one part of complete bands, or a gate band and an up
+/// band. Returns None for a CPU backend, or when the device rejects the
+/// rotation; the caller then runs the CPU rotation, which reports the exact
+/// error.
+// Feature-free builds have no GPU arm: everything after the match is dead.
+#[allow(unused_variables, unreachable_code)]
+fn encode_ht_gpu_rotated(
     parts: &[(&[f32], &[f32])],
     su: &[f32],
     rows: usize,
@@ -1130,6 +1144,25 @@ fn encode_ht_cuda_rotated(
     meta: &QuantMeta<'_>,
     bits: usize,
 ) -> Result<Option<Vec<u8>>> {
+    type Native = unsafe extern "C" fn(
+        *const *const f32,
+        *const f32,
+        *const *const f32,
+        c_int,
+        *const f32,
+        *mut u8,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+    ) -> c_int;
+    let (native, last_error): (Native, fn() -> String) = match meta.ht_backend {
+        #[cfg(feature = "cuda")]
+        HtBackend::Cuda => (hgn_cuda_encode_ht, cuda_last_error),
+        #[cfg(feature = "hip")]
+        HtBackend::Hip => (hgn_hip_encode_ht, hip_last_error),
+        _ => return Ok(None),
+    };
     let count = parts.len() * rows * cols;
     native_ht_tile_count(count)?;
     let sources: Vec<*const f32> = parts.iter().map(|(values, _)| values.as_ptr()).collect();
@@ -1137,9 +1170,9 @@ fn encode_ht_cuda_rotated(
     let mut symbols = vec![0u8; count];
     // SAFETY: each part holds rows*cols finite values and rows scales, su holds
     // cols signs (validated by the caller); symbols holds every tile's 256
-    // symbols. Native CUDA synchronizes before return and keeps no pointers.
+    // symbols. The native backend synchronizes before return and keeps no pointers.
     let result = unsafe {
-        hgn_cuda_encode_ht(
+        native(
             sources.as_ptr(),
             su.as_ptr(),
             scales.as_ptr(),
@@ -1152,15 +1185,19 @@ fn encode_ht_cuda_rotated(
             bits as c_int,
         )
     };
-    if result == CUDA_HT_ROTATION_REJECTED {
+    if result == GPU_HT_ROTATION_REJECTED {
         return Ok(None);
     }
-    ensure!(result == 0, "CUDA HT encoding failed: {}", cuda_last_error());
+    ensure!(
+        result == 0,
+        "{} HT encoding failed: {}",
+        meta.ht_backend.label(),
+        last_error()
+    );
     Ok(Some(pack_ht_symbols(&symbols, bits)))
 }
 
-#[cfg(feature = "cuda")]
-const CUDA_HT_ROTATION_REJECTED: c_int = -6;
+const GPU_HT_ROTATION_REJECTED: c_int = -6;
 
 fn pack_ht_symbols(symbols: &[u8], bits: usize) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(symbols.len() / 8 * bits);
@@ -1368,11 +1405,10 @@ pub fn encode_rows(
         }
         Encoding::Ht | Encoding::Ht3 => {
             validate_rotation(rows, cols, meta, false)?;
-            #[cfg(feature = "cuda")]
-            if meta.ht_backend == HtBackend::Cuda {
+            {
                 let bits = encoding.ht_bits().unwrap();
                 if let Some(codes) =
-                    encode_ht_cuda_rotated(&[(input, meta.sv)], meta.su, rows, cols, meta, bits)?
+                    encode_ht_gpu_rotated(&[(input, meta.sv)], meta.su, rows, cols, meta, bits)?
                 {
                     return Ok(EncodedBlock {
                         codes,
@@ -1453,9 +1489,8 @@ pub fn encode_ht_gate_up_bands(
         "paired HT bands must use the same encoder settings"
     );
     validate_ht_backend(gate_meta)?;
-    #[cfg(feature = "cuda")]
-    if gate_meta.ht_backend == HtBackend::Cuda {
-        if let Some(codes) = encode_ht_cuda_rotated(
+    {
+        if let Some(codes) = encode_ht_gpu_rotated(
             &[(gate, gate_meta.sv), (up, up_meta.sv)],
             gate_meta.su,
             128,
@@ -3069,9 +3104,9 @@ mod backend_tests {
     #[cfg(any(feature = "hip", feature = "cuda"))]
     fn native_batches_and_changed_codebooks_match_cpu(backend: HtBackend) {
         backend.preflight().unwrap();
-        // Cross each implementation's largest tile batch; CUDA also crosses its
+        // Cross the 16,384-tile launch batch; this also crosses the
         // persistent-grid stride (fewer resident blocks than tiles).
-        let tiles_per_call = if backend == HtBackend::Cuda { 16385 } else { 65 };
+        let tiles_per_call = 16385;
         let tiles: Vec<f32> = (0..tiles_per_call * 256)
             .map(|i| ((i * 17 % 97) as f32 - 48.0) / 32.0)
             .collect();

@@ -1,4 +1,6 @@
-use bf16_to_hgn::codec::{encode_rows, Encoding, Q4cpBackend, QuantMeta, NF4_CODEBOOK};
+use bf16_to_hgn::codec::{encode_rows, Encoding, Q4cpBackend, QuantMeta};
+#[cfg(feature = "cuda")]
+use bf16_to_hgn::codec::NF4_CODEBOOK;
 
 #[test]
 fn q4cp_default_backend_is_cpu() {

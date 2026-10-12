@@ -1144,6 +1144,42 @@ CXX=g++-12 NVCC=nvcc CARGO_TARGET_DIR=/tmp/bf16-hgn-cuda-target CARGO_BUILD_JOBS
   cargo test --release --locked --features cuda --test q4cp_cuda -- --ignored
 ```
 
+### HIP HT search port (2026-10-13)
+
+The HIP HT3/HT4 encoder now uses the same search as CUDA: persistent grid,
+coalesced wave segments, radix set selection with exact libstdc++ tie
+replay, parent lists, no candidate compaction, early radix stop, GPU forward
+rotation, multi-band calls and in-place launches of up to 16,384 tiles.
+Wave operations use the HIP 64-bit ballot and the device `warpSize`, so the
+code is correct for wave32 and wave64. gfx1151 runs wave32.
+
+Two settings differ from CUDA because they measured faster on gfx1151:
+
+- HT4 uses the uploaded codebook table and `amdgpu_waves_per_eu(16)`.
+- HT3 uses the computed standard codebook and the default occupancy.
+
+Measured on Frame (Radeon 8060S, ROCm HIP 7.2, GCC 16.2.1) with Halogen
+stopped, beam 128, one 128×2560 band, interleaved with the previous build:
+
+| Case | Previous HIP (ms) | New HIP (ms) | New Mvalues/s | Ratio |
+| --- | ---: | ---: | ---: | ---: |
+| HT4 synthetic | 419.7 | 57.9 | 5.66 | ~7.2× |
+| HT3 synthetic | 296.9 | 47.5 | 6.90 | ~6.3× |
+| HT4 pair synthetic | — | 112.2 | 5.84 | — |
+| HT4 real Blackfrost layer 0 gate | — | 63.4 | 5.17 | — |
+| HT3 real Blackfrost layer 0 gate | — | 48.9 | 6.70 | — |
+
+Evidence for byte identity on gfx1151:
+
+- All 12 HIP library device tests, the HIP conversion tests and the new HIP
+  multi-band and rotation-error tests passed.
+- The 224-sample corpus matched CPU at beams 1/8/128/256.
+- Real Blackfrost expert bands from layers 0 and 23 matched CPU fingerprints.
+- The HIP tiny conversion gave three containers that are byte-identical to
+  CPU, and a CPU-only executable verified them.
+- Fault injection of the step replay and the end-of-pass replay made the
+  corpus fail.
+
 ## Bounded structural checks
 
 The public CLI has no fixture mode or architecture bypass. Library examples
@@ -1328,6 +1364,10 @@ loading, full-model inference, inference-quality comparisons or full-model
 throughput. A full v2 conversion is not evidence for HT43 qualification.
 
 ## Changes
+
+- Ported the CUDA HT search work to HIP, with gfx1151-specific occupancy and
+  codebook choices. HIP HT4 is about 7.2× and HT3 about 6.3× faster per
+  band; output is byte-identical to CPU.
 
 - Added opt-in `--q4cp-backend cuda`, with manifest provenance, a separate
   progress class, value-bounded batches and no CPU fallback. Reworked CUDA
