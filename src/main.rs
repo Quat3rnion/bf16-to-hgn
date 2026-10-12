@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use bf16_to_hgn::{
     architecture,
-    codec::HtBackend,
+    codec::{HtBackend, I4rBackend},
     container, conversion,
     manifest::{Options, OutputProfile},
     progress::Progress,
@@ -39,6 +39,9 @@ enum Command {
         /// HT execution backend to describe; inspection does not load a device.
         #[arg(long, value_enum, default_value_t = HtBackend::Cpu)]
         ht_backend: HtBackend,
+        /// I4R execution backend to describe; inspection does not load a device.
+        #[arg(long, value_enum, default_value_t = I4rBackend::Cpu)]
+        i4r_backend: I4rBackend,
     },
     /// Print the complete tensor/store/layout plan without writing anything.
     Plan {
@@ -124,6 +127,9 @@ struct EncodingOptions {
     /// HT3/HT4 trellis backend; real GPU execution requires --features hip or cuda.
     #[arg(long, value_enum, default_value_t = HtBackend::Cpu)]
     ht_backend: HtBackend,
+    /// I4R rotation and quantization backend, independent of HT; CUDA requires --features cuda.
+    #[arg(long, value_enum, default_value_t = I4rBackend::Cpu)]
+    i4r_backend: I4rBackend,
 }
 impl EncodingOptions {
     fn options(&self) -> Result<Options> {
@@ -133,6 +139,7 @@ impl EncodingOptions {
             threads: self.threads,
             ht_beam: self.ht_beam,
             ht_backend: self.ht_backend,
+            i4r_backend: self.i4r_backend,
         };
         options.validate()?;
         Ok(options)
@@ -152,10 +159,12 @@ fn run() -> Result<()> {
             input,
             profile,
             ht_backend,
+            i4r_backend,
         } => {
             let options = Options {
                 profile,
                 ht_backend,
+                i4r_backend,
                 ..Options::default()
             };
             let snapshot = input.open()?;
@@ -192,7 +201,7 @@ fn run() -> Result<()> {
                     &Progress::stderr(),
                 )?;
                 print_json(
-                    &json!({ "published": true, "source_tensors": manifest.sources.len(), "output_tensors": manifest.containers.iter().map(|c| c.tensors.len()).sum::<usize>(), "manifest": "conversion-manifest.json", "source_format": manifest.source_kind, "profile": manifest.options.profile, "ht_backend": manifest.options.ht_backend, "policy": manifest.policy }),
+                    &json!({ "published": true, "source_tensors": manifest.sources.len(), "output_tensors": manifest.containers.iter().map(|c| c.tensors.len()).sum::<usize>(), "manifest": "conversion-manifest.json", "source_format": manifest.source_kind, "profile": manifest.options.profile, "ht_backend": manifest.options.ht_backend, "i4r_backend": manifest.options.i4r_backend, "policy": manifest.policy }),
                 )?;
             }
         }
@@ -242,7 +251,7 @@ fn summary(
         outputs.push(json!({ "filename": file.filename, "identity": file.identity, "tensors": file.tensors.len(), "bytes": container::layout(file)?.file_size, "stores": stores }));
     }
     Ok(
-        json!({ "architecture": plan.architecture, "source_format": snapshot.kind(), "source_tensors": snapshot.tensors().len(), "source_shards": shards.len(), "canonical_source_payload_bytes": source_bytes, "source_dtypes": dtypes, "outputs": outputs, "assets": plan.assets, "output_hgn_bytes": conversion::planned_bytes(plan)?, "spec_version": SPEC_VERSION, "spec_commit": SPEC_COMMIT, "profile": options.profile, "ht_backend": options.ht_backend, "policy": options.profile.policy(), "tensor_payloads_read": false }),
+        json!({ "architecture": plan.architecture, "source_format": snapshot.kind(), "source_tensors": snapshot.tensors().len(), "source_shards": shards.len(), "canonical_source_payload_bytes": source_bytes, "source_dtypes": dtypes, "outputs": outputs, "assets": plan.assets, "output_hgn_bytes": conversion::planned_bytes(plan)?, "spec_version": SPEC_VERSION, "spec_commit": SPEC_COMMIT, "profile": options.profile, "ht_backend": options.ht_backend, "i4r_backend": options.i4r_backend, "policy": options.profile.policy(), "tensor_payloads_read": false }),
     )
 }
 

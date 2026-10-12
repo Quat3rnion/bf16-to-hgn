@@ -292,13 +292,21 @@ fn conversion_work_counts_ngram_passes_and_rotation_writes_not_preparation() {
         assert_eq!(estimate.total(), 770);
         assert_eq!(estimate.planned_values(WorkClass::ScanFp8Scale), 320);
         assert_eq!(
-            estimate.planned_values(WorkClass::encode(Encoding::Fp8G128, backend)),
+            estimate.planned_values(WorkClass::encode(
+                Encoding::Fp8G128,
+                backend,
+                codec::I4rBackend::Cpu,
+            )),
             320
         );
         assert_eq!(estimate.planned_values(WorkClass::WriteRotation), 130);
         for encoding in [Encoding::Ht, Encoding::Ht3] {
             assert_eq!(
-                estimate.planned_values(WorkClass::encode(encoding, backend)),
+                estimate.planned_values(WorkClass::encode(
+                    encoding,
+                    backend,
+                    codec::I4rBackend::Cpu,
+                )),
                 0
             );
         }
@@ -310,47 +318,52 @@ fn conversion_work_counts_ngram_passes_and_rotation_writes_not_preparation() {
 
 #[test]
 fn conversion_work_classifies_copy_reencoding_and_actual_backend() {
-    for backend in [
+    for ht in [
         codec::HtBackend::Cpu,
         codec::HtBackend::Hip,
         codec::HtBackend::Cuda,
     ] {
-        let options = Options {
-            ht_backend: backend,
-            ..Options::default()
-        };
-        for (encoding, dtype) in [
-            (Encoding::Bf16, Dtype::Bf16),
-            (Encoding::F32, Dtype::F32),
-            (Encoding::I64, Dtype::I64),
-        ] {
-            let class = source_work(encoding, dtype, &options);
-            assert_eq!(class, WorkClass::Copy(encoding));
-            assert_eq!(class.backend_label(), "CPU");
-        }
-        // Imported F32 values converted back to BF16 are encoding work, not copies.
-        assert_eq!(
-            source_work(Encoding::Bf16, Dtype::F32, &options),
-            WorkClass::encode(Encoding::Bf16, codec::HtBackend::Cpu)
-        );
-        for encoding in [Encoding::Ht, Encoding::Ht3] {
-            let class = source_work(encoding, Dtype::Bf16, &options);
-            assert_eq!(class, WorkClass::Encode(encoding, backend));
-            assert_eq!(class.backend_label(), backend.label());
-        }
-        for encoding in [
-            Encoding::F16,
-            Encoding::F32,
-            Encoding::I64,
-            Encoding::Fp8G128,
-            Encoding::I4r,
-            Encoding::Q4Cp,
-            Encoding::Q8G64,
-            Encoding::Q6G64,
-        ] {
-            let class = source_work(encoding, Dtype::Bf16, &options);
-            assert_eq!(class, WorkClass::Encode(encoding, codec::HtBackend::Cpu));
-            assert_eq!(class.backend_label(), "CPU");
+        for i4r in [codec::I4rBackend::Cpu, codec::I4rBackend::Cuda] {
+            let options = Options {
+                ht_backend: ht,
+                i4r_backend: i4r,
+                ..Options::default()
+            };
+            for (encoding, dtype) in [
+                (Encoding::Bf16, Dtype::Bf16),
+                (Encoding::F32, Dtype::F32),
+                (Encoding::I64, Dtype::I64),
+            ] {
+                let class = source_work(encoding, dtype, &options);
+                assert_eq!(class, WorkClass::Copy(encoding));
+                assert_eq!(class.backend_label(), "CPU");
+            }
+            // Imported F32 values converted back to BF16 are encoding work, not copies.
+            assert_eq!(
+                source_work(Encoding::Bf16, Dtype::F32, &options),
+                WorkClass::encode(Encoding::Bf16, ht, i4r)
+            );
+            for encoding in [Encoding::Ht, Encoding::Ht3] {
+                let class = source_work(encoding, Dtype::Bf16, &options);
+                assert_eq!(class, WorkClass::encode(encoding, ht, i4r));
+                assert_eq!(class.backend_label(), ht.label());
+            }
+            let class = source_work(Encoding::I4r, Dtype::Bf16, &options);
+            assert_eq!(class, WorkClass::encode(Encoding::I4r, ht, i4r));
+            assert_eq!(class.backend_label(), i4r.label());
+            for encoding in [
+                Encoding::F16,
+                Encoding::F32,
+                Encoding::I64,
+                Encoding::Fp8G128,
+                Encoding::Q4Cp,
+                Encoding::Q8G64,
+                Encoding::Q6G64,
+            ] {
+                let class = source_work(encoding, Dtype::Bf16, &options);
+                assert_eq!(class, WorkClass::encode(encoding, ht, i4r));
+                assert_eq!(class.backend_label(), "CPU");
+            }
         }
     }
     assert_eq!(WorkClass::WriteRotation.backend_label(), "CPU");
@@ -373,13 +386,22 @@ fn conversion_work_slots_keep_cpu_hip_cuda_and_nonencoding_classes_distinct() {
         Encoding::Ht3,
         Encoding::I4r,
     ] {
-        classes.push(WorkClass::encode(encoding, codec::HtBackend::Cpu));
+        classes.push(WorkClass::encode(
+            encoding,
+            codec::HtBackend::Cpu,
+            codec::I4rBackend::Cpu,
+        ));
     }
     for backend in [codec::HtBackend::Hip, codec::HtBackend::Cuda] {
         for encoding in [Encoding::Ht, Encoding::Ht3] {
-            classes.push(WorkClass::encode(encoding, backend));
+            classes.push(WorkClass::encode(encoding, backend, codec::I4rBackend::Cpu));
         }
     }
+    classes.push(WorkClass::encode(
+        Encoding::I4r,
+        codec::HtBackend::Cpu,
+        codec::I4rBackend::Cuda,
+    ));
     for encoding in [Encoding::Bf16, Encoding::F32, Encoding::I64] {
         classes.push(WorkClass::Copy(encoding));
     }
@@ -388,7 +410,7 @@ fn conversion_work_slots_keep_cpu_hip_cuda_and_nonencoding_classes_distinct() {
     for (index, &class) in classes.iter().enumerate() {
         estimate.add(class, index as u64 + 1).unwrap();
     }
-    assert_eq!(estimate.total(), 210);
+    assert_eq!(estimate.total(), 231);
     for (index, &class) in classes.iter().enumerate() {
         assert_eq!(
             estimate.planned_values(class),
@@ -396,4 +418,79 @@ fn conversion_work_slots_keep_cpu_hip_cuda_and_nonencoding_classes_distinct() {
             "{class:?}"
         );
     }
+}
+
+#[test]
+fn i4r_cuda_batches_respect_expert_portion_and_tail_boundaries() {
+    let mut tensor = TensorPlan {
+        name: "layers.0.mlp.experts.gate_up_proj.weight".into(),
+        shape: vec![2, 70 * 128, 128],
+        encoding: Encoding::I4r,
+        origin: Origin::Tensor {
+            name: "expert".into(),
+        },
+        rotation: Some(Rotation {
+            su: "shared.su".into(),
+            sv: "projection.sv".into(),
+        }),
+    };
+    let su = codec::generate_signs(7, "shared", 128);
+    let sv = codec::generate_signs(7, "projection", 70 * 128);
+    let vectors = BTreeMap::from([
+        ("shared.su".into(), su.clone()),
+        ("projection.sv".into(), sv.clone()),
+    ]);
+    let (rows, _) = rows_cols(&tensor.shape).unwrap();
+    let mut row = 0;
+    let mut bands = Vec::new();
+    while row < rows {
+        let take = matrix_batch_rows(&tensor, codec::I4rBackend::Cuda, row, rows).unwrap();
+        assert_eq!(row / (70 * 128), (row + take - 1) / (70 * 128));
+        assert_eq!(row / (35 * 128), (row + take - 1) / (35 * 128));
+        let (batch_su, batch_sv) = rotation_slice(&tensor, &vectors, row, take).unwrap();
+        assert_eq!(batch_su, su);
+        let local_row = row % (70 * 128);
+        assert_eq!(batch_sv, &sv[local_row..local_row + take]);
+        bands.push(take / 128);
+        row += take;
+    }
+    assert_eq!(bands, [32, 3, 32, 3, 32, 3, 32, 3]);
+    assert_eq!(
+        matrix_batch_rows(&tensor, codec::I4rBackend::Cpu, 0, rows).unwrap(),
+        128
+    );
+
+    tensor.name = "layers.0.mlp.experts.down_proj.weight".into();
+    tensor.shape = vec![3, 35 * 128, 128];
+    let (rows, _) = rows_cols(&tensor.shape).unwrap();
+    let mut row = 0;
+    let mut bands = Vec::new();
+    while row < rows {
+        let take = matrix_batch_rows(&tensor, codec::I4rBackend::Cuda, row, rows).unwrap();
+        assert_eq!(row / (35 * 128), (row + take - 1) / (35 * 128));
+        bands.push(take / 128);
+        row += take;
+    }
+    assert_eq!(bands, [32, 3, 32, 3, 32, 3]);
+    tensor.encoding = Encoding::Ht;
+    assert_eq!(
+        matrix_batch_rows(&tensor, codec::I4rBackend::Cuda, 0, rows).unwrap(),
+        128
+    );
+}
+
+#[test]
+fn i4r_cuda_matrix_batch_rejects_partial_bands() {
+    let tensor = TensorPlan {
+        name: "matrix".into(),
+        shape: vec![129, 128],
+        encoding: Encoding::I4r,
+        origin: Origin::Tensor {
+            name: "matrix".into(),
+        },
+        rotation: None,
+    };
+    assert!(matrix_batch_rows(&tensor, codec::I4rBackend::Cuda, 0, 129).is_err());
+    assert!(matrix_batch_rows(&tensor, codec::I4rBackend::Cuda, 1, 128).is_err());
+    assert!(matrix_batch_rows(&tensor, codec::I4rBackend::Cuda, 128, 128).is_err());
 }

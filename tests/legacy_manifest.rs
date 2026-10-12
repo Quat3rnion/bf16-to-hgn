@@ -2,6 +2,7 @@ mod support;
 
 use anyhow::Result;
 use bf16_to_hgn::{
+    codec::{HtBackend, I4rBackend},
     conversion,
     manifest::{Options, OutputProfile},
     progress::Progress,
@@ -31,6 +32,7 @@ fn legacy_manifest(mut current: Value) -> Value {
     let options = current["options"].as_object_mut().expect("options object");
     options.remove("profile");
     options.remove("ht_backend");
+    options.remove("i4r_backend");
     current
 }
 
@@ -172,7 +174,7 @@ fn schema1_rejects_mixed_schemas_invalid_pins_missing_index_and_unknown_fields()
         changed[field] = current[field].clone();
         rejected.push(changed);
     }
-    for field in ["profile", "ht_backend"] {
+    for field in ["profile", "ht_backend", "i4r_backend"] {
         let mut changed = legacy.clone();
         changed["options"][field] = current["options"][field].clone();
         rejected.push(changed);
@@ -239,7 +241,7 @@ fn schema1_rejects_mixed_schemas_invalid_pins_missing_index_and_unknown_fields()
 }
 
 #[test]
-fn schema2_requires_real_provenance_and_only_allows_the_existing_backend_omission() -> Result<()> {
+fn schema2_requires_real_provenance_and_allows_independent_backend_omissions() -> Result<()> {
     let temporary = tempfile::tempdir()?;
     let (snapshot, plan) = support::matrix_fixture(temporary.path(), OutputProfile::V2)?;
     let output = temporary.path().join("converted");
@@ -250,19 +252,43 @@ fn schema2_requires_real_provenance_and_only_allows_the_existing_backend_omissio
         &options(),
         &Progress::disabled(),
     )?)?;
-    let mut old_schema2 = current.clone();
-    old_schema2["options"]
-        .as_object_mut()
-        .unwrap()
-        .remove("ht_backend");
-    save(&output, &old_schema2)?;
-    verify::verify(
-        &snapshot,
-        &plan,
-        &output,
-        DecodeBackend::Cpu,
-        &Progress::disabled(),
-    )?;
+    for fields in [
+        &["ht_backend"][..],
+        &["i4r_backend"][..],
+        &["ht_backend", "i4r_backend"][..],
+    ] {
+        let mut old_schema2 = current.clone();
+        old_schema2["options"]["ht_backend"] = json!("hip");
+        old_schema2["options"]["i4r_backend"] = json!("cuda");
+        for field in fields {
+            old_schema2["options"]
+                .as_object_mut()
+                .unwrap()
+                .remove(*field);
+        }
+        save(&output, &old_schema2)?;
+        let expected = Options {
+            ht_backend: if fields.contains(&"ht_backend") {
+                HtBackend::Cpu
+            } else {
+                HtBackend::Hip
+            },
+            i4r_backend: if fields.contains(&"i4r_backend") {
+                I4rBackend::Cpu
+            } else {
+                I4rBackend::Cuda
+            },
+            ..options()
+        };
+        assert_eq!(verify::manifest_options(&output)?, expected);
+        verify::verify(
+            &snapshot,
+            &plan,
+            &output,
+            DecodeBackend::Cpu,
+            &Progress::disabled(),
+        )?;
+    }
     for field in ["source_kind", "source_provenance"] {
         let mut changed = current.clone();
         changed.as_object_mut().unwrap().remove(field);

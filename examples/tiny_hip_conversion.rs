@@ -4,18 +4,22 @@
 //! `--root /tmp/tiny-cuda --backend cuda` retains inputs and cpu/cuda outputs;
 //! a CPU-only executable can use those arguments plus `--verify-only`.
 //! Select real GPU verification with `--decode-backend hip` or `cuda`.
+//! --i4r-backend cuda enables a real I4R matrix in the fixture; combine with
+//! --backend cuda --ht-backend cpu for I4R-only CUDA, or omit the HT override
+//! for dual HT/I4R CUDA. CPU-reference conversion always uses both CPU backends.
 
 #[path = "../tests/support/mod.rs"]
 mod support;
 
 use anyhow::{ensure, Context, Result};
 use bf16_to_hgn::{
-    codec::HtBackend,
+    codec::{Encoding, HtBackend, I4rBackend},
     conversion, hf,
     manifest::{Manifest, Options, OutputProfile},
     progress::Progress,
     verify,
     verify_gpu::DecodeBackend,
+    Origin,
 };
 use clap::{Parser, ValueEnum};
 use serde_json::{json, Value};
@@ -54,6 +58,12 @@ struct Args {
     /// GPU encoder and retained output directory; defaults to HIP.
     #[arg(long, value_enum, default_value = "hip")]
     backend: GpuBackend,
+    /// Override HT encoding independently; otherwise --backend selects HIP/CUDA.
+    #[arg(long, value_enum)]
+    ht_backend: Option<HtBackend>,
+    /// Independent I4R encoder; CPU preserves the original all-HT fixture.
+    #[arg(long, value_enum, default_value_t = I4rBackend::Cpu)]
+    i4r_backend: I4rBackend,
     /// New directory retaining genuine fixture source plus cpu/GPU outputs.
     #[arg(long)]
     root: Option<PathBuf>,
@@ -98,24 +108,35 @@ fn compare_container(cpu: &Path, gpu: &Path) -> Result<Value> {
 fn verify_and_compare(
     root: &Path,
     gpu_backend: GpuBackend,
+    ht_backend: HtBackend,
+    i4r_backend: I4rBackend,
     decode_backend: DecodeBackend,
     progress: &Progress,
 ) -> Result<Value> {
     let snapshot = hf::Snapshot::open(&root.join("source"))?;
     let mut manifests = Vec::new();
     let mut reports = Vec::<Value>::new();
-    for (name, backend) in [
-        ("cpu", HtBackend::Cpu),
-        (gpu_backend.name(), gpu_backend.encoder()),
+    for (name, backend, i4r) in [
+        ("cpu", HtBackend::Cpu, I4rBackend::Cpu),
+        (gpu_backend.name(), ht_backend, i4r_backend),
     ] {
         let output = root.join(name);
         let manifest: Manifest =
             serde_json::from_value(hf::read_json(&output.join("conversion-manifest.json"))?)
                 .context("read tiny conversion manifest")?;
         ensure!(
-            manifest.options.ht_backend == backend,
-            "{name} manifest records the wrong backend"
+            manifest.options.ht_backend == backend && manifest.options.i4r_backend == i4r,
+            "{name} manifest records the wrong HT/I4R backend"
         );
+        if i4r_backend == I4rBackend::Cuda {
+            ensure!(
+                manifest.plan.files.iter().any(|file| file
+                    .tensors
+                    .iter()
+                    .any(|tensor| tensor.encoding == Encoding::I4r)),
+                "CUDA I4R smoke must contain an actual I4R tensor"
+            );
+        }
         let report = serde_json::to_value(verify::verify(
             &snapshot,
             &manifest.plan,
@@ -129,13 +150,14 @@ fn verify_and_compare(
                 "complete verification reports differ for CPU/GPU encoded payloads"
             );
         }
-        reports.push(json!({"backend": backend, "verification": report}));
+        reports.push(json!({"backend": backend, "i4r_backend": i4r, "verification": report}));
         manifests.push(manifest);
     }
     let cpu = &manifests[0];
     let gpu = &manifests[1];
     let mut gpu_options = gpu.options.clone();
     gpu_options.ht_backend = HtBackend::Cpu;
+    gpu_options.i4r_backend = I4rBackend::Cpu;
     ensure!(
         cpu.options == gpu_options,
         "CPU/GPU conversion options differ beyond backend"
@@ -164,7 +186,8 @@ fn verify_and_compare(
     };
     Ok(json!({
         "fixture": "library-only; not an engine-compatible checkpoint or public CLI bypass",
-        "encoding_backend": gpu_backend.encoder(),
+        "encoding_backend": ht_backend,
+        "i4r_backend": i4r_backend,
         "decode_backend": decode_backend,
         "ht_beam": cpu.options.ht_beam,
         "conversion_encoder_sha256": cpu.encoder_sha256,
@@ -175,14 +198,43 @@ fn verify_and_compare(
     }))
 }
 
+fn tiny_fixture(
+    root: &Path,
+    i4r_backend: I4rBackend,
+) -> Result<(hf::Snapshot, bf16_to_hgn::ConversionPlan)> {
+    let (snapshot, mut plan) = support::gpu_fixture(root)?;
+    if i4r_backend == I4rBackend::Cuda {
+        // Restore the genuine source expert axes and shared sign planes for I4R.
+        // Other tensors retain the original legal HT3/HT4 matrix fixture.
+        for tensor in &mut plan.files[0].tensors {
+            match tensor.name.as_str() {
+                "fixture.experts.down.weight" => {
+                    tensor.shape = vec![2, 128, 128];
+                    tensor.encoding = Encoding::I4r;
+                }
+                "fixture.experts.down.svh" => {
+                    tensor.shape = vec![128];
+                    tensor.origin = Origin::Signs {
+                        key: tensor.name.clone(),
+                    };
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok((snapshot, plan))
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
+    let ht_backend = args.ht_backend.unwrap_or_else(|| args.backend.encoder());
     let options = Options {
         profile: OutputProfile::Ht43,
         seed: 7,
         threads: 1,
         ht_beam: args.ht_beam,
-        ht_backend: args.backend.encoder(),
+        ht_backend,
+        i4r_backend: args.i4r_backend,
     };
     if !args.verify_only {
         // Fail before creating even a fixture directory: never fake a GPU run.
@@ -205,13 +257,14 @@ fn main() -> Result<()> {
             .to_path_buf()
     };
     if !args.verify_only {
-        let (snapshot, plan) = support::gpu_fixture(&root)?;
-        for (name, backend) in [
-            ("cpu", HtBackend::Cpu),
-            (args.backend.name(), args.backend.encoder()),
+        let (snapshot, plan) = tiny_fixture(&root, args.i4r_backend)?;
+        for (name, backend, i4r_backend) in [
+            ("cpu", HtBackend::Cpu, I4rBackend::Cpu),
+            (args.backend.name(), ht_backend, args.i4r_backend),
         ] {
             let opts = Options {
                 ht_backend: backend,
+                i4r_backend,
                 ..options.clone()
             };
             conversion::convert(&snapshot, &plan, &root.join(name), &opts, &progress)?;
@@ -222,6 +275,8 @@ fn main() -> Result<()> {
         serde_json::to_string_pretty(&verify_and_compare(
             &root,
             args.backend,
+            ht_backend,
+            args.i4r_backend,
             args.decode_backend,
             &progress,
         )?)?
@@ -240,6 +295,8 @@ mod tests {
         let args = Args::parse_from(["tiny_hip_conversion"]);
         assert!(matches!(args.backend, GpuBackend::Hip));
         assert!(matches!(args.decode_backend, DecodeBackend::Cpu));
+        assert!(args.ht_backend.is_none());
+        assert_eq!(args.i4r_backend, I4rBackend::Cpu);
     }
 
     #[test]
@@ -269,5 +326,51 @@ mod tests {
         ]);
         assert!(matches!(args.backend, GpuBackend::Hip));
         assert!(matches!(args.decode_backend, DecodeBackend::Cuda));
+    }
+
+    #[test]
+    fn i4r_cuda_and_ht_cpu_are_independent() {
+        let args = Args::parse_from([
+            "tiny_hip_conversion",
+            "--backend",
+            "cuda",
+            "--ht-backend",
+            "cpu",
+            "--i4r-backend",
+            "cuda",
+        ]);
+        assert_eq!(args.ht_backend, Some(HtBackend::Cpu));
+        assert_eq!(args.i4r_backend, I4rBackend::Cuda);
+        assert!(Args::try_parse_from(["tiny_hip_conversion", "--i4r-backend", "hip"]).is_err());
+    }
+
+    #[test]
+    fn cuda_i4r_fixture_converts_and_source_verifies_without_a_device() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let (snapshot, plan) = tiny_fixture(temporary.path(), I4rBackend::Cuda)?;
+        let options = Options {
+            profile: OutputProfile::Ht43,
+            seed: 7,
+            threads: 1,
+            ht_beam: 8,
+            ht_backend: HtBackend::Cpu,
+            i4r_backend: I4rBackend::Cpu,
+        };
+        let progress = Progress::disabled();
+        let output = temporary.path().join("cpu");
+        conversion::convert(&snapshot, &plan, &output, &options, &progress)?;
+        let report = verify::verify(&snapshot, &plan, &output, DecodeBackend::Cpu, &progress)?;
+        let down = &report.errors["model.hgn:fixture.experts.down.weight"];
+        assert_eq!(down.values, 32768);
+        assert!(down.source_squared.is_finite() && down.source_squared > 0.0);
+        // A generous 10% squared-error ceiling checks reconstructed source
+        // fidelity without freezing this structural fixture's quantized bytes.
+        assert!(down.error_squared.is_finite());
+        assert!(
+            down.relative_squared_error() < 0.1,
+            "I4R source-relative squared error exceeds 10%: {}",
+            down.relative_squared_error(),
+        );
+        Ok(())
     }
 }

@@ -31,7 +31,7 @@
 //! shortened. A stopped stage keeps its context so a failure shows where it
 //! stopped; a completed stage collapses to one "done" line.
 
-use crate::codec::{Encoding, HtBackend};
+use crate::codec::{Encoding, HtBackend, I4rBackend};
 use indicatif::{
     BinaryBytes, FormattedDuration, HumanCount, HumanDuration, ProgressBar, ProgressDrawTarget,
     ProgressState, ProgressStyle,
@@ -136,32 +136,79 @@ impl Progress {
     }
 }
 
-/// End-to-end value-processing passes. Backend selection applies only to HT
-/// encoding; reads, rotations, hashing and writes within that chunk are included.
+/// Device that actually runs a work class's chunks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Device {
+    Cpu,
+    Hip,
+    Cuda,
+}
+
+impl Device {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU",
+            Self::Hip => "HIP",
+            Self::Cuda => "CUDA",
+        }
+    }
+}
+
+impl From<HtBackend> for Device {
+    fn from(backend: HtBackend) -> Self {
+        match backend {
+            HtBackend::Cpu => Self::Cpu,
+            HtBackend::Hip => Self::Hip,
+            HtBackend::Cuda => Self::Cuda,
+        }
+    }
+}
+
+impl From<I4rBackend> for Device {
+    fn from(backend: I4rBackend) -> Self {
+        match backend {
+            I4rBackend::Cpu => Self::Cpu,
+            I4rBackend::Cuda => Self::Cuda,
+        }
+    }
+}
+
+/// End-to-end value-processing passes. The HT backend selects HT3/HT4
+/// encoding's device and the independent I4R backend selects I4R's; every
+/// other codec runs on CPU. Reads, rotations, hashing and writes within that
+/// chunk are included.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WorkClass {
     Copy(Encoding),
-    Encode(Encoding, HtBackend),
+    Encode(Encoding, Device),
     WriteRotation,
     ScanFp8Scale,
 }
 
 const ENCODING_CLASSES: usize = 11;
-const WORK_CLASSES: usize = ENCODING_CLASSES + 4 + 3 + 2;
+/// HT3/HT4 on HIP and CUDA, and I4R on CUDA.
+const GPU_CLASSES: usize = 5;
+const WORK_CLASSES: usize = ENCODING_CLASSES + GPU_CLASSES + 3 + 2;
 
 impl WorkClass {
-    pub(crate) fn encode(encoding: Encoding, configured_backend: HtBackend) -> Self {
-        let backend = if encoding.ht_bits().is_some() {
-            configured_backend
+    pub(crate) fn encode(
+        encoding: Encoding,
+        ht_backend: HtBackend,
+        i4r_backend: I4rBackend,
+    ) -> Self {
+        let device = if encoding.ht_bits().is_some() {
+            ht_backend.into()
+        } else if encoding == Encoding::I4r {
+            i4r_backend.into()
         } else {
-            HtBackend::Cpu
+            Device::Cpu
         };
-        Self::Encode(encoding, backend)
+        Self::Encode(encoding, device)
     }
 
     pub(crate) fn backend_label(self) -> &'static str {
         match self {
-            Self::Encode(_, backend) => backend.label(),
+            Self::Encode(_, device) => device.label(),
             _ => "CPU",
         }
     }
@@ -169,7 +216,7 @@ impl WorkClass {
     /// Fixed, dense slots: updates never allocate or search the conversion plan.
     fn index(self) -> usize {
         match self {
-            Self::Encode(encoding, HtBackend::Cpu) => match encoding {
+            Self::Encode(encoding, Device::Cpu) => match encoding {
                 Encoding::Bf16 => 0,
                 Encoding::F16 => 1,
                 Encoding::F32 => 2,
@@ -182,19 +229,20 @@ impl WorkClass {
                 Encoding::Ht3 => 9,
                 Encoding::I4r => 10,
             },
-            Self::Encode(Encoding::Ht, HtBackend::Hip) => ENCODING_CLASSES,
-            Self::Encode(Encoding::Ht3, HtBackend::Hip) => ENCODING_CLASSES + 1,
-            Self::Encode(Encoding::Ht, HtBackend::Cuda) => ENCODING_CLASSES + 2,
-            Self::Encode(Encoding::Ht3, HtBackend::Cuda) => ENCODING_CLASSES + 3,
-            Self::Encode(_, HtBackend::Hip | HtBackend::Cuda) => {
-                unreachable!("only HT encoding runs on a GPU")
+            Self::Encode(Encoding::Ht, Device::Hip) => ENCODING_CLASSES,
+            Self::Encode(Encoding::Ht3, Device::Hip) => ENCODING_CLASSES + 1,
+            Self::Encode(Encoding::Ht, Device::Cuda) => ENCODING_CLASSES + 2,
+            Self::Encode(Encoding::Ht3, Device::Cuda) => ENCODING_CLASSES + 3,
+            Self::Encode(Encoding::I4r, Device::Cuda) => ENCODING_CLASSES + 4,
+            Self::Encode(_, Device::Hip | Device::Cuda) => {
+                unreachable!("only HT and I4R encoding run on a GPU")
             }
-            Self::Copy(Encoding::Bf16) => ENCODING_CLASSES + 4,
-            Self::Copy(Encoding::F32) => ENCODING_CLASSES + 5,
-            Self::Copy(Encoding::I64) => ENCODING_CLASSES + 6,
+            Self::Copy(Encoding::Bf16) => ENCODING_CLASSES + GPU_CLASSES,
+            Self::Copy(Encoding::F32) => ENCODING_CLASSES + GPU_CLASSES + 1,
+            Self::Copy(Encoding::I64) => ENCODING_CLASSES + GPU_CLASSES + 2,
             Self::Copy(_) => unreachable!("unsupported direct-copy encoding"),
-            Self::WriteRotation => ENCODING_CLASSES + 7,
-            Self::ScanFp8Scale => ENCODING_CLASSES + 8,
+            Self::WriteRotation => ENCODING_CLASSES + GPU_CLASSES + 3,
+            Self::ScanFp8Scale => ENCODING_CLASSES + GPU_CLASSES + 4,
         }
     }
 }
@@ -1016,8 +1064,9 @@ impl Drop for Stage {
 mod tests {
     use super::*;
 
-    const HT4: WorkClass = WorkClass::Encode(Encoding::Ht, HtBackend::Cpu);
-    const I4R: WorkClass = WorkClass::Encode(Encoding::I4r, HtBackend::Cpu);
+    const HT4: WorkClass = WorkClass::Encode(Encoding::Ht, Device::Cpu);
+    const I4R: WorkClass = WorkClass::Encode(Encoding::I4r, Device::Cpu);
+    const I4R_CUDA: WorkClass = WorkClass::Encode(Encoding::I4r, Device::Cuda);
 
     fn plan(classes: &[(WorkClass, u64)]) -> WorkEstimate {
         let mut estimate = WorkEstimate::default();
@@ -1072,18 +1121,20 @@ mod tests {
 
     #[test]
     fn operation_encoding_and_actual_backend_have_independent_rates() {
+        let cpu = I4rBackend::Cpu;
         let classes = [
             HT4,
-            WorkClass::encode(Encoding::Ht, HtBackend::Hip),
-            WorkClass::encode(Encoding::Ht3, HtBackend::Cpu),
-            WorkClass::encode(Encoding::Ht3, HtBackend::Hip),
-            WorkClass::encode(Encoding::Ht, HtBackend::Cuda),
-            WorkClass::encode(Encoding::Ht3, HtBackend::Cuda),
+            WorkClass::encode(Encoding::Ht, HtBackend::Hip, cpu),
+            WorkClass::encode(Encoding::Ht3, HtBackend::Cpu, cpu),
+            WorkClass::encode(Encoding::Ht3, HtBackend::Hip, cpu),
+            WorkClass::encode(Encoding::Ht, HtBackend::Cuda, cpu),
+            WorkClass::encode(Encoding::Ht3, HtBackend::Cuda, cpu),
             I4R,
-            WorkClass::encode(Encoding::Fp8G128, HtBackend::Hip),
+            I4R_CUDA,
+            WorkClass::encode(Encoding::Fp8G128, HtBackend::Hip, I4rBackend::Cuda),
             WorkClass::ScanFp8Scale,
             WorkClass::Copy(Encoding::Bf16),
-            WorkClass::encode(Encoding::Bf16, HtBackend::Hip),
+            WorkClass::encode(Encoding::Bf16, HtBackend::Hip, I4rBackend::Cuda),
             WorkClass::WriteRotation,
         ];
         let mut estimate = WorkEstimate::default();
@@ -1100,18 +1151,34 @@ mod tests {
                 expected(seconds, classes.len() - sampled)
             );
         }
-        assert_eq!(estimate.remaining(), expected(78, 0));
-        for backend in [HtBackend::Hip, HtBackend::Cuda] {
-            assert_eq!(WorkClass::encode(Encoding::I4r, backend), I4R);
+        let all = classes.len();
+        assert_eq!(
+            estimate.remaining(),
+            expected((all * (all + 1) / 2) as u64, 0)
+        );
+    }
+
+    #[test]
+    fn ht_and_i4r_backends_select_devices_independently() {
+        for ht in [HtBackend::Cpu, HtBackend::Hip, HtBackend::Cuda] {
+            assert_eq!(WorkClass::encode(Encoding::I4r, ht, I4rBackend::Cpu), I4R);
             assert_eq!(
-                WorkClass::encode(Encoding::Fp8G128, backend).backend_label(),
-                "CPU"
+                WorkClass::encode(Encoding::I4r, ht, I4rBackend::Cuda),
+                I4R_CUDA
             );
-            assert_eq!(
-                WorkClass::encode(Encoding::Ht, backend).backend_label(),
-                backend.label()
-            );
+            for i4r in [I4rBackend::Cpu, I4rBackend::Cuda] {
+                for encoding in [Encoding::Ht, Encoding::Ht3] {
+                    let class = WorkClass::encode(encoding, ht, i4r);
+                    assert_eq!(class, WorkClass::Encode(encoding, ht.into()));
+                    assert_eq!(class.backend_label(), ht.label());
+                }
+                for encoding in [Encoding::Fp8G128, Encoding::Q4Cp, Encoding::Bf16] {
+                    assert_eq!(WorkClass::encode(encoding, ht, i4r).backend_label(), "CPU");
+                }
+            }
         }
+        assert_eq!(I4R.backend_label(), "CPU");
+        assert_eq!(I4R_CUDA.backend_label(), "CUDA");
     }
 
     #[test]

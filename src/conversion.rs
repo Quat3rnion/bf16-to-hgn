@@ -20,6 +20,7 @@ use std::{
 
 const COPY_CHUNK: usize = 8 * 1024 * 1024;
 const MATRIX_ROWS: usize = 128;
+const I4R_CUDA_BATCH_BANDS: usize = 32;
 const TABLE_ROWS: usize = 8192;
 
 pub fn validate_plan(
@@ -674,7 +675,7 @@ fn encode_tensor(
     }
     let mut row = 0;
     while row < rows {
-        let take = MATRIX_ROWS.min(rows - row);
+        let take = matrix_batch_rows(tensor, options.i4r_backend, row, rows)?;
         if stage.is_enabled() {
             tensor_progress::rows(
                 stage,
@@ -697,6 +698,7 @@ fn encode_tensor(
             threads: options.threads,
             ht_beam: options.ht_beam,
             ht_backend: options.ht_backend,
+            i4r_backend: options.i4r_backend,
             ..QuantMeta::default()
         };
         let block = codec::encode_rows(tensor.encoding, &values, take, cols, &meta)
@@ -751,14 +753,49 @@ pub(crate) fn direct_copy(encoding: Encoding, dtype: Dtype) -> bool {
 }
 
 fn encode_backend(tensor: &TensorPlan, options: &Options) -> &'static str {
-    WorkClass::encode(tensor.encoding, options.ht_backend).backend_label()
+    WorkClass::encode(tensor.encoding, options.ht_backend, options.i4r_backend).backend_label()
+}
+
+fn matrix_batch_rows(
+    tensor: &TensorPlan,
+    i4r_backend: codec::I4rBackend,
+    row: usize,
+    rows: usize,
+) -> Result<usize> {
+    ensure!(row < rows, "matrix batch starts beyond tensor");
+    if tensor.encoding != Encoding::I4r || i4r_backend == codec::I4rBackend::Cpu {
+        return Ok(MATRIX_ROWS.min(rows - row));
+    }
+    let expert_rows = if tensor.shape.len() == 3 {
+        usize::try_from(tensor.shape[1])?
+    } else {
+        rows
+    };
+    ensure!(
+        row % MATRIX_ROWS == 0 && expert_rows > 0 && expert_rows % MATRIX_ROWS == 0,
+        "I4R batch requires complete row bands"
+    );
+    let portion_rows = if tensor.shape.len() == 3 && tensor.name.ends_with(".gate_up_proj.weight") {
+        ensure!(
+            expert_rows % (2 * MATRIX_ROWS) == 0,
+            "I4R gate/up requires complete projection bands"
+        );
+        expert_rows / 2
+    } else {
+        expert_rows
+    };
+    // One bounded host batch shares su. sv restarts at each expert, and the
+    // gate/up half boundary is also kept intact for truthful portion progress.
+    Ok((I4R_CUDA_BATCH_BANDS * MATRIX_ROWS)
+        .min(portion_rows - row % portion_rows)
+        .min(rows - row))
 }
 
 fn source_work(encoding: Encoding, dtype: Dtype, options: &Options) -> WorkClass {
     if direct_copy(encoding, dtype) {
         WorkClass::Copy(encoding)
     } else {
-        WorkClass::encode(encoding, options.ht_backend)
+        WorkClass::encode(encoding, options.ht_backend, options.i4r_backend)
     }
 }
 
@@ -781,7 +818,11 @@ fn conversion_work(
                 estimate
                     .add(WorkClass::ScanFp8Scale, values)
                     .context("progress value count overflow")?;
-                WorkClass::encode(Encoding::Fp8G128, codec::HtBackend::Cpu)
+                WorkClass::encode(
+                    Encoding::Fp8G128,
+                    codec::HtBackend::Cpu,
+                    codec::I4rBackend::Cpu,
+                )
             }
         };
         estimate
@@ -801,7 +842,7 @@ fn encode_gate_up(
     options: &Options,
     stage: &Stage,
 ) -> Result<String> {
-    let class = WorkClass::encode(tensor.encoding, options.ht_backend);
+    let class = WorkClass::encode(tensor.encoding, options.ht_backend, options.i4r_backend);
     let experts = usize::try_from(tensor.shape[0])?;
     let expert_rows = usize::try_from(tensor.shape[1])?;
     let cols = usize::try_from(tensor.shape[2])?;
@@ -852,6 +893,7 @@ fn encode_gate_up(
                 threads: options.threads,
                 ht_beam: options.ht_beam,
                 ht_backend: options.ht_backend,
+                i4r_backend: options.i4r_backend,
                 ..QuantMeta::default()
             };
             let up_meta = QuantMeta {
@@ -1019,6 +1061,7 @@ fn encode_table(
         threads: options.threads,
         ht_beam: options.ht_beam,
         ht_backend: options.ht_backend,
+        i4r_backend: options.i4r_backend,
         ..QuantMeta::default()
     };
     let mut output_offset = 0;
@@ -1065,7 +1108,11 @@ fn encode_table(
                 );
             }
             stage.advance_work(
-                WorkClass::encode(Encoding::Fp8G128, codec::HtBackend::Cpu),
+                WorkClass::encode(
+                    Encoding::Fp8G128,
+                    codec::HtBackend::Cpu,
+                    codec::I4rBackend::Cpu,
+                ),
                 (take * cols) as u64,
                 started,
             );

@@ -1,4 +1,4 @@
-// CUDA trellis encoder and independent verification decode/unrotation.
+// CUDA HT/I4R encoders and independent verification decode/unrotation.
 // The CPU implementations remain the references; this file never calls them.
 //
 // Selection below is an independent implementation of the observable
@@ -6,10 +6,11 @@
 // 12 and 16 are the build candidates; tests/cuda_selection.cu qualifies the
 // installed version against complete device permutations. Changing either
 // selection algorithm requires renewed byte-equivalence qualification.
-// libc++ and parallel-mode libstdc++ are not interchangeable. Both encoders
-// require separate IEEE operations: --fmad=false --ftz=false for CUDA, and
+// libc++ and parallel-mode libstdc++ are not interchangeable. CPU/GPU encoding
+// requires separate IEEE operations: --fmad=false --ftz=false for CUDA, and
 // -ffp-contract=off without fast math for the host compiler.
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 #include <array>
 #include <cfenv>
@@ -124,6 +125,33 @@ static_assert(sizeof(double) == 8 && std::numeric_limits<double>::is_iec559);
 static_assert(sizeof(DecodeStorage) == 55115776);
 static_assert(sizeof(DeviceStorage) + sizeof(DecodeStorage) <= 192u * 1024u * 1024u);
 
+// Complete 128x128 blocks are independent in both the forward rotation and
+// quantizer. Keep whole bands contiguous when they fit, splitting only widths
+// greater than 32768. The source buffer becomes the rotated buffer after the
+// row pass; no whole-request allocation or second f32 plane is needed.
+constexpr int kI4rBlocks = 256;
+constexpr int kI4rValues = kI4rBlocks * 128 * 128;
+constexpr int kI4rThreads = 128;
+constexpr int kI4rGroups = kI4rThreads / 8;
+struct I4rStatus {
+    // Separate words: quantizer blocks read the completed rotation status
+    // while other quantizer blocks may atomically report a bad half scale.
+    unsigned rotation_overflow;
+    unsigned scale_overflow;
+};
+struct I4rStorage {
+    float values[kI4rValues];
+    double scratch[kI4rValues];
+    float su[kI4rBlocks * 128];
+    float sv[kI4rBlocks * 128];
+    uint8_t codes[kI4rValues / 2];
+    uint8_t scales[kI4rValues / 64];
+    I4rStatus status;
+};
+static_assert(sizeof(I4rStorage) == 52756488);
+static_assert(sizeof(DeviceStorage) + sizeof(DecodeStorage) + sizeof(I4rStorage)
+              <= 256u * 1024u * 1024u);
+
 __device__ __forceinline__ float decode_half(uint16_t bits) {
     const unsigned sign = unsigned(bits & 0x8000) << 16;
     const unsigned exponent = (bits >> 10) & 31;
@@ -224,6 +252,142 @@ __global__ __launch_bounds__(kThreads) void decode_column_axis(
         // and preserves f32 denormals, including the final narrowing cast.
         storage->output[row * cols + col] = float(value * 0x1p-7
             * double(storage->sv[row]) * double(storage->su[su_index]));
+    }
+}
+
+__global__ __launch_bounds__(kThreads) void i4r_forward_rows(I4rStorage *storage, int cols) {
+    __shared__ double values[16 * 128];
+    const int row_base = int(blockIdx.y) * 16;
+    const int col_base = int(blockIdx.x) * 128;
+    for (int index = int(threadIdx.x); index < 16 * 128; index += kThreads) {
+        const int row = row_base + index / 128;
+        const int col = col_base + index % 128;
+        // Rust validates finite source values and +/-1 signs. Preserve the
+        // CPU's divide-then-multiply order, including signed zero.
+        values[index] = __dmul_rn(__ddiv_rn(double(storage->values[row * cols + col]),
+                                          double(storage->sv[row])), double(storage->su[col]));
+    }
+    decode_axis<128>(values);
+    for (int index = int(threadIdx.x); index < 16 * 128; index += kThreads) {
+        const int row = row_base + index / 128;
+        const int col = col_base + index % 128;
+        storage->scratch[row * cols + col] = values[index];
+    }
+}
+
+__global__ __launch_bounds__(kThreads) void i4r_forward_columns(I4rStorage *storage, int cols) {
+    __shared__ double values[16 * 129];
+    const int row_base = int(blockIdx.y) * 128;
+    const int col_base = int(blockIdx.x) * 16;
+    for (int index = int(threadIdx.x); index < 16 * 128; index += kThreads) {
+        const int row = row_base + index / 16;
+        const int col = col_base + index % 16;
+        values[(index % 16) * 129 + index / 16] = storage->scratch[row * cols + col];
+    }
+    decode_axis<129>(values);
+    for (int index = int(threadIdx.x); index < 16 * 128; index += kThreads) {
+        const int row = row_base + index / 16;
+        const int col = col_base + index % 16;
+        // The two ordered FP64 axes precede the sole normalization/narrowing.
+        const float value = __double2float_rn(
+            __dmul_rn(values[(index % 16) * 129 + index / 16], 0x1p-7));
+        if ((__float_as_uint(value) & 0x7fffffffU) >= 0x7f800000U)
+            atomicExch(&storage->status.rotation_overflow, 1u);
+        storage->values[row * cols + col] = value;
+    }
+}
+
+__device__ __forceinline__ int i4r_round_code(float value, float divisor) {
+    const float quotient = __fdiv_rn(value, divisor);
+    const float clamped = fminf(fmaxf(quotient, -8.0f), 7.0f);
+    // Identical to round_small_code: one binary32 RNE addition, then an exact
+    // integer conversion/subtraction. Never round the division in FP64.
+    return __float2int_rz(__fadd_rn(clamped, 12582912.0f)) - 12582912;
+}
+
+__global__ __launch_bounds__(kI4rThreads) void i4r_quantize(I4rStorage *storage) {
+    // The preceding column kernel has finished on this stream. Reject its
+    // nonfinite result before any extreme selection, division or error sum.
+    if (storage->status.rotation_overflow) return;
+    __shared__ float values[kI4rGroups * 128];
+    __shared__ double errors[kI4rGroups][8];
+    __shared__ uint16_t halves[kI4rGroups][8], selected[kI4rGroups];
+    const int thread = int(threadIdx.x);
+    const int local = thread / 8;
+    const int lane = thread % 8;
+    const int group = int(blockIdx.x) * kI4rGroups + local;
+    // Every rectangle contains complete 128x128 blocks, so its group count
+    // is a multiple of 128 and no partially active warp/block is possible.
+    for (int index = thread; index < kI4rGroups * 128; index += kI4rThreads)
+        values[index] = storage->values[int(blockIdx.x) * kI4rGroups * 128 + index];
+    __syncthreads();
+
+    float extreme = values[local * 128 + lane];
+    int position = lane;
+    for (int index = lane + 8; index < 128; index += 8) {
+        const float value = values[local * 128 + index];
+        if (fabsf(value) > fabsf(extreme)) {
+            extreme = value;
+            position = index;
+        }
+    }
+    for (int delta = 4; delta != 0; delta /= 2) {
+        const float value = __shfl_down_sync(0xffffffffu, extreme, delta, 8);
+        const int index = __shfl_down_sync(0xffffffffu, position, delta, 8);
+        // Equal magnitudes keep the first source position, not the lowest
+        // lane. Its sign (even -0) defines all six candidate half scales.
+        if (lane + delta < 8 && (fabsf(value) > fabsf(extreme)
+            || (fabsf(value) == fabsf(extreme) && index < position))) {
+            extreme = value;
+            position = index;
+        }
+    }
+    extreme = __shfl_sync(0xffffffffu, extreme, 0, 8);
+    uint16_t half_bits = 0;
+    if (lane < 6) {
+        const float multipliers[6] = {1.0f, 0.97f, 0.94f, 0.91f, 0.88f, 0.85f};
+        const float scale = __fmul_rn(__fdiv_rn(-extreme, 8.0f), multipliers[lane]);
+        half_bits = __half_as_ushort(__float2half_rn(scale));
+    }
+    const unsigned invalid = __ballot_sync(0xffffffffu, (half_bits & 0x7c00) == 0x7c00);
+    const unsigned group_mask = 0xffu << ((thread % 32 / 8) * 8);
+    const bool invalid_group = (invalid & group_mask) != 0;
+    if (invalid_group && lane == 0) atomicExch(&storage->status.scale_overflow, 1u);
+
+    double error = 0.0;
+    if (lane < 6 && !invalid_group) {
+        const float scale = decode_half(half_bits);
+        const float divisor = scale == 0.0f ? 1.0f : scale;
+        // Parallel candidates/groups, never parallel elements of this sum:
+        // the CPU's sequential FP64 rounding controls strict first-win ties.
+        #pragma unroll 1
+        for (int index = 0; index < 128; ++index) {
+            const float value = values[local * 128 + index];
+            const int code = i4r_round_code(value, divisor);
+            const double delta = __dsub_rn(__dmul_rn(double(code), double(scale)), double(value));
+            error = __dadd_rn(error, __dmul_rn(delta, delta));
+        }
+    }
+    errors[local][lane] = error;
+    halves[local][lane] = half_bits;
+    __syncthreads();
+    if (lane == 0 && !invalid_group) {
+        int best = 0;
+        for (int candidate = 1; candidate < 6; ++candidate)
+            if (errors[local][candidate] < errors[local][best]) best = candidate;
+        selected[local] = halves[local][best];
+        storage->scales[group * 2] = uint8_t(selected[local]);
+        storage->scales[group * 2 + 1] = uint8_t(selected[local] >> 8);
+    }
+    __syncthreads();
+    if (!invalid_group) {
+        const float scale = decode_half(selected[local]);
+        const float divisor = scale == 0.0f ? 1.0f : scale;
+        for (int index = lane; index < 64; index += 8) {
+            const int first = i4r_round_code(values[local * 128 + 2 * index], divisor) + 8;
+            const int second = i4r_round_code(values[local * 128 + 2 * index + 1], divisor) + 8;
+            storage->codes[group * 64 + index] = uint8_t(first | (second << 4));
+        }
     }
 }
 
@@ -606,10 +770,12 @@ struct Context {
     cudaStream_t stream = nullptr;
     DeviceStorage *storage = nullptr;
     DecodeStorage *decode_storage = nullptr;
+    I4rStorage *i4r_storage = nullptr;
     std::array<float, kStates> cached_codebook;
     std::array<float, kStates> decode_cached_codebook;
     // Remains alive while an error path drains a queued D2H transfer.
     std::array<TileStatus, kBatch> tile_status;
+    I4rStatus i4r_status{};
     bool codebook_valid = false;
     bool decode_codebook_valid = false;
 
@@ -628,23 +794,29 @@ struct Context {
         // Resolve every compiled kernel, including under CUDA_MODULE_LOADING=LAZY.
         // A device query alone cannot detect a missing SASS/PTX image. Attribute
         // queries load/JIT code when needed but never launch inference or kernels.
-        const void *kernels[] = {
-            reinterpret_cast<const void *>(encode_tiles<3>),
-            reinterpret_cast<const void *>(encode_tiles<4>),
-            reinterpret_cast<const void *>(decode_row_axis<0>),
-            reinterpret_cast<const void *>(decode_row_axis<3>),
-            reinterpret_cast<const void *>(decode_row_axis<4>),
-            reinterpret_cast<const void *>(decode_column_axis)
+        const struct {
+            const void *function;
+            int threads;
+        } kernels[] = {
+            {reinterpret_cast<const void *>(encode_tiles<3>), kThreads},
+            {reinterpret_cast<const void *>(encode_tiles<4>), kThreads},
+            {reinterpret_cast<const void *>(decode_row_axis<0>), kThreads},
+            {reinterpret_cast<const void *>(decode_row_axis<3>), kThreads},
+            {reinterpret_cast<const void *>(decode_row_axis<4>), kThreads},
+            {reinterpret_cast<const void *>(decode_column_axis), kThreads},
+            {reinterpret_cast<const void *>(i4r_forward_rows), kThreads},
+            {reinterpret_cast<const void *>(i4r_forward_columns), kThreads},
+            {reinterpret_cast<const void *>(i4r_quantize), kI4rThreads}
         };
-        for (const void *kernel : kernels) {
+        for (const auto &kernel : kernels) {
             cudaFuncAttributes attributes{};
-            error = cudaFuncGetAttributes(&attributes, kernel);
+            error = cudaFuncGetAttributes(&attributes, kernel.function);
             if (error != cudaSuccess) {
                 cuda_failure(error, "resolve compiled CUDA kernel on device 0; check HGN_CUDA_ARCH/driver");
                 return error == cudaErrorNoKernelImageForDevice || error == cudaErrorInvalidDeviceFunction
                     || error == cudaErrorUnsupportedPtxVersion ? -2 : -3;
             }
-            if (attributes.maxThreadsPerBlock < kThreads
+            if (attributes.maxThreadsPerBlock < kernel.threads
                 || attributes.sharedSizeBytes > properties.sharedMemPerBlock)
                 return fail(-2, "compiled CUDA kernel exceeds device 0's thread/shared-memory limits");
         }
@@ -677,16 +849,27 @@ struct Context {
         return 0;
     }
 
+    int ensure_i4r_encoder() {
+        if (i4r_storage) return 0;
+        const cudaError_t error = cudaMalloc(reinterpret_cast<void **>(&i4r_storage), sizeof(I4rStorage));
+        if (error != cudaSuccess) {
+            i4r_storage = nullptr;
+            return cuda_failure(error, "allocate bounded 52,756,488-byte CUDA I4R workspace");
+        }
+        return 0;
+    }
+
     ~Context() {
         // The CUDA runtime can already be unloading at static destruction.
         // Best-effort silent cleanup; never reset a device shared by services.
-        if (!stream && !storage && !decode_storage) return;
+        if (!stream && !storage && !decode_storage && !i4r_storage) return;
         int previous = 0;
         if (cudaGetDevice(&previous) != cudaSuccess) return;
         if (previous != 0 && cudaSetDevice(0) != cudaSuccess) return;
         if (stream) cudaStreamSynchronize(stream);
         if (storage) cudaFree(storage);
         if (decode_storage) cudaFree(decode_storage);
+        if (i4r_storage) cudaFree(i4r_storage);
         if (stream) cudaStreamDestroy(stream);
         if (previous != 0) cudaSetDevice(previous);
     }
@@ -812,6 +995,114 @@ int encode(Context &state, const float *tiles, const float *codebook,
                 return -4;
             }
         }
+    }
+    return 0;
+}
+
+cudaError_t copy_i4r_rectangle(void *destination, size_t destination_pitch,
+                             const void *source, size_t source_pitch,
+                             size_t width, size_t rows, cudaMemcpyKind kind,
+                             cudaStream_t stream) {
+    if (destination_pitch == width && source_pitch == width)
+        return cudaMemcpyAsync(destination, source, width * rows, kind, stream);
+    // Only widths above the 32768-column workspace need strided copies.
+    // Row copies avoid cudaMemcpy2D's device-dependent pitch ceiling for an
+    // otherwise valid arbitrarily wide host matrix. Ordinary bands use the
+    // single contiguous transfer above, not one transfer per rotation tile.
+    for (size_t row = 0; row < rows; ++row) {
+        const cudaError_t error = cudaMemcpyAsync(
+            static_cast<uint8_t *>(destination) + row * destination_pitch,
+            static_cast<const uint8_t *>(source) + row * source_pitch, width, kind, stream);
+        if (error != cudaSuccess) return error;
+    }
+    return cudaSuccess;
+}
+
+int encode_i4r(Context &state, const float *source, const float *su, const float *sv,
+               uint8_t *codes, uint8_t *scales, int bands, int cols) {
+    const int allocation = state.ensure_i4r_encoder();
+    if (allocation != 0) return allocation;
+    I4rStorage *storage = state.i4r_storage;
+    const size_t full_cols = size_t(cols);
+    const size_t width_limit = full_cols < size_t(kI4rBlocks * 128)
+        ? full_cols : size_t(kI4rBlocks * 128);
+    const size_t band_limit = kI4rBlocks / (width_limit / 128);
+    bool scale_failed = false;
+    size_t scale_band = 0;
+    size_t scale_col = 0;
+    for (size_t band_base = 0; band_base < size_t(bands);) {
+        const size_t remaining = size_t(bands) - band_base;
+        const size_t batch_bands = remaining < band_limit ? remaining : band_limit;
+        const size_t rows = batch_bands * 128;
+        for (size_t col_base = 0; col_base < full_cols; col_base += width_limit) {
+            const size_t width = full_cols - col_base < width_limit
+                ? full_cols - col_base : width_limit;
+            int batch_cols = int(width);
+            cudaError_t error = cudaMemsetAsync(&storage->status, 0, sizeof(I4rStatus), state.stream);
+            if (error != cudaSuccess) return cuda_failure(error, "clear CUDA I4R batch status");
+            error = cudaMemcpyAsync(storage->su, su + col_base, width * sizeof(float),
+                                    cudaMemcpyHostToDevice, state.stream);
+            if (error != cudaSuccess) return cuda_failure(error, "upload CUDA I4R input signs");
+            error = cudaMemcpyAsync(storage->sv, sv + band_base * 128, rows * sizeof(float),
+                                    cudaMemcpyHostToDevice, state.stream);
+            if (error != cudaSuccess) return cuda_failure(error, "upload CUDA I4R output signs");
+            error = copy_i4r_rectangle(storage->values, width * sizeof(float),
+                source + band_base * 128 * full_cols + col_base, full_cols * sizeof(float),
+                width * sizeof(float), rows, cudaMemcpyHostToDevice, state.stream);
+            if (error != cudaSuccess) return cuda_failure(error, "upload CUDA I4R source rectangle");
+            void *axis_arguments[] = {&storage, &batch_cols};
+            error = cudaLaunchKernel(reinterpret_cast<const void *>(i4r_forward_rows),
+                dim3(unsigned(width / 128), unsigned(rows / 16)), dim3(kThreads),
+                axis_arguments, 0, state.stream);
+            if (error != cudaSuccess) return cuda_failure(error, "launch CUDA I4R row butterflies");
+            error = cudaLaunchKernel(reinterpret_cast<const void *>(i4r_forward_columns),
+                dim3(unsigned(width / 16), unsigned(batch_bands)), dim3(kThreads),
+                axis_arguments, 0, state.stream);
+            if (error != cudaSuccess) return cuda_failure(error, "launch CUDA I4R column butterflies");
+            if (!scale_failed) {
+                void *quantize_arguments[] = {&storage};
+                error = cudaLaunchKernel(reinterpret_cast<const void *>(i4r_quantize),
+                    dim3(unsigned(rows * width / 128 / kI4rGroups)), dim3(kI4rThreads),
+                    quantize_arguments, 0, state.stream);
+                if (error != cudaSuccess) return cuda_failure(error, "launch CUDA I4R exact quantizer");
+                error = copy_i4r_rectangle(codes + band_base * 128 * (full_cols / 2) + col_base / 2,
+                    full_cols / 2, storage->codes, width / 2, width / 2, rows,
+                    cudaMemcpyDeviceToHost, state.stream);
+                if (error != cudaSuccess) return cuda_failure(error, "download CUDA I4R codes");
+                error = copy_i4r_rectangle(scales + band_base * 128 * (full_cols / 64) + col_base / 64,
+                    full_cols / 64, storage->scales, width / 64, width / 64, rows,
+                    cudaMemcpyDeviceToHost, state.stream);
+                if (error != cudaSuccess) return cuda_failure(error, "download CUDA I4R half scales");
+            }
+            // Context-owned status outlives every failed asynchronous copy
+            // while with_context drains the stream before releasing callers.
+            error = cudaMemcpyAsync(&state.i4r_status, &storage->status, sizeof(I4rStatus),
+                                    cudaMemcpyDeviceToHost, state.stream);
+            if (error != cudaSuccess) return cuda_failure(error, "download CUDA I4R batch status");
+            error = cudaStreamSynchronize(state.stream);
+            if (error != cudaSuccess) return cuda_failure(error, "complete CUDA I4R batch");
+            if (state.i4r_status.rotation_overflow) {
+                std::snprintf(last_error, sizeof(last_error),
+                    "CUDA I4R rotation overflows f32 in band rectangle starting at band %zu, column %zu; "
+                    "reduce source magnitude before encoding", band_base, col_base);
+                return -4;
+            }
+            if (!scale_failed && state.i4r_status.scale_overflow) {
+                scale_failed = true;
+                scale_band = band_base;
+                scale_col = col_base;
+                // CPU rotation validates the entire request before checking
+                // any half scales. Continue rotation only, so a later f32
+                // overflow retains that error category across chunk borders.
+            }
+        }
+        band_base += batch_bands;
+    }
+    if (scale_failed) {
+        std::snprintf(last_error, sizeof(last_error),
+            "CUDA I4R quantization scale exceeds finite f16 range in band rectangle starting at "
+            "band %zu, column %zu; value cannot be represented as a finite f16", scale_band, scale_col);
+        return -4;
     }
     return 0;
 }
@@ -952,6 +1243,33 @@ extern "C" int ht_encode_bits_cuda(const float *tiles, const float *codebook,
         return fail(-1, "CUDA HT buffer extent overflows the host address space");
     return with_context([&](Context &state) {
         return encode(state, tiles, codebook, codes, count, beam, bits);
+    });
+}
+
+extern "C" int hgn_cuda_i4r_preflight() {
+    last_error[0] = '\0';
+    // Resolve kernels through the common guarded context, but allocate only
+    // I4R storage: this backend is independent of HT beam/encoder selection.
+    return with_context([](Context &state) { return state.ensure_i4r_encoder(); });
+}
+
+extern "C" int hgn_cuda_encode_i4r(const float *source, const float *su, const float *sv,
+                                 uint8_t *codes, uint8_t *scales, int bands, int cols) {
+    last_error[0] = '\0';
+    if (bands <= 0 || cols <= 0 || cols % 128 != 0)
+        return fail(-1, "CUDA I4R encode requires positive bands and a positive multiple-of-128 column count");
+    if (size_t(bands) > std::numeric_limits<size_t>::max() / 128 / size_t(cols) / sizeof(float))
+        return fail(-1, "CUDA I4R encode shape overflows the host address space");
+    if (!source || !su || !sv || !codes || !scales)
+        return fail(-1, "CUDA I4R encode requires nonnull buffers");
+    const size_t values = size_t(bands) * 128 * size_t(cols);
+    if (address_overflows(source, values * sizeof(float))
+        || address_overflows(su, size_t(cols) * sizeof(float))
+        || address_overflows(sv, size_t(bands) * 128 * sizeof(float))
+        || address_overflows(codes, values / 2) || address_overflows(scales, values / 64))
+        return fail(-1, "CUDA I4R encode buffer extent overflows the host address space");
+    return with_context([&](Context &state) {
+        return encode_i4r(state, source, su, sv, codes, scales, bands, cols);
     });
 }
 

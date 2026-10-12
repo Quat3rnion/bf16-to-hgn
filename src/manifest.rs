@@ -1,5 +1,5 @@
 use crate::{
-    codec::HtBackend,
+    codec::{HtBackend, I4rBackend},
     container::{Entry, Fingerprint, Layout},
     hf::TensorInfo,
     source::SourceKind,
@@ -33,6 +33,9 @@ pub struct Options {
     /// Encoding provenance only; verification selects its decode backend at runtime.
     #[serde(default)]
     pub ht_backend: HtBackend,
+    /// Independent I4R encoding provenance; never selects the verification device.
+    #[serde(default)]
+    pub i4r_backend: I4rBackend,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -42,6 +45,7 @@ impl Default for Options {
             threads: 1,
             ht_beam: 128,
             ht_backend: HtBackend::Cpu,
+            i4r_backend: I4rBackend::Cpu,
         }
     }
 }
@@ -62,7 +66,8 @@ impl Options {
     /// `validate` deliberately remains device-independent for plans and verification.
     pub fn validate_for_execution(&self) -> anyhow::Result<()> {
         self.validate()?;
-        self.ht_backend.preflight()
+        self.ht_backend.preflight()?;
+        self.i4r_backend.preflight()
     }
 }
 

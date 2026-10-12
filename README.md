@@ -137,10 +137,16 @@ rather than the system's newer compiler:
 CXX=g++-12 NVCC=nvcc CARGO_TARGET_DIR=/tmp/bf16-hgn-cuda-target CARGO_BUILD_JOBS=1 \
   cargo build --release --locked --features cuda
 CUDA_BIN=/tmp/bf16-hgn-cuda-target/release/bf16-to-hgn
+# v2 routed experts use I4R; dense HT and I4R are selected independently.
 $CUDA_BIN convert --source /path/to/hf-bf16 --output /path/to/new-output \
-  --profile ht43 --ht-backend cuda --ht-beam 128
+  --profile v2 --ht-backend cuda --i4r-backend cuda --ht-beam 128
 $CUDA_BIN verify --source /path/to/hf-bf16 --output /path/to/new-output \
   --decode-backend cuda
+# I4R-only CUDA encoding: HT stays on CPU; use a different new output.
+$CUDA_BIN convert --source /path/to/hf-bf16 --output /path/to/new-i4r-output \
+  --profile v2 --ht-backend cpu --i4r-backend cuda
+$CUDA_BIN verify --source /path/to/hf-bf16 --output /path/to/new-i4r-output \
+  --decode-backend cpu
 ```
 
 `NVCC` selects the CUDA compiler; it must support the selected `CXX` host
@@ -152,10 +158,11 @@ PTX. Set it explicitly for a different target. Device preflight checks the
 compiled kernels' compatibility with the visible device without launching
 them; an incompatible image/device or unavailable runtime is an error.
 CUDA disables FMA contraction and fast math, preserves FP32 denormals, and
-requests precise division and square root. The CUDA 12.0/GCC 12 combination
-was qualified on the workhorse host below, including cross-host fidelity
-against Frame GCC 16. A build alone is not hardware, byte-fidelity or
-performance qualification; qualify different toolchains/devices separately.
+requests precise division and square root. The historical HT encoding and
+GPU decoding qualification below used CUDA 12.0/GCC 12, including cross-host
+fidelity against Frame GCC 16; it is not qualification of the new I4R encoder.
+A build alone is not hardware, byte-fidelity or performance qualification;
+qualify different toolchains/devices separately.
 
 ## Commands
 
@@ -163,6 +170,13 @@ performance qualification; qualify different toolchains/devices separately.
 unambiguous. `inspect`, `plan` and `convert` accept `--profile v2|ht43`;
 omitting it selects v2. `verify` derives the profile and encoding options
 from `conversion-manifest.json`, not a CLI profile override.
+
+`convert --i4r-backend cpu|cuda` selects I4R forward rotation and quantization
+independently of `--ht-backend cpu|hip|cuda`. Both encoder defaults are CPU,
+even in GPU-feature builds. `--profile v2` uses I4R routed trunk experts;
+`--profile ht43` retains its HT3/HT4 routed-expert policy. Backend choices
+do not change codecs, profile or HT beam width. `plan` and `inspect` can
+describe these choices without loading a GPU.
 
 `verify --decode-backend cpu|hip|cuda` selects the verifier's runtime decoder
 independently of the encoder backend recorded in the manifest. CPU is the
@@ -445,13 +459,18 @@ switching storage formats.
 
 ## Memory and CPU safeguards
 
-Rust streams one tensor and 128 matrix rows at a time, with experts processed
-individually and paired HT gate/up bands handled separately. The n-gram table
-uses 8,192-row chunks and two passes; raw copies/hashes use at most 8 MiB
-chunks. HGN/GGUF decoding uses bounded source windows, not an intermediate
-decoded HF checkpoint or temporary full model. HF uses windowed mmap reads
-with eviction hints; output dirty data is synced/evicted every 64 MiB and
-final hashing is streamed.
+Rust normally streams one tensor and 128 matrix rows at a time, with experts
+processed individually and paired HT gate/up bands handled separately.
+CUDA I4R conversion reads at most **32 × 128-row bands per host batch**,
+never crossing an expert boundary or a fused gate/up portion boundary;
+tails remain complete bands. Native CUDA further tiles each batch into
+bounded rectangles of at most 256 independent 128×128 blocks. Neither
+layer queues a whole tensor or all experts. The n-gram table uses 8,192-row
+chunks and two passes; raw copies/hashes use at most 8 MiB chunks.
+HGN/GGUF decoding uses bounded source windows, not an intermediate decoded
+HF checkpoint or temporary full model. HF uses windowed mmap reads with
+eviction hints; output dirty data is synced/evicted every 64 MiB and final
+hashing is streamed.
 
 Generated rotations are retained as F32 vectors across conversion/verification.
 They are not all “small”: HT43's per-expert signs/scales require roughly
@@ -460,17 +479,21 @@ They are not all “small”: HT43's per-expert signs/scales require roughly
 import decoder scratch and native per-worker trellis scratch are additional.
 These are working-set bounds, not an exact RSS guarantee for every allocator/OS.
 
-Default `--ht-backend cpu --threads 1` is deliberate. `--threads` controls
-only CPU HT workers (1–64), not HIP or CUDA. During conversion, either GPU
-backend accelerates HT3/HT4 trellis search; rotation preparation/application,
-all non-HT encoders, source import decoding/I/O and sidecar resolution remain
-on CPU. GPU selection does not change the explicit matching-sidecar rules
-or permit stock-checkpoint fallback. GPU encoding supports beams 1–256;
-exact beam 0/full-state search and larger library-only beams require CPU.
-Requesting HIP or CUDA without its feature, a compatible device, or a working
-runtime is an error, never a silent CPU fallback. Real conversion preflights
-the selected GPU before creating staging output; metadata-only inspect/plan
-do not initialize a GPU.
+Default `--ht-backend cpu --i4r-backend cpu --threads 1` is deliberate.
+`--threads` controls only CPU HT workers (1–64), not HIP or CUDA. HIP/CUDA
+HT encoding accelerates HT3/HT4 trellis search; HT row-scale preparation and
+forward rotation application remain on CPU. **CUDA I4R is the non-HT encoder
+exception:** both axes of the full forward rotation and I4R quantization
+run on GPU, without a CPU rotation pass. Sign generation, all other encoders,
+source import decoding/I/O and sidecar resolution remain on CPU.
+GPU selection does not change matching-sidecar rules or permit
+stock-checkpoint fallback. GPU HT encoding supports beams 1–256; exact
+beam 0/full-state search and larger library-only beams require CPU.
+Requesting either GPU encoder without its feature, a compatible device or
+working runtime is an error, never a silent CPU fallback; CUDA I4R failures
+also propagate rather than retrying on CPU. Real conversion preflights both
+selected encoders before creating staging output; inspect/plan do not
+initialize a GPU.
 
 HIP uses device 0 (respecting `HIP_VISIBLE_DEVICES`) and a least-priority
 stream. Encoding uses 64 tiles per batch and a reusable **27,607,808-byte
@@ -485,20 +508,23 @@ CUDA uses visible device 0 (`CUDA_VISIBLE_DEVICES` applies), restoring the
 caller's current device after each call. Calls are synchronous and
 mutex-serialized within persistent encoder/decoder contexts; concurrent
 callers do not create parallel GPU queues. Codebooks are cached by content,
-not pointer identity. Encoding batches adapt to beam/bits, capped at 512
-tiles, using **135,141,376 bytes** of reusable device storage; independent
-lazy decode storage uses **55,115,776 bytes**. Runtime/driver memory is
-additional. GPU selection does not manage serving processes or reserve
-device headroom; run qualification and conversion only where contention
-and memory use are safe.
+not pointer identity. HT encoding batches adapt to beam/bits, capped at 512
+tiles, using **135,141,376 bytes** of reusable device storage. Independent
+lazy decode storage uses **55,115,776 bytes**, and lazy I4R encoding storage
+uses **52,756,488 bytes**. All three together total **243,013,640 bytes**;
+these are native workspace bytes, excluding CUDA context/runtime/driver
+memory and host buffers, not a total device-memory or RSS guarantee.
+I4R-only encoding does not allocate the HT workspace. GPU selection does
+not manage serving processes or reserve device headroom; run qualification
+and conversion only where contention and memory use are safe.
 
-The manifest records `options.ht_backend`; an omitted field in an older
-schema-2 manifest means CPU. This encoder provenance is separate from the
-verification-time `--decode-backend` choice, which does not rewrite it.
-CPU-only builds can verify HIP- or CUDA-produced output without a GPU.
-Container bytes must match the same-toolchain CPU reference; the manifest
-legitimately differs in backend metadata. Changing backends does not resume
-an unfinished conversion.
+The manifest records per-encoder `options.ht_backend` and
+`options.i4r_backend`; either omitted field in an older schema-2 manifest
+means CPU. These provenance fields are separate from verification-time
+`--decode-backend`, which does not rewrite them. CPU-only builds can verify
+HIP- or CUDA-produced output without a GPU. Container bytes must match the
+same-toolchain CPU reference; the manifest legitimately differs in backend
+metadata. Changing backends does not resume an unfinished conversion.
 
 The BF16 source is approximately 360 GB. Including n-gram and vision, outputs
 are approximately **119 GB for v2** or **110 GB for HT43** (decimal, excluding
@@ -525,18 +551,38 @@ with input fingerprints, complete output/metadata/rotation/padding
 fingerprints, and per-sample timings.
 Timing includes public encoding, validation, codec allocations and rotation,
 but excludes input loading, sign/row-RMS preparation, hashing and destruction.
-It caps input bands and retained outputs, reads only selected HF BF16 bands,
-and checks equality across iterations, samples, worker counts and backends.
+It caps each input at 8,388,608 values and retained outputs at 128 MiB,
+reads only selected HF BF16 bands, and checks equality across iterations,
+samples, worker counts and backends. I4R additionally compares code and scale
+bytes to concatenated single-band CPU encoding, outside the timed region.
 
-Samples distinguish `selected_backend` from `effective_backend`: non-HT
-codecs always execute on CPU, even on a GPU-selected axis. Their
-`timed_region.gpu_host_device_copies_and_synchronization` is false;
-it is true only for effective HIP/CUDA HT encoding.
+`--backends cpu|hip|cuda` is the HT-only axis; I4R uses the independent
+`--i4r-backends cpu|cuda` axis (both default to CPU). `--i4r-bands 1..=32`
+defaults to 1 and sets the number of contiguous 128-row bands encoded in
+**one public call**, not the number of calls or a whole-model batch.
+The input-value cap still applies: 32 bands fit at 256 columns, but not at
+2560 columns. For real expert data, select rows wholly within one expert
+and gate/up portion. I4R has no HT beam/thread search axis.
+
+Samples retain HT `selected_backend`, add I4R `selected_i4r_backend` and
+`i4r_bands_per_call`, and report the actual `effective_backend`.
+Non-HT codecs other than explicitly selected CUDA I4R stay on CPU even
+on a GPU-selected HT axis. Their
+`timed_region.gpu_host_device_copies_and_synchronization` is false; it is
+true for effective HIP/CUDA HT or CUDA I4R encoding.
 `timed_region.gpu_device_preflight` is always false. The run record's
-`gpu_preflight` array contains `{backend, elapsed_ns}` for each selected GPU,
-including a non-HT-only run; `gpu_preflight_before_samples` and `gpu_timing`
-describe that separate startup cost and the measured scope. This replaces
-the schema-1 HIP-specific timing fields; consumers must use schema 2.
+`gpu_preflight` array reports `{backend, elapsed_ns}` separately for each
+selected HT GPU, including a non-HT-only run; the independent CUDA I4R entry
+also has `encoding: "i4r"`. `gpu_preflight_before_samples` and `gpu_timing`
+describe startup cost and measured scope. Schema 2 replaces the schema-1
+HIP-specific timing fields.
+
+Rates below are **million input values/second (Mvalues/s)**, calculated as
+`values_per_call / (median_ms × 1000)`, not encoded bytes/second.
+Paired HT calls count both projections (655,360 values at 128×2560 each);
+single bands count 327,680 values. Historical rates are approximate,
+derived from their displayed rounded median times. Multi-iteration samples
+report average elapsed time per call before taking the sample median.
 
 ```sh
 CARGO_BUILD_JOBS=1 cargo build --release --locked --example encoder_bench
@@ -564,15 +610,15 @@ The harness itself does not compare separate processes/revisions.
 Measured against `a0157bf` on Frame's Ryzen AI MAX+ 395, Rust 1.98.1,
 GCC 16.2.1, normal release flags, CPUs 10/11, beam 128:
 
-| Case | Baseline median ms (range) | Optimized median ms (range) | Throughput ratio |
-| --- | ---: | ---: | ---: |
-| Real Blackfrost HT4 | 6790 (5948–7682) | 4529 (3936–4928) | 1.50× |
-| Real Blackfrost HT3 | 3800 (3399–5286) | 2802 (2625–3561) | 1.36× |
-| Real Blackfrost HT4 gate/up | 12773 (11439–13919) | 9333 (8676–9695) | 1.37× |
-| Real Blackfrost HT3 gate/up | 7121 (6728–7708) | 5728 (5098–6448) | 1.24× |
-| Synthetic I4R | 15.681 (13.378–17.842) | 6.754 (5.994–7.653) | 2.32× |
-| Synthetic Q6G64 | 2.426 (2.340–2.782) | 2.320 (2.040–2.636) | 1.05× |
-| Synthetic Q8G64 | 2.053 (1.935–3.983) | 1.820 (1.696–2.420) | 1.13× |
+| Case | Baseline median ms (range) | Optimized median ms (range) | Baseline Mvalues/s | Optimized Mvalues/s | Throughput ratio |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Real Blackfrost HT4 | 6790 (5948–7682) | 4529 (3936–4928) | 0.0483 | 0.0724 | 1.50× |
+| Real Blackfrost HT3 | 3800 (3399–5286) | 2802 (2625–3561) | 0.0862 | 0.1169 | 1.36× |
+| Real Blackfrost HT4 gate/up | 12773 (11439–13919) | 9333 (8676–9695) | 0.0513 | 0.0702 | 1.37× |
+| Real Blackfrost HT3 gate/up | 7121 (6728–7708) | 5728 (5098–6448) | 0.0920 | 0.1144 | 1.24× |
+| Synthetic I4R | 15.681 (13.378–17.842) | 6.754 (5.994–7.653) | 20.897 | 48.516 | 2.32× |
+| Synthetic Q6G64 | 2.426 (2.340–2.782) | 2.320 (2.040–2.636) | 135.070 | 141.241 | 1.05× |
+| Synthetic Q8G64 | 2.053 (1.935–3.983) | 1.820 (1.696–2.420) | 159.610 | 180.044 | 1.13× |
 
 Real bands are 128×2560 per projection, two HT workers, four samples per
 revision, from Blackfrost revision `3e30d25ddb0e802389d62e55e9ff31ad05f0c96e`.
@@ -628,12 +674,12 @@ Measured on Frame before unloading production Halogen: real Blackfrost
 128×2560 bands, beam 128, CPUs 10/11, two CPU workers, four warm samples per
 backend/case across CPU→HIP and HIP→CPU process orders:
 
-| Case | CPU median ms (range) | HIP median ms (range) | Throughput ratio |
-| --- | ---: | ---: | ---: |
-| HT4 | 3128 (3085–3476) | 862 (423–1327) | 3.63× |
-| HT3 | 2120 (2024–2243) | 450 (301–666) | 4.71× |
-| HT4 gate/up | 6460 (6119–6966) | 845 (844–847) | 7.64× |
-| HT3 gate/up | 4336 (4035–5146) | 914 (601–1273) | 4.74× |
+| Case | CPU median ms (range) | HIP median ms (range) | CPU Mvalues/s | HIP Mvalues/s | Throughput ratio |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| HT4 | 3128 (3085–3476) | 862 (423–1327) | 0.1048 | 0.3801 | 3.63× |
+| HT3 | 2120 (2024–2243) | 450 (301–666) | 0.1546 | 0.7282 | 4.71× |
+| HT4 gate/up | 6460 (6119–6966) | 845 (844–847) | 0.1014 | 0.7756 | 7.64× |
+| HT3 gate/up | 4336 (4035–5146) | 914 (601–1273) | 0.1511 | 0.7170 | 4.74× |
 
 All 64 timing samples (including the separate one-worker axis) matched
 complete input/output fingerprints across processes. The public corpus
@@ -644,16 +690,18 @@ The shared GPU was not idle: wide HIP ranges reflect contention, and the
 unusually tight paired-HT4 subset must not be generalized. No full-model
 GPU conversion or inference qualification was performed.
 
-### NVIDIA CUDA backend
+### NVIDIA CUDA HT backend — historical qualification
 
-CUDA uses the same beam, CPU selection permutation, strict ties and separate
-binary32 operations; it does not trade precision or search width for speed.
-Bounded qualification on 2026-10-12 used CUDA 12.0.140, GCC 12.4.0,
-Rust 1.98.1 and driver 595.91.07 on the workhorse RTX 4090 Laptop GPU
-(`sm_89`). The source encoder SHA-256 was
+HT CUDA uses the same beam, CPU selection permutation, strict ties and
+separate binary32 operations; it does not trade precision or search width
+for speed. The historical bounded HT encoding/GPU decoding qualification
+on 2026-10-12 used CUDA 12.0.140, GCC 12.4.0, Rust 1.98.1 and driver
+595.91.07 on the workhorse RTX 4090 Laptop GPU (`sm_89`). Its source encoder
+SHA-256 was
 `905faf22ddf6d22bc227132c2b07f54d2bfd2d85266909539192a31234ef1788`,
-matching Frame. Different toolchains/devices still require qualification;
-the HIP measurements above are separate from these CUDA observations.
+matching Frame at that revision. These results predate the integrated CUDA
+I4R encoder and do not qualify it. Different toolchains/devices still
+require qualification; HIP measurements above are separate observations.
 
 ```sh
 CXX=g++-12 NVCC=nvcc CARGO_TARGET_DIR=/tmp/bf16-hgn-cuda-target CARGO_BUILD_JOBS=1 \
@@ -667,20 +715,21 @@ $CUDA_BENCH --suite corpus --backends cpu,cuda --threads 1,2 \
 Observed median public-encoding times for synthetic 128 × 2560 bands,
 beam 128, one CPU thread, three samples after one warmup:
 
-| Case | CPU median (ms) | CUDA median (ms) | CPU/CUDA ratio |
-| --- | ---: | ---: | ---: |
-| HT3 | 8977.939 | 120.974 | 74.2× |
-| HT4 | 10942.228 | 197.998 | 55.3× |
-| HT3 pair | 14237.961 | 222.159 | 64.1× |
-| HT4 pair | 27443.945 | 409.626 | 67.0× |
+| Case | CPU median (ms) | CUDA median (ms) | CPU Mvalues/s | CUDA Mvalues/s | CPU/CUDA ratio |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| HT3 | 8977.939 | 120.974 | 0.0365 | 2.709 | 74.2× |
+| HT4 | 10942.228 | 197.998 | 0.0299 | 1.655 | 55.3× |
+| HT3 pair | 14237.961 | 222.159 | 0.0460 | 2.950 | 64.1× |
+| HT4 pair | 27443.945 | 409.626 | 0.0239 | 1.600 | 67.0× |
 
 Paired cases encode two such bands. All timed CPU/CUDA samples were
 bit-identical. The timed region includes public validation, codec allocation,
 rotation and synchronous GPU copies/kernels; it excludes source I/O, input
-setup, device preflight, hashing and output destruction. Preflight is reported
-separately; use a fresh process with `--backends cuda --warmup 0` for
-first-encoding cost and add its reported preflight for startup-inclusive
-cost. Warm samples reuse native storage/codebooks.
+setup, device preflight, hashing and output destruction. This run's CUDA
+preflight took **163.134074 ms**, separately from the table. Use a fresh
+process with `--backends cuda --warmup 0` for first-encoding cost and add its
+reported preflight for startup-inclusive cost. Warm samples reuse native
+storage/codebooks.
 
 These observations came from a **shared Ubuntu VM and GPU**, not an isolated
 throughput run. An unrelated `render_raytracing` process was observed after
@@ -691,6 +740,137 @@ speedups. All services were untouched. Matching driver userspace was
 isolated for qualification, with no global driver/package or `ldconfig`
 changes. Local evidence (not a durable publication) is retained at
 `/tmp/bf16-hgn-cuda-crosshost/workhorse/qualification-summary.json`.
+
+### NVIDIA CUDA I4R encoder
+
+The integrated I4R path performs the complete forward Hadamard rotation
+on GPU with ordered FP64 butterflies, then the same signed-extreme scale
+search, F16 rounding, nearest-even codes, sequential FP64 error sums and
+strict first-wins ties as CPU. CPU remains the default; selecting CUDA
+does not reduce precision or fall back to CPU.
+
+Use the CUDA benchmark build above for these recipes. The one- and 16-band
+synthetic timing cases were exercised in the qualification reported below:
+
+```sh
+# Synthetic correctness corpus, independent of the HT backend axis.
+$CUDA_BENCH --suite corpus --cases i4r --backends cpu \
+  --i4r-backends cpu,cuda --i4r-bands 1 --threads 1
+# Synthetic public-call timings; includes full rotation and synchronous copies.
+$CUDA_BENCH --cases i4r --cols 2560 --backends cpu \
+  --i4r-backends cpu,cuda --i4r-bands 1 --threads 1 \
+  --iterations 1 --repetitions 3 --warmup 1
+# Synthetic 16-band public-call timing, matching the measured batch geometry.
+$CUDA_BENCH --cases i4r --cols 2560 --backends cpu \
+  --i4r-backends cpu,cuda --i4r-bands 16 --threads 1 \
+  --iterations 1 --repetitions 3 --warmup 1
+# 32-band synthetic batching case; narrower columns keep input below the cap.
+$CUDA_BENCH --cases i4r --cols 256 --backends cpu \
+  --i4r-backends cpu,cuda --i4r-bands 32 --threads 1 \
+  --iterations 1 --repetitions 3 --warmup 1
+# Real BF16 gate portion: five 128-row bands of one expert, not synthetic input.
+$CUDA_BENCH --hf /path/to/hf-bf16 \
+  --tensor model.language_model.layers.0.mlp.experts.gate_up_proj \
+  --row-start 0 --cases i4r --backends cpu --i4r-backends cpu,cuda \
+  --i4r-bands 5 --threads 1 --iterations 1 --repetitions 3 --warmup 1
+```
+
+Preflight and the single-band CPU byte oracle are untimed; warm samples
+reuse native workspace. Use a fresh process with
+`--i4r-backends cuda --warmup 0` for first-encode cost and add reported I4R
+preflight for startup-inclusive cost. The HT beam setting does not affect
+I4R. The 32-band and contiguous five-band real-input commands above are
+recipes, not the geometries measured in the following table.
+
+Bounded **integrated production-code** qualification on the workhorse CUDA
+host on 2026-10-12 used the RTX 4090 Laptop GPU (`sm_89`), CUDA 12.0.140,
+GCC 12.4.0, Rust 1.98.1 and driver 595.91.07, under a two-CPU quota,
+4 GiB memory cap and no swap. Encoder source SHA-256 was
+`a59f3218829380ad2f96b9ccc10fa6f1a9785aab4e74b6c157746c3a7c1b1100`.
+These observations use the production public encoder, not the earlier
+standalone prototype:
+
+| Synthetic geometry per call | CPU median (ms) | CUDA median (ms) | CPU Mvalues/s | CUDA Mvalues/s | CPU/CUDA ratio |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 band, 128×2560 | 4.571640 | 0.422171 | 71.677 | 776.178 | 10.83× |
+| 16 bands, 2048×2560 | 109.438385 | 5.552646 | 47.907 | 944.213 | 19.71× |
+
+Both cases used one CPU thread, three repetitions after one warmup, and
+byte-identical CPU/CUDA fingerprints. Timings include public validation,
+allocation, the full forward rotation, quantization and synchronous GPU
+H2D/kernel/D2H copies; they exclude input loading/I/O, input/sign preparation,
+converter setup/output writes/hashing, GPU preflight and the CPU byte oracle.
+Their separate CUDA preflights took **94.482573 ms** (one band) and
+**91.161707 ms** (16 bands); neither is included in the medians.
+The host/GPU were shared; these are bounded warm public-call measurements,
+not isolated whole-model conversion or inference speedups.
+
+Nine retained real Orca gate/up/down bands also matched both CUDA and the
+retained Frame CPU code/scale hashes. Their signs were the benchmark's
+seed-123 signs, restarted per band, **not production full-tensor signs**.
+The retained extracted inputs/signs were hash-checked; upstream model-shard
+provenance was retained, not reverified. This is real-data encoder evidence,
+not full-model fidelity or inference-quality qualification.
+
+The same integrated encoder also measured these real inputs, one public
+call per sample, **six repetitions after two CPU/CUDA warmup pairs**.
+Timed order alternated CPU→CUDA and CUDA→CPU (three pairs each way).
+The harness passed `threads=2`, but production CPU I4R rotation/quantization
+is serial; this is not a two-thread speedup. I4R has no beam search.
+All rows use the same complete-call timing boundary above, with output
+destruction/hash comparison and batch construction outside timing; CUDA
+preflight was separately **125.294505 ms**.
+
+| Real Orca band (layer / expert / projection / flattened row start) | Geometry per call | CPU median (ms) | CUDA median (ms) | CPU Mvalues/s | CUDA Mvalues/s | CPU/CUDA ratio |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 0 / 0 / gate / 0 | 128×2560 | 8.1091755 | 0.6013525 | 40.409 | 544.905 | 13.48× |
+| 0 / 0 / up / 640 | 128×2560 | 13.8168715 | 1.0813485 | 23.716 | 303.029 | 12.78× |
+| 0 / 0 / down / 0 | 128×640 | 2.3486050 | 0.2503545 | 34.880 | 327.216 | 9.38× |
+| 23 / 255 / gate / 326400 | 128×2560 | 14.9540965 | 1.2237065 | 21.912 | 267.777 | 12.22× |
+| 23 / 255 / up / 327040 | 128×2560 | 14.2310365 | 1.0858435 | 23.026 | 301.775 | 13.11× |
+| 23 / 255 / down / 654080 | 128×640 | 3.4466350 | 0.3005510 | 23.768 | 272.566 | 11.47× |
+| 47 / 511 / gate / 654080 | 128×2560 | 13.3696520 | 0.9136140 | 24.509 | 358.664 | 14.63× |
+| 47 / 511 / up / 654720 | 128×2560 | 11.9377735 | 0.6846490 | 27.449 | 478.610 | 17.44× |
+| 47 / 511 / down / 1310592 | 128×640 | 2.1410865 | 0.2128100 | 38.261 | 384.944 | 10.06× |
+| Gate band 0 / 0 / 0 repeated 16 times | 2048×2560 | 119.5972420 | 7.4305140 | 43.838 | 705.588 | 16.10× |
+
+The last row is **16 copies of one retained real band in one call**
+(5,242,880 values), not 16 distinct bands or a contiguous real expert
+slice. Every measured code/scale plane matched CPU; the nine original bands
+also matched their retained Frame oracles.
+
+For the nine original bands only (2,211,840 values), summing corresponding
+repetition-index timings across independently warmed cases and then taking
+each backend's median gives **85.9036895 ms CPU / 6.8872210 ms CUDA**,
+or **25.748 / 321.151 Mvalues/s**, a **12.47×** ratio.
+This is a **median of six index-wise sums, not a continuously timed
+nine-band pass**, and excludes the repeated 16-band case. The real-band
+times vary substantially on the shared, uncontrolled host/GPU; they neither
+establish isolated performance nor a comparison with the earlier prototype,
+and are not full-converter, full-model or inference speed measurements.
+
+The earlier CUDA all-target suite passed 182 tests (20 ignored); all 19
+selected opt-in device tests passed. The final Frame CPU all-target suite
+passed **186 tests (1 ignored)**, including the fixture alignment regression.
+The earlier HIP-feature suite passed 182 (15 ignored; HIP device tests were
+not run); the corrected fixture's rebuilt GPU smokes also passed.
+I4R-only and dual HT/I4R CUDA tiny conversions each produced three
+byte-identical CPU/CUDA containers. Complete CPU/CUDA numerical verification
+reports matched, and feature-free CPU executables verified both outputs.
+The public CLI retained architecture rejection; these genuine structural
+fixtures are not architecture-valid full models or engine-loadable weights.
+
+Actual `encode I4R on CPU` and `encode I4R on CUDA` progress labels were
+observed in 120-column PTYs using a disclosed 60 ms `strace` delay on `lseek`
+to expose short stages. Delayed stdout matched undelayed stdout; those
+delayed runs are display checks, not performance measurements.
+
+The qualification archive is retained locally at
+`/home/quaternion/models/i4r-cuda-production-qualification-20261012T073944Z/qualification-evidence.tar.gz`
+(`evidence/qualification-summary.json` and `evidence/real-band-summary.json`).
+Prototype figures and the historical HT table do not establish I4R production
+performance. No entire-model conversion, deployment, inference-quality or
+inference-throughput claim follows from these bounded checks.
 
 ## Bounded structural checks
 
@@ -743,8 +923,11 @@ published CPU/HIP HGN containers and independently verifies both conversions.
 These structural fixtures are deliberately not engine-loadable models.
 
 The existing example name is retained; `--backend hip` is its default and
-`--backend cuda` selects CUDA. These commands exercise the bounded checks
-demonstrated on the workhorse CUDA host above; use a compatible device:
+`--backend cuda` selects the retained CUDA output and default HT encoder.
+`--ht-backend cpu --i4r-backend cuda` selects I4R-only CUDA; omitting that
+HT override selects dual HT/I4R CUDA. Adding `--i4r-backend cuda` enables
+an actual I4R matrix in the fixture. The I4R-only and dual paths were
+exercised in the bounded qualification above; use a compatible device:
 
 ```sh
 CXX=g++-12 NVCC=nvcc CARGO_TARGET_DIR=/tmp/bf16-hgn-cuda-target CARGO_BUILD_JOBS=1 \
@@ -756,6 +939,25 @@ CXX=g++-12 NVCC=nvcc CARGO_TARGET_DIR=/tmp/bf16-hgn-cuda-target CARGO_BUILD_JOBS
 CUDA_VISIBLE_DEVICES=-1 CARGO_TARGET_DIR=/tmp/bf16-hgn-cpu-target CARGO_BUILD_JOBS=1 \
   cargo run --release --locked --example tiny_hip_conversion \
   -- --backend cuda --root /tmp/tiny-cuda-conversion --verify-only
+
+# I4R-only CUDA encoding and CUDA decoding, in a separate new fixture root.
+CXX=g++-12 NVCC=nvcc CARGO_TARGET_DIR=/tmp/bf16-hgn-cuda-target CARGO_BUILD_JOBS=1 \
+  cargo run --release --locked --features cuda --example tiny_hip_conversion \
+  -- --backend cuda --ht-backend cpu --i4r-backend cuda \
+  --decode-backend cuda --root /tmp/tiny-i4r-only-cuda
+CUDA_VISIBLE_DEVICES=-1 CARGO_TARGET_DIR=/tmp/bf16-hgn-cpu-target CARGO_BUILD_JOBS=1 \
+  cargo run --release --locked --example tiny_hip_conversion \
+  -- --backend cuda --ht-backend cpu --i4r-backend cuda \
+  --root /tmp/tiny-i4r-only-cuda --verify-only
+
+# Dual HT/I4R CUDA encoding; independently verify using a CPU-only executable.
+CXX=g++-12 NVCC=nvcc CARGO_TARGET_DIR=/tmp/bf16-hgn-cuda-target CARGO_BUILD_JOBS=1 \
+  cargo run --release --locked --features cuda --example tiny_hip_conversion \
+  -- --backend cuda --i4r-backend cuda --decode-backend cuda \
+  --root /tmp/tiny-dual-cuda
+CUDA_VISIBLE_DEVICES=-1 CARGO_TARGET_DIR=/tmp/bf16-hgn-cpu-target CARGO_BUILD_JOBS=1 \
+  cargo run --release --locked --example tiny_hip_conversion \
+  -- --backend cuda --i4r-backend cuda --root /tmp/tiny-dual-cuda --verify-only
 
 # Full device candidate permutations and forced heap fallback; arch 89.
 nvcc -ccbin g++-12 -std=c++17 -O3 \
@@ -773,11 +975,12 @@ with either decoder. `--backend` identifies the retained output, while
 Ignored CUDA tests include
 `cuda_tiny_conversion_matches_cpu_all_containers_and_verifies` and
 `cuda_full_verification_reports_match_cpu_bitwise`, alongside native encoding/
-decoding fidelity cases. On 2026-10-12, workhorse passed 167 nonignored
-all-target tests and all 14 CUDA device tests. Frame passed 170 CPU tests
-(1 ignored) and 167 HIP-feature tests (15 ignored; HIP GPU tests were not
-run). The independent full-model stock oracle remained outside this CUDA
-qualification.
+decoding fidelity cases. In the historical HT qualification on 2026-10-12,
+workhorse passed 167 nonignored all-target tests and all 14 then-existing
+CUDA device tests. Frame passed 170 CPU tests (1 ignored) and 167 HIP-feature
+tests (15 ignored; HIP GPU tests were not run). These counts predate the
+integrated I4R encoder; the independent full-model stock oracle remained
+outside that CUDA qualification.
 
 The CUDA selection regression passed 5,896 cases with permutation fingerprint
 `1e1a514d2974fd0f`, matching Frame GCC 16. All 196 CPU/CUDA corpus samples
@@ -821,6 +1024,13 @@ throughput. A full v2 conversion is not evidence for HT43 qualification.
 
 ## Changes
 
+- Added opt-in `--i4r-backend cuda`, independent of HT encoding and runtime
+  verification selection, with per-encoder provenance and CPU defaults.
+  The full I4R forward rotation and quantizer run on GPU without CPU fallback;
+  conversion batches at most 32 bands within expert/portion boundaries.
+  Added independent I4R benchmark/backend/batch axes and tiny I4R-only/dual
+  CUDA acceptance coverage; recorded integrated encoder fidelity and bounded
+  timings separately from historical HT and prototype results.
 - Added opt-in CUDA HT3/HT4 encoding and I4R/HT3/HT4 verification with explicit
   feature/device errors, preserved CPU defaults and separate encoder
   provenance versus verification-backend selection.
@@ -852,7 +1062,7 @@ throughput. A full v2 conversion is not evidence for HT43 qualification.
   explicit backend provenance and CPU-only verification of HIP output.
 - Added CPU/GPU differential benchmarks, native selection regressions and
   real tiny GPU conversion/publication/verification coverage. CPU remains
-  the default; non-HT GPU quantizers are not implemented.
+  the default; HIP has no non-HT quantizer, while CUDA now also supports I4R.
 
 - Added byte-preserving AVX2 HT transitions, exact packed candidate ordering
   and bounded I4R/Q6/Q8 rounding, with scalar/portable fallbacks.

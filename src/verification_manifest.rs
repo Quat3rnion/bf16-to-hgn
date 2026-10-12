@@ -1,5 +1,5 @@
 use crate::{
-    codec::HtBackend,
+    codec::{HtBackend, I4rBackend},
     hf,
     manifest::{AssetRecord, ContainerRecord, Manifest, Options, OutputProfile, SourceRecord},
     source::SourceKind,
@@ -99,6 +99,7 @@ pub(crate) fn read_manifest(
                     threads: legacy.options.threads,
                     ht_beam: legacy.options.ht_beam,
                     ht_backend: HtBackend::Cpu,
+                    i4r_backend: I4rBackend::Cpu,
                 },
                 source_kind: SourceKind::Hf,
                 source_provenance: None,
@@ -113,17 +114,19 @@ pub(crate) fn read_manifest(
         Some(2) => {
             let current = Manifest::deserialize(&json).context("invalid conversion manifest")?;
             // The writer's shared serde types ignore unknown fields. Reject
-            // those recursively, preserving only the existing schema-2
-            // exception for manifests written before ht_backend selection.
+            // those recursively, permitting backend omissions only for older
+            // schema-2 writers; both absent selections reconstruct as CPU.
             let mut canonical = serde_json::to_value(&current)?;
-            if json["options"]
-                .as_object()
-                .is_some_and(|options| !options.contains_key("ht_backend"))
-            {
-                canonical["options"]
-                    .as_object_mut()
-                    .expect("serialized Options is an object")
-                    .remove("ht_backend");
+            for field in ["ht_backend", "i4r_backend"] {
+                if json["options"]
+                    .as_object()
+                    .is_some_and(|options| !options.contains_key(field))
+                {
+                    canonical["options"]
+                        .as_object_mut()
+                        .expect("serialized Options is an object")
+                        .remove(field);
+                }
             }
             ensure!(canonical == json, "unknown or noncanonical manifest fields");
             ensure!(current.tool == "bf16-to-hgn", "unexpected manifest tool");

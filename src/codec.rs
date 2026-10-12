@@ -90,8 +90,8 @@ pub fn q4c_codebook() -> [f32; 16] {
     NF4_CODEBOOK
 }
 /// Encoding backend for HT3/HT4 trellis search only.
-/// Encoding rotations and other quantizers remain on CPU. Verification selects
-/// its independent decode backend through [`crate::verify_gpu::DecodeBackend`].
+/// Encoding rotations remain on CPU. I4R chooses its independent backend through
+/// [`I4rBackend`], and verification through [`crate::verify_gpu::DecodeBackend`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum HtBackend {
@@ -102,7 +102,7 @@ pub enum HtBackend {
 }
 
 impl HtBackend {
-    /// Device family used by HT trellis search; all other codecs stay on CPU.
+    /// Device family used by HT trellis search only.
     pub const fn label(self) -> &'static str {
         match self {
             Self::Cpu => "CPU",
@@ -149,6 +149,51 @@ impl HtBackend {
     }
 }
 
+/// Encoding backend for the complete I4R rotation and quantization pipeline.
+/// This selection is independent of HT trellis search and verification.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum I4rBackend {
+    #[default]
+    Cpu,
+    Cuda,
+}
+
+impl I4rBackend {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU",
+            Self::Cuda => "CUDA",
+        }
+    }
+
+    pub const fn is_gpu(self) -> bool {
+        matches!(self, Self::Cuda)
+    }
+
+    /// Validate I4R device availability without allocating an HT workspace.
+    pub fn preflight(self) -> Result<()> {
+        match self {
+            Self::Cpu => Ok(()),
+            Self::Cuda => {
+                #[cfg(feature = "cuda")]
+                {
+                    // SAFETY: preflight takes no pointers and synchronizes native context access.
+                    let result = unsafe { hgn_cuda_i4r_preflight() };
+                    ensure!(
+                        result == 0,
+                        "CUDA I4R preflight failed: {}",
+                        cuda_last_error()
+                    );
+                    Ok(())
+                }
+                #[cfg(not(feature = "cuda"))]
+                bail!("CUDA I4R backend requires a build with --features cuda");
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct QuantMeta<'a> {
     /// Input signs for the current matrix/expert; exactly `cols` values.
@@ -161,6 +206,7 @@ pub struct QuantMeta<'a> {
     pub threads: usize,
     pub ht_beam: usize,
     pub ht_backend: HtBackend,
+    pub i4r_backend: I4rBackend,
 }
 
 impl Default for QuantMeta<'_> {
@@ -173,6 +219,7 @@ impl Default for QuantMeta<'_> {
             threads: 1,
             ht_beam: 128,
             ht_backend: HtBackend::Cpu,
+            i4r_backend: I4rBackend::Cpu,
         }
     }
 }
@@ -760,6 +807,16 @@ unsafe extern "C" {
     ) -> c_int;
     fn ht_cuda_last_error() -> *const std::ffi::c_char;
     fn ht_cuda_preflight() -> c_int;
+    fn hgn_cuda_i4r_preflight() -> c_int;
+    fn hgn_cuda_encode_i4r(
+        src: *const f32,
+        su: *const f32,
+        sv: *const f32,
+        codes: *mut u8,
+        scales: *mut u8,
+        bands: c_int,
+        cols: c_int,
+    ) -> c_int;
 }
 
 #[cfg(feature = "cuda")]
@@ -773,6 +830,63 @@ fn cuda_last_error() -> String {
     unsafe { std::ffi::CStr::from_ptr(error) }
         .to_string_lossy()
         .into_owned()
+}
+
+fn native_i4r_shape(rows: usize, cols: usize) -> Result<(c_int, c_int)> {
+    ensure!(
+        rows > 0 && cols > 0 && rows % 128 == 0 && cols % 128 == 0,
+        "I4R encoding requires complete 128-by-128 blocks"
+    );
+    let count = rows
+        .checked_mul(cols)
+        .context("CUDA I4R matrix element count overflow")?;
+    ensure!(
+        count <= isize::MAX as usize / std::mem::size_of::<f32>(),
+        "CUDA I4R block exceeds addressable buffer size"
+    );
+    let bands =
+        c_int::try_from(rows / 128).context("CUDA I4R band count exceeds signed-int range")?;
+    let cols = c_int::try_from(cols).context("CUDA I4R column count exceeds signed-int range")?;
+    Ok((bands, cols))
+}
+
+fn encode_i4r_cuda(
+    input: &[f32],
+    meta: &QuantMeta<'_>,
+    bands: c_int,
+    cols: c_int,
+) -> Result<EncodedBlock> {
+    #[cfg(feature = "cuda")]
+    {
+        let mut codes = vec![0; input.len() / 2];
+        let mut scales = vec![0; input.len() / 64];
+        // SAFETY: shape, finite source values, and complete +/-1 sign planes
+        // were checked before this call. Exclusive output planes have exactly
+        // values/2 and values/64 bytes. Native CUDA synchronizes before return
+        // and retains no host pointers; failed output is never exposed.
+        let result = unsafe {
+            hgn_cuda_encode_i4r(
+                input.as_ptr(),
+                meta.su.as_ptr(),
+                meta.sv.as_ptr(),
+                codes.as_mut_ptr(),
+                scales.as_mut_ptr(),
+                bands,
+                cols,
+            )
+        };
+        ensure!(
+            result == 0,
+            "CUDA I4R encoding failed: {}",
+            cuda_last_error()
+        );
+        Ok(EncodedBlock { codes, scales })
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (input, meta, bands, cols);
+        bail!("CUDA I4R backend requires a build with --features cuda");
+    }
 }
 
 fn validate_ht_backend(meta: &QuantMeta<'_>) -> Result<()> {
@@ -943,8 +1057,9 @@ fn encode_ht_tiles(tiles: &[f32], meta: &QuantMeta<'_>, bits: usize) -> Result<V
 }
 
 /// Encode a bounded block from ORIGINAL (not already rotated) source values.
-/// HT and I4R require exactly 128 rows. The caller passes the appropriate
-/// sv slice and never crosses an expert boundary within that band.
+/// HT requires exactly 128 rows; I4R accepts positive multiples of 128.
+/// The caller passes the complete row-indexed sv slice and must not cross an
+/// expert boundary, where the input signs may change.
 /// I64 must use `encode_i64` or an exact little-endian source byte copy.
 pub fn encode_rows(
     encoding: Encoding,
@@ -957,6 +1072,11 @@ pub fn encode_rows(
         ht_band_value_count(rows, cols, false)?;
         validate_ht_backend(meta)?;
     }
+    let i4r_cuda_shape = if encoding == Encoding::I4r && meta.i4r_backend == I4rBackend::Cuda {
+        Some(native_i4r_shape(rows, cols)?)
+    } else {
+        None
+    };
     let count = element_count(input, rows, cols)?;
     payload_layout(encoding, rows, cols)?;
     match encoding {
@@ -998,28 +1118,32 @@ pub fn encode_rows(
                 scales: Vec::new(),
             })
         }
-        Encoding::Ht | Encoding::Ht3 | Encoding::I4r => {
-            ensure!(
-                rows == 128,
-                "HT/I4R encoding consumes one 128-row band at a time"
-            );
-            validate_rotation(rows, cols, meta, encoding == Encoding::I4r)?;
+        Encoding::Ht | Encoding::Ht3 => {
+            validate_rotation(rows, cols, meta, false)?;
             let mut rotated = vec![0.0; count];
-            let order = if encoding.ht_bits().is_some() {
+            rotate_into(
+                input,
+                rows,
+                cols,
+                meta,
                 RotationOrder::Tiles {
                     row_tiles: 8,
                     row_tile_offset: 0,
-                }
+                },
+                &mut rotated,
+            )?;
+            Ok(EncodedBlock {
+                codes: encode_ht_tiles(&rotated, meta, encoding.ht_bits().unwrap())?,
+                scales: Vec::new(),
+            })
+        }
+        Encoding::I4r => {
+            validate_rotation(rows, cols, meta, true)?;
+            if let Some((bands, cols)) = i4r_cuda_shape {
+                encode_i4r_cuda(input, meta, bands, cols)
             } else {
-                RotationOrder::Rows
-            };
-            rotate_into(input, rows, cols, meta, order, &mut rotated)?;
-            if let Some(bits) = encoding.ht_bits() {
-                Ok(EncodedBlock {
-                    codes: encode_ht_tiles(&rotated, meta, bits)?,
-                    scales: Vec::new(),
-                })
-            } else {
+                let mut rotated = vec![0.0; count];
+                rotate_into(input, rows, cols, meta, RotationOrder::Rows, &mut rotated)?;
                 encode_i4r_rotated(&rotated)
             }
         }
@@ -1199,11 +1323,13 @@ pub fn decode_rows(
     if encoding == Encoding::I64 {
         bail!("I64 cannot be decoded losslessly to f32; compare source integer bytes");
     }
-    if encoding.ht_bits().is_some() || encoding == Encoding::I4r {
+    if encoding.ht_bits().is_some() {
         ensure!(
             rows == 128,
-            "HT/I4R decoding consumes one 128-row band at a time"
+            "HT decoding consumes one 128-row band at a time"
         );
+    }
+    if encoding.ht_bits().is_some() || encoding == Encoding::I4r {
         validate_decode_rotation(rows, cols, meta)?;
     }
     if encoding == Encoding::Q4Cp {

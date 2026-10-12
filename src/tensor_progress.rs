@@ -224,6 +224,42 @@ mod tests {
     }
 
     #[test]
+    fn i4r_multi_band_batches_report_exact_expert_and_portion_rows() {
+        let half = 35 * 128;
+        let plan = tensor(
+            "layers.7.mlp.experts.gate_up_proj.weight",
+            &[2, 2 * half, 128],
+            Encoding::I4r,
+        );
+        for expert in 0..2 {
+            for (offset, part) in [(0, Projection::Gate), (half, Projection::Up)] {
+                let start = expert * 2 * half + offset;
+                let before = row_progress(&plan, start, 32 * 128, false, false).unwrap();
+                assert_eq!(before.expert, Some((expert, 2)));
+                assert_eq!(before.part, Some(part));
+                assert_eq!((before.completed, before.total), (0, half));
+                let batch = row_progress(&plan, start, 32 * 128, true, false).unwrap();
+                assert_eq!(batch.expert, Some((expert, 2)));
+                assert_eq!(batch.part, Some(part));
+                assert_eq!((batch.completed, batch.total), (32 * 128, half));
+                let tail = row_progress(&plan, start + 32 * 128, 3 * 128, true, false).unwrap();
+                assert_eq!(tail.expert, Some((expert, 2)));
+                assert_eq!(tail.part, Some(part));
+                assert_eq!((tail.completed, tail.total), (half, half));
+            }
+        }
+        let down = tensor(
+            "layers.7.mlp.experts.down_proj.weight",
+            &[3, half, 128],
+            Encoding::I4r,
+        );
+        let tail = row_progress(&down, half + 32 * 128, 3 * 128, true, false).unwrap();
+        assert_eq!(tail.expert, Some((1, 3)));
+        assert_eq!(tail.part, None);
+        assert_eq!((tail.completed, tail.total), (half, half));
+    }
+
+    #[test]
     fn rank_three_convolution_and_flattened_unknown_matrix_are_not_experts() {
         for plan in [
             tensor(
