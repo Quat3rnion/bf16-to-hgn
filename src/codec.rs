@@ -936,6 +936,18 @@ unsafe extern "C" {
     ) -> c_int;
     fn ht_cuda_last_error() -> *const std::ffi::c_char;
     fn ht_cuda_preflight() -> c_int;
+    fn hgn_cuda_encode_ht(
+        sources: *const *const f32,
+        su: *const f32,
+        svs: *const *const f32,
+        parts: c_int,
+        codebook: *const f32,
+        symbols: *mut u8,
+        bands: c_int,
+        cols: c_int,
+        beam: c_int,
+        bits: c_int,
+    ) -> c_int;
     fn hgn_cuda_q4cp_preflight() -> c_int;
     fn hgn_cuda_encode_q4cp(
         src: *const f32,
@@ -1105,6 +1117,51 @@ fn validate_ht_backend(meta: &QuantMeta<'_>) -> Result<()> {
     Ok(())
 }
 
+/// CUDA HT with GPU rotation. `parts` are (source, row scales) pairs sharing
+/// `su`: one part of complete bands, or a gate band and an up band. Returns
+/// None when the device rejects the rotation; the caller then reruns the CPU
+/// rotation, which reports the exact error.
+#[cfg(feature = "cuda")]
+fn encode_ht_cuda_rotated(
+    parts: &[(&[f32], &[f32])],
+    su: &[f32],
+    rows: usize,
+    cols: usize,
+    meta: &QuantMeta<'_>,
+    bits: usize,
+) -> Result<Option<Vec<u8>>> {
+    let count = parts.len() * rows * cols;
+    native_ht_tile_count(count)?;
+    let sources: Vec<*const f32> = parts.iter().map(|(values, _)| values.as_ptr()).collect();
+    let scales: Vec<*const f32> = parts.iter().map(|(_, sv)| sv.as_ptr()).collect();
+    let mut symbols = vec![0u8; count];
+    // SAFETY: each part holds rows*cols finite values and rows scales, su holds
+    // cols signs (validated by the caller); symbols holds every tile's 256
+    // symbols. Native CUDA synchronizes before return and keeps no pointers.
+    let result = unsafe {
+        hgn_cuda_encode_ht(
+            sources.as_ptr(),
+            su.as_ptr(),
+            scales.as_ptr(),
+            c_int::try_from(parts.len())?,
+            ht_codebook().as_ptr(),
+            symbols.as_mut_ptr(),
+            c_int::try_from(rows / 128)?,
+            c_int::try_from(cols)?,
+            meta.ht_beam as c_int,
+            bits as c_int,
+        )
+    };
+    if result == CUDA_HT_ROTATION_REJECTED {
+        return Ok(None);
+    }
+    ensure!(result == 0, "CUDA HT encoding failed: {}", cuda_last_error());
+    Ok(Some(pack_ht_symbols(&symbols, bits)))
+}
+
+#[cfg(feature = "cuda")]
+const CUDA_HT_ROTATION_REJECTED: c_int = -6;
+
 fn pack_ht_symbols(symbols: &[u8], bits: usize) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(symbols.len() / 8 * bits);
     let mut word = 0u64;
@@ -1138,9 +1195,11 @@ fn native_ht_tile_count(value_count: usize) -> Result<c_int> {
 }
 
 fn ht_band_value_count(rows: usize, cols: usize, paired: bool) -> Result<usize> {
+    // Tiles are independent and stored band-major, so several complete
+    // bands in one call equal the concatenation of single-band calls.
     ensure!(
-        rows == 128 && cols > 0 && cols % 128 == 0,
-        "HT encoding requires one 128-row band and columns divisible by 128"
+        rows > 0 && rows % 128 == 0 && cols > 0 && cols % 128 == 0 && (!paired || rows == 128),
+        "HT encoding requires complete 128-row bands (one band when paired) and columns divisible by 128"
     );
     let count = rows
         .checked_mul(cols)
@@ -1309,6 +1368,18 @@ pub fn encode_rows(
         }
         Encoding::Ht | Encoding::Ht3 => {
             validate_rotation(rows, cols, meta, false)?;
+            #[cfg(feature = "cuda")]
+            if meta.ht_backend == HtBackend::Cuda {
+                let bits = encoding.ht_bits().unwrap();
+                if let Some(codes) =
+                    encode_ht_cuda_rotated(&[(input, meta.sv)], meta.su, rows, cols, meta, bits)?
+                {
+                    return Ok(EncodedBlock {
+                        codes,
+                        scales: Vec::new(),
+                    });
+                }
+            }
             let mut rotated = vec![0.0; count];
             rotate_into(
                 input,
@@ -1382,6 +1453,19 @@ pub fn encode_ht_gate_up_bands(
         "paired HT bands must use the same encoder settings"
     );
     validate_ht_backend(gate_meta)?;
+    #[cfg(feature = "cuda")]
+    if gate_meta.ht_backend == HtBackend::Cuda {
+        if let Some(codes) = encode_ht_cuda_rotated(
+            &[(gate, gate_meta.sv), (up, up_meta.sv)],
+            gate_meta.su,
+            128,
+            cols,
+            gate_meta,
+            bits,
+        )? {
+            return Ok(codes);
+        }
+    }
     let mut tiles = vec![0.0; paired_count];
     rotate_into(
         gate,
@@ -2987,7 +3071,7 @@ mod backend_tests {
         backend.preflight().unwrap();
         // Cross each implementation's largest tile batch; CUDA also crosses its
         // persistent-grid stride (fewer resident blocks than tiles).
-        let tiles_per_call = if backend == HtBackend::Cuda { 4097 } else { 65 };
+        let tiles_per_call = if backend == HtBackend::Cuda { 16385 } else { 65 };
         let tiles: Vec<f32> = (0..tiles_per_call * 256)
             .map(|i| ((i * 17 % 97) as f32 - 48.0) / 32.0)
             .collect();

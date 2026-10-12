@@ -21,6 +21,8 @@ use std::{
 const COPY_CHUNK: usize = 8 * 1024 * 1024;
 const MATRIX_ROWS: usize = 128;
 const I4R_GPU_BATCH_BANDS: usize = 32;
+/// Host values per GPU HT call (32 MiB of f32 plus its rotated copy).
+const HT_GPU_BATCH_VALUES: usize = 1 << 23;
 /// Host values per GPU Q4C-P call: 32 MiB of f32, one native device batch.
 const Q4CP_GPU_BATCH_VALUES: usize = 1 << 23;
 const TABLE_ROWS: usize = 8192;
@@ -769,7 +771,8 @@ fn matrix_batch_rows(
     if tensor.encoding == Encoding::Q4Cp && options.q4cp_backend.is_gpu() {
         return q4cp_gpu_batch_rows(tensor, row, rows);
     }
-    if tensor.encoding != Encoding::I4r || !options.i4r_backend.is_gpu() {
+    let ht_gpu = tensor.encoding.ht_bits().is_some() && options.ht_backend.is_gpu();
+    if !ht_gpu && (tensor.encoding != Encoding::I4r || !options.i4r_backend.is_gpu()) {
         return Ok(MATRIX_ROWS.min(rows - row));
     }
     let expert_rows = if tensor.shape.len() == 3 {
@@ -779,7 +782,7 @@ fn matrix_batch_rows(
     };
     ensure!(
         row % MATRIX_ROWS == 0 && expert_rows > 0 && expert_rows % MATRIX_ROWS == 0,
-        "I4R batch requires complete row bands"
+        "GPU batch requires complete row bands"
     );
     let portion_rows = if tensor.shape.len() == 3 && tensor.name.ends_with(".gate_up_proj.weight") {
         ensure!(
@@ -792,7 +795,15 @@ fn matrix_batch_rows(
     };
     // One bounded host batch shares su. sv restarts at each expert, and the
     // gate/up half boundary is also kept intact for truthful portion progress.
-    Ok((I4R_GPU_BATCH_BANDS * MATRIX_ROWS)
+    // GPU HT batches whole bands up to a value budget: one 128-row band of a
+    // narrow matrix (e.g. 128x640 down experts) is barely one device wave.
+    let bands = if ht_gpu {
+        let cols = usize::try_from(*tensor.shape.last().context("HT tensor has no shape")?)?;
+        (HT_GPU_BATCH_VALUES / (MATRIX_ROWS * cols)).max(1)
+    } else {
+        I4R_GPU_BATCH_BANDS
+    };
+    Ok((bands * MATRIX_ROWS)
         .min(portion_rows - row % portion_rows)
         .min(rows - row))
 }

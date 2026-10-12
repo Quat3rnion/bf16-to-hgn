@@ -578,3 +578,47 @@ fn q4cp_backend_selects_only_q4cp_device() {
         .unwrap();
     assert_eq!(estimate.planned_values(class), 7);
 }
+
+#[test]
+fn ht_gpu_batches_whole_bands_within_experts_and_cpu_keeps_single_bands() {
+    let mut tensor = TensorPlan {
+        name: "layers.0.mlp.experts.down_proj.weight".into(),
+        shape: vec![3, 35 * 128, 640],
+        encoding: Encoding::Ht3,
+        origin: Origin::Tensor {
+            name: "expert".into(),
+        },
+        rotation: None,
+    };
+    let rows = 3 * 35 * 128;
+    for backend in [codec::HtBackend::Hip, codec::HtBackend::Cuda] {
+        let options = Options {
+            ht_backend: backend,
+            ..Options::default()
+        };
+        let mut row = 0;
+        let mut bands = Vec::new();
+        while row < rows {
+            let take = matrix_batch_rows(&tensor, &options, row, rows).unwrap();
+            assert_eq!(row / (35 * 128), (row + take - 1) / (35 * 128), "batch crosses an expert");
+            assert_eq!(take % 128, 0);
+            bands.push(take / 128);
+            row += take;
+        }
+        assert_eq!(bands, [35, 35, 35]);
+        // A wide 2-D matrix is limited by the host value budget.
+        let wide = TensorPlan {
+            name: "layers.0.self_attn.q_proj.weight".into(),
+            shape: vec![64 * 128, 8192],
+            encoding: Encoding::Ht,
+            ..tensor.clone()
+        };
+        assert_eq!(
+            matrix_batch_rows(&wide, &options, 0, 64 * 128).unwrap(),
+            HT_GPU_BATCH_VALUES / 8192
+        );
+    }
+    assert_eq!(matrix_batch_rows(&tensor, &Options::default(), 0, rows).unwrap(), 128);
+    tensor.encoding = Encoding::Ht;
+    assert_eq!(matrix_batch_rows(&tensor, &Options::default(), 128, rows).unwrap(), 128);
+}

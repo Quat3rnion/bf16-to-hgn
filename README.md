@@ -1076,6 +1076,20 @@ identity:
    first 8 rounds of each lane stay in registers from expansion to selection.
 7. **Early radix stop.** When the bin that holds rank k must be fully
    selected, the radix search stops. Lower digits cannot change the set.
+8. **Multi-band GPU calls.** With a GPU HT backend, conversion sends up to
+   2^23 values of complete 128-row bands in one call. A batch does not cross
+   an expert, because down experts have their own input signs. HT tiles are
+   independent and band-major, so the result equals the concatenated
+   single-band output. A single 128×640 down-expert band is only 320 tiles,
+   about one device wave. CPU HT still uses single bands.
+9. **GPU rotation.** CUDA HT does the forward rotation on the GPU with the
+   CPU order of operations: FP64 `(value / sv) * su`, the row axis then the
+   column axis, one exact /128 and f32 narrowing. The kernel writes trellis
+   tile order directly, for single bands and for paired gate/up bands. A
+   zero row scale with a nonzero value, a nonfinite value or a value above
+   1e17 sets a flag. Then the encoder runs the CPU path again to report the
+   exact CPU error. The trellis kernel reads the rotated tiles in device
+   memory, in launches of up to 16,384 tiles.
 
 Measured on the workhorse RTX 4090 Laptop GPU (CUDA 12.0, GCC 12.4,
 `sm_89`), beam 128, one 128×2560 band, median of 3 warm samples. The
@@ -1090,6 +1104,11 @@ session:
 | HT3 real Orca layer 0 gate | — | 44.0 | 27.1 | 12.1 | — |
 | HT4 pair real Orca layer 0 | — | 113.7 | 60.6 | 10.8 | — |
 | Q4C-P 128×4096 (16 bands) | CPU 58.9 Mvalues/s | — | — | 1180 | ~20× vs CPU |
+
+For down-expert batches of 35 bands (128×640 each), changes 8 and 9 give
+about 11.2 Mvalues/s for HT4 and 14 Mvalues/s for HT3. One band of this
+shape was 6.8 and 8.2 Mvalues/s before change 8. A 35-band HT4 call takes
+244 ms instead of 264 ms without the GPU rotation.
 
 Interleaved A/B rounds in one session gave the steps for changes 4–7:
 HT4 60.5 → 44 → 40 → 35 → 31 → 30 ms; HT3 43.8 → 34 → 32.6 → 30.5 → 26 →
@@ -1314,8 +1333,8 @@ throughput. A full v2 conversion is not evidence for HT43 qualification.
   progress class, value-bounded batches and no CPU fallback. Reworked CUDA
   HT3/HT4 search: persistent grid, coalesced warp segments, radix set
   selection with exact libstdc++ tie replay, per-group parent lists, a
-  computed standard codebook, no candidate compaction and an early radix
-  stop. Output is byte-identical to CPU; HT4 is about 5.7× and HT3 about 3.9×
+  computed standard codebook, no candidate compaction, an early radix
+  stop, multi-band GPU HT calls within an expert and GPU forward rotation. Output is byte-identical to CPU; HT4 is about 5.7× and HT3 about 3.9×
   faster per band. See the CUDA Q4C-P section above.
 
 - Added opt-in `--i4r-backend hip`, independent of HT and verification backends,

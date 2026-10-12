@@ -400,7 +400,9 @@ fn i4r_rejects_invalid_inputs_before_any_native_backend_call() -> Result<()> {
     bad_scales.scales[..2].copy_from_slice(&half::f16::INFINITY.to_le_bytes());
     assert!(decode_rows(Encoding::I4r, &bad_scales, rows, cols, &meta).is_err());
     for encoding in [Encoding::Ht, Encoding::Ht3] {
-        assert!(encode_rows(encoding, &input, rows, cols, &meta).is_err());
+        // Multi-band HT encoding is accepted (it equals concatenated bands;
+        // see tests/ht_gpu_batch.rs); HT decoding still takes one band.
+        assert!(encode_rows(encoding, &input, rows, cols, &meta).is_ok());
         let block = EncodedBlock {
             codes: vec![0; codec::payload_layout(encoding, rows, cols)?.len as usize],
             scales: Vec::new(),

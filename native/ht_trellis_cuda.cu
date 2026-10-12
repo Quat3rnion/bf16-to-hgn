@@ -54,7 +54,7 @@ constexpr int kMaxBeam = 256;
 constexpr int kThreads = 256;
 // Tiles per launch. Blocks are persistent: the grid is bounded by co-resident
 // blocks and workspace slots, not by this batch, so a band is one launch.
-constexpr int kBatch = 4096;
+constexpr int kBatch = 16384;
 constexpr size_t kWorkspaceBytes = 128u * 1024u * 1024u;
 constexpr uint16_t kMissing = 0xffff;
 
@@ -109,7 +109,7 @@ static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559);
 static_assert(sizeof(DeviceStorage) == kStates * 4 + size_t(kBatch) * kLength * 5
               + size_t(kBatch) * sizeof(TileStatus) + kWorkspaceBytes);
 static_assert(kWorkspaceBytes / tile_workspace_bytes(3, kMaxBeam) >= 256);
-static_assert(sizeof(DeviceStorage) <= 134u * 1024u * 1024u);
+static_assert(sizeof(DeviceStorage) <= 150u * 1024u * 1024u);
 
 // Decode uses two FP64 axis passes, with only 16 independent 128-point
 // transforms in shared memory at once. The complete 128x128 block would require 128 KiB.
@@ -128,7 +128,7 @@ struct DecodeStorage {
 };
 static_assert(sizeof(double) == 8 && std::numeric_limits<double>::is_iec559);
 static_assert(sizeof(DecodeStorage) == 55115776);
-static_assert(sizeof(DeviceStorage) + sizeof(DecodeStorage) <= 192u * 1024u * 1024u);
+static_assert(sizeof(DeviceStorage) + sizeof(DecodeStorage) <= 208u * 1024u * 1024u);
 
 // Complete 128x128 blocks are independent in both the forward rotation and
 // quantizer. Keep whole bands contiguous when they fit, splitting only widths
@@ -155,7 +155,7 @@ struct I4rStorage {
 };
 static_assert(sizeof(I4rStorage) == 52756488);
 static_assert(sizeof(DeviceStorage) + sizeof(DecodeStorage) + sizeof(I4rStorage)
-              <= 256u * 1024u * 1024u);
+              <= 272u * 1024u * 1024u);
 
 // Q4C-P groups of 32 values are independent; batches are flat group runs,
 // never rows, so arbitrarily wide or short matrices need no strided copies.
@@ -321,6 +321,64 @@ __global__ __launch_bounds__(kThreads) void i4r_forward_columns(I4rStorage *stor
         if ((__float_as_uint(value) & 0x7fffffffU) >= 0x7f800000U)
             atomicExch(&storage->status.rotation_overflow, 1u);
         storage->values[row * cols + col] = value;
+    }
+}
+
+// HT forward rotation, the CPU rotate_into order: (value / sv) * su in FP64,
+// the two ordered butterfly axes, one exact /128 and f32 narrowing. A zero
+// row scale yields +0 and requires a zero source; any violation, nonfinite
+// result or |value| > 1e17 only raises a flag. The host then reruns the CPU
+// path, which reports the exact first error.
+__global__ __launch_bounds__(kThreads) void ht_forward_rows(I4rStorage *storage, int cols) {
+    __shared__ double values[16 * 128];
+    const int row_base = int(blockIdx.y) * 16;
+    const int col_base = int(blockIdx.x) * 128;
+    for (int index = int(threadIdx.x); index < 16 * 128; index += kThreads) {
+        const int row = row_base + index / 128;
+        const int col = col_base + index % 128;
+        const float value = storage->values[row * cols + col];
+        const float scale = storage->sv[row];
+        double rotated = 0.0;
+        if (scale == 0.0f) {
+            if (value != 0.0f) atomicExch(&storage->status.rotation_overflow, 1u);
+        } else {
+            rotated = __dmul_rn(__ddiv_rn(double(value), double(scale)), double(storage->su[col]));
+        }
+        values[index] = rotated;
+    }
+    decode_axis<128>(values);
+    for (int index = int(threadIdx.x); index < 16 * 128; index += kThreads) {
+        const int row = row_base + index / 128;
+        const int col = col_base + index % 128;
+        storage->scratch[row * cols + col] = values[index];
+    }
+}
+
+// Writes the rectangle's rotated values straight into trellis tile order.
+// row_offset/col_offset place the rectangle within the full call.
+__global__ __launch_bounds__(kThreads) void ht_forward_columns(
+    I4rStorage *storage, float *tiles, int cols, int row_offset, int col_offset, int full_cols,
+    int row_tiles, int tile_offset) {
+    __shared__ double values[16 * 129];
+    const int row_base = int(blockIdx.y) * 128;
+    const int col_base = int(blockIdx.x) * 16;
+    for (int index = int(threadIdx.x); index < 16 * 128; index += kThreads) {
+        const int row = row_base + index / 16;
+        const int col = col_base + index % 16;
+        values[(index % 16) * 129 + index / 16] = storage->scratch[row * cols + col];
+    }
+    decode_axis<129>(values);
+    for (int index = int(threadIdx.x); index < 16 * 128; index += kThreads) {
+        const int row = row_offset + row_base + index / 16;
+        const int col = col_offset + col_base + index % 16;
+        const float value = __double2float_rn(
+            __dmul_rn(values[(index % 16) * 129 + index / 16], 0x1p-7));
+        const unsigned magnitude = __float_as_uint(value) & 0x7fffffffU;
+        if (magnitude >= 0x7f800000U || __uint_as_float(magnitude) > 1.0e17f)
+            atomicExch(&storage->status.rotation_overflow, 1u);
+        const int tile = ((row / 128) * (full_cols / 16) + col / 16) * row_tiles
+            + (row % 128) / 16 + tile_offset;
+        tiles[size_t(tile) * kLength + (col % 16 / 8) * 128 + (row % 16) * 8 + col % 8] = value;
     }
 }
 
@@ -1041,7 +1099,7 @@ __host__ __device__ __forceinline__ float standard_codebook(unsigned state) {
 // The workspace slot belongs to the calling block, not to the tile: a
 // persistent block reuses it serially for each tile it owns.
 template<int Bits, bool Standard>
-__device__ void encode_tile(DeviceStorage *storage, int width, int tile, int slot,
+__device__ void encode_tile(DeviceStorage *storage, const float *tiles, int width, int tile, int slot,
                             BlockState<Bits> &shared) {
     constexpr int symbols = 1 << Bits;
     constexpr int histories = kStates >> Bits;
@@ -1049,7 +1107,7 @@ __device__ void encode_tile(DeviceStorage *storage, int width, int tile, int slo
     constexpr int closing_symbols = (16 - Bits + Bits - 1) / Bits;
     constexpr int group_words = (groups + 31) / 32;
     const int thread = int(threadIdx.x);
-    const float *x = storage->tiles + tile * kLength;
+    const float *x = tiles + size_t(tile) * kLength;
     const float *cb = storage->codebook;
     const TileWorkspace workspace = tile_workspace(
         storage->workspace + size_t(slot) * tile_workspace_bytes(Bits, width), histories);
@@ -1293,10 +1351,10 @@ __device__ void encode_tile(DeviceStorage *storage, int width, int tile, int slo
 // Four blocks per SM (<= 64 registers) measured fastest on the RTX 4090
 // Laptop for HT3 and HT4 at beam 128; fewer registers spill into latency.
 template<int Bits, bool Standard>
-__global__ __launch_bounds__(kThreads, 4) void encode_tiles(DeviceStorage *storage, int width, int count) {
+__global__ __launch_bounds__(kThreads, 4) void encode_tiles(DeviceStorage *storage, const float *tiles, int width, int count) {
     __shared__ BlockState<Bits> shared;
     for (int tile = int(blockIdx.x); tile < count; tile += int(gridDim.x)) {
-        encode_tile<Bits, Standard>(storage, width, tile, int(blockIdx.x), shared);
+        encode_tile<Bits, Standard>(storage, tiles, width, tile, int(blockIdx.x), shared);
         __syncthreads();
     }
 }
@@ -1328,6 +1386,8 @@ struct Context {
     DecodeStorage *decode_storage = nullptr;
     I4rStorage *i4r_storage = nullptr;
     Q4Storage *q4_storage = nullptr;
+    float *ht_tiles = nullptr; // Rotated tiles of one GPU-rotated HT call (grow-only).
+    size_t ht_tiles_capacity = 0;
     std::array<float, kStates> cached_codebook;
     std::array<float, kStates> decode_cached_codebook;
     // Remains alive while an error path drains a queued D2H transfer.
@@ -1371,6 +1431,8 @@ struct Context {
             {reinterpret_cast<const void *>(i4r_forward_rows), kThreads},
             {reinterpret_cast<const void *>(i4r_forward_columns), kThreads},
             {reinterpret_cast<const void *>(i4r_quantize), kI4rThreads},
+            {reinterpret_cast<const void *>(ht_forward_rows), kThreads},
+            {reinterpret_cast<const void *>(ht_forward_columns), kThreads},
             {reinterpret_cast<const void *>(q4_quantize), kQ4Threads}
         };
         for (const auto &kernel : kernels) {
@@ -1437,7 +1499,7 @@ struct Context {
     ~Context() {
         // The CUDA runtime can already be unloading at static destruction.
         // Best-effort silent cleanup; never reset a device shared by services.
-        if (!stream && !storage && !decode_storage && !i4r_storage && !q4_storage) return;
+        if (!stream && !storage && !decode_storage && !i4r_storage && !q4_storage && !ht_tiles) return;
         int previous = 0;
         if (cudaGetDevice(&previous) != cudaSuccess) return;
         if (previous != 0 && cudaSetDevice(0) != cudaSuccess) return;
@@ -1446,6 +1508,7 @@ struct Context {
         if (decode_storage) cudaFree(decode_storage);
         if (i4r_storage) cudaFree(i4r_storage);
         if (q4_storage) cudaFree(q4_storage);
+        if (ht_tiles) cudaFree(ht_tiles);
         if (stream) cudaStreamDestroy(stream);
         if (previous != 0) cudaSetDevice(previous);
     }
@@ -1521,8 +1584,10 @@ bool address_overflows(const void *pointer, size_t bytes) {
     return reinterpret_cast<uintptr_t>(pointer) > std::numeric_limits<uintptr_t>::max() - bytes;
 }
 
+// device_tiles: `tiles` is device memory (GPU-rotated) read in place;
+// otherwise host tiles are uploaded per batch.
 int encode(Context &state, const float *tiles, const float *codebook,
-           uint8_t *codes, int count, int beam, int bits) {
+           uint8_t *codes, int count, int beam, int bits, bool device_tiles = false) {
     const int allocation = state.ensure_encoder();
     if (allocation != 0) return allocation;
     const size_t codebook_bytes = sizeof(state.cached_codebook);
@@ -1571,11 +1636,15 @@ int encode(Context &state, const float *tiles, const float *codebook,
     for (size_t base = 0; base < total; base += batch_limit) {
         int batch = int(total - base < batch_limit ? total - base : batch_limit);
         const unsigned grid = unsigned(size_t(batch) < grid_limit ? size_t(batch) : grid_limit);
-        void *arguments[] = {&state.storage, &beam, &batch};
         const size_t elements = size_t(batch) * kLength;
-        cudaError_t error = cudaMemcpyAsync(state.storage->tiles, tiles + base * kLength,
-                                         elements * sizeof(float), cudaMemcpyHostToDevice, state.stream);
-        if (error != cudaSuccess) return cuda_failure(error, "upload CUDA tile batch");
+        const float *batch_tiles = device_tiles ? tiles + base * kLength : state.storage->tiles;
+        void *arguments[] = {&state.storage, &batch_tiles, &beam, &batch};
+        cudaError_t error = cudaSuccess;
+        if (!device_tiles) {
+            error = cudaMemcpyAsync(state.storage->tiles, tiles + base * kLength,
+                                    elements * sizeof(float), cudaMemcpyHostToDevice, state.stream);
+            if (error != cudaSuccess) return cuda_failure(error, "upload CUDA tile batch");
+        }
         // Check this launch's direct status: an earlier recoverable runtime
         // error must not become a false launch failure via cudaGetLastError.
         // Fatal asynchronous device errors still fail; never reset the GPU.
@@ -1748,6 +1817,87 @@ int encode_q4(Context &state, const float *source, const Q4Params &params,
     return 0;
 }
 
+constexpr int kHtRotationOverflow = -6;
+
+// Rotate one or two (gate/up) source parts on the GPU into trellis tile
+// order, then run the unchanged trellis search on those device tiles.
+int encode_ht_rows(Context &state, const float *const *sources, const float *su,
+                   const float *const *svs, int parts, const float *codebook, uint8_t *symbols,
+                   int bands, int cols, int beam, int bits) {
+    int allocation = state.ensure_i4r_encoder();
+    if (allocation == 0) allocation = state.ensure_encoder();
+    if (allocation != 0) return allocation;
+    const size_t full_cols = size_t(cols);
+    const size_t values = size_t(parts) * size_t(bands) * 128 * full_cols;
+    if (state.ht_tiles_capacity < values) {
+        if (state.ht_tiles) {
+            const cudaError_t error = cudaStreamSynchronize(state.stream);
+            if (error != cudaSuccess) return cuda_failure(error, "drain before growing CUDA HT tiles");
+            cudaFree(state.ht_tiles);
+            state.ht_tiles = nullptr;
+            state.ht_tiles_capacity = 0;
+        }
+        const cudaError_t error = cudaMalloc(reinterpret_cast<void **>(&state.ht_tiles), values * sizeof(float));
+        if (error != cudaSuccess) {
+            state.ht_tiles = nullptr;
+            return cuda_failure(error, "allocate CUDA HT rotated tiles");
+        }
+        state.ht_tiles_capacity = values;
+    }
+    I4rStorage *storage = state.i4r_storage;
+    const size_t width_limit = full_cols < size_t(kI4rBlocks * 128) ? full_cols : size_t(kI4rBlocks * 128);
+    const size_t band_limit = kI4rBlocks / (width_limit / 128);
+    const int row_tiles = parts == 2 ? 16 : 8;
+    cudaError_t error = cudaMemsetAsync(&storage->status, 0, sizeof(I4rStatus), state.stream);
+    if (error != cudaSuccess) return cuda_failure(error, "clear CUDA HT rotation status");
+    for (int part = 0; part < parts; ++part) {
+        int tile_offset = part * 8;
+        for (size_t band_base = 0; band_base < size_t(bands);) {
+            const size_t remaining = size_t(bands) - band_base;
+            const size_t batch_bands = remaining < band_limit ? remaining : band_limit;
+            const size_t rows = batch_bands * 128;
+            for (size_t col_base = 0; col_base < full_cols; col_base += width_limit) {
+                const size_t width = full_cols - col_base < width_limit ? full_cols - col_base : width_limit;
+                int batch_cols = int(width);
+                int row_offset = int(band_base * 128);
+                int col_offset = int(col_base);
+                int all_cols = cols;
+                int tiles_per_row = row_tiles;
+                error = cudaMemcpyAsync(storage->su, su + col_base, width * sizeof(float),
+                                        cudaMemcpyHostToDevice, state.stream);
+                if (error != cudaSuccess) return cuda_failure(error, "upload CUDA HT input signs");
+                error = cudaMemcpyAsync(storage->sv, svs[part] + band_base * 128, rows * sizeof(float),
+                                        cudaMemcpyHostToDevice, state.stream);
+                if (error != cudaSuccess) return cuda_failure(error, "upload CUDA HT row scales");
+                error = copy_i4r_rectangle(storage->values, width * sizeof(float),
+                    sources[part] + band_base * 128 * full_cols + col_base, full_cols * sizeof(float),
+                    width * sizeof(float), rows, cudaMemcpyHostToDevice, state.stream);
+                if (error != cudaSuccess) return cuda_failure(error, "upload CUDA HT source rectangle");
+                void *row_arguments[] = {&storage, &batch_cols};
+                error = cudaLaunchKernel(reinterpret_cast<const void *>(ht_forward_rows),
+                    dim3(unsigned(width / 128), unsigned(rows / 16)), dim3(kThreads),
+                    row_arguments, 0, state.stream);
+                if (error != cudaSuccess) return cuda_failure(error, "launch CUDA HT row butterflies");
+                void *column_arguments[] = {&storage, &state.ht_tiles, &batch_cols, &row_offset,
+                                            &col_offset, &all_cols, &tiles_per_row, &tile_offset};
+                error = cudaLaunchKernel(reinterpret_cast<const void *>(ht_forward_columns),
+                    dim3(unsigned(width / 16), unsigned(batch_bands)), dim3(kThreads),
+                    column_arguments, 0, state.stream);
+                if (error != cudaSuccess) return cuda_failure(error, "launch CUDA HT column butterflies");
+            }
+            band_base += batch_bands;
+        }
+    }
+    error = cudaMemcpyAsync(&state.i4r_status, &storage->status, sizeof(I4rStatus),
+                            cudaMemcpyDeviceToHost, state.stream);
+    if (error != cudaSuccess) return cuda_failure(error, "download CUDA HT rotation status");
+    error = cudaStreamSynchronize(state.stream);
+    if (error != cudaSuccess) return cuda_failure(error, "complete CUDA HT rotation");
+    if (state.i4r_status.rotation_overflow)
+        return fail(kHtRotationOverflow, "CUDA HT rotation rejected the input; rerun on CPU for the exact error");
+    return encode(state, state.ht_tiles, codebook, symbols, int(values / kLength), beam, bits, true);
+}
+
 cudaError_t copy_decode_rectangle(void *destination, size_t destination_pitch,
                                 const void *source, size_t source_pitch,
                                 size_t width, size_t rows, cudaMemcpyKind kind,
@@ -1884,6 +2034,30 @@ extern "C" int ht_encode_bits_cuda(const float *tiles, const float *codebook,
         return fail(-1, "CUDA HT buffer extent overflows the host address space");
     return with_context([&](Context &state) {
         return encode(state, tiles, codebook, codes, count, beam, bits);
+    });
+}
+
+// parts == 1: one or more complete 128-row bands (row_tiles 8).
+// parts == 2: one gate band and one up band sharing su (row_tiles 16, up at 8).
+// symbols receives parts*bands*128*cols trellis symbols in tile order.
+// Returns -6 when the rotation is invalid; callers rerun the CPU reference.
+extern "C" int hgn_cuda_encode_ht(const float *const *sources, const float *su,
+                                  const float *const *svs, int parts, const float *codebook,
+                                  uint8_t *symbols, int bands, int cols, int beam, int bits) {
+    last_error[0] = '\0';
+    if (bits != 3 && bits != 4) return fail(-1, "CUDA HT bits must be 3 or 4");
+    if (beam < 1 || beam > kMaxBeam)
+        return fail(-1, "CUDA HT beam must be 1..256; exact beam 0 and larger beams are CPU-only");
+    if ((parts != 1 && parts != 2) || bands <= 0 || (parts == 2 && bands != 1) || cols <= 0 || cols % 128 != 0)
+        return fail(-1, "CUDA HT encode requires complete bands (one band per part when paired)");
+    if (!sources || !su || !svs || !codebook || !symbols)
+        return fail(-1, "CUDA HT encode requires nonnull buffers");
+    if (size_t(bands) * size_t(parts) > size_t(std::numeric_limits<int>::max()) / 128 / size_t(cols))
+        return fail(-1, "CUDA HT encode shape exceeds the native index range");
+    for (int part = 0; part < parts; ++part)
+        if (!sources[part] || !svs[part]) return fail(-1, "CUDA HT encode requires nonnull part buffers");
+    return with_context([&](Context &state) {
+        return encode_ht_rows(state, sources, su, svs, parts, codebook, symbols, bands, cols, beam, bits);
     });
 }
 
