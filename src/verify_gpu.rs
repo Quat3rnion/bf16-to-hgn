@@ -1,10 +1,12 @@
-//! Verification-only HIP decoding. Encoding provenance never selects this backend.
+//! Verification-only GPU decoding. Encoding provenance never selects this backend.
 //!
 //! I4R follows `codec::decode_rows`; HT receives the independent verifier's
 //! codebook and uses its circular-state mapping, not the encoder's decoder.
 //! Both native axis passes use ordered f64 butterflies and one final f32 cast.
 //! The native context batches arbitrary complete 128x128 blocks into a lazy
 //! workspace smaller than 64 MiB, and returns only after output is complete.
+//! HIP and CUDA calls serialize their shared native context with a mutex;
+//! concurrent callers retain separate thread-local errors and caller buffers.
 
 use crate::codec::{EncodedBlock, QuantMeta};
 use anyhow::{ensure, Context, Result};
@@ -17,10 +19,23 @@ pub enum DecodeBackend {
     #[default]
     Cpu,
     Hip,
+    Cuda,
 }
 
 impl DecodeBackend {
-    /// Fail explicitly for unavailable HIP, even without an eligible tensor.
+    pub const fn is_gpu(self) -> bool {
+        matches!(self, Self::Hip | Self::Cuda)
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU",
+            Self::Hip => "HIP",
+            Self::Cuda => "CUDA",
+        }
+    }
+
+    /// Fail explicitly for an unavailable GPU, even without an eligible tensor.
     pub fn preflight(self) -> Result<()> {
         match self {
             Self::Cpu => Ok(()),
@@ -32,12 +47,27 @@ impl DecodeBackend {
                     ensure!(
                         result == 0,
                         "HIP decode preflight failed: {}",
-                        hip_last_error()
+                        native_last_error(self)
                     );
                     Ok(())
                 }
                 #[cfg(not(feature = "hip"))]
                 anyhow::bail!("HIP decode backend requires a build with --features hip");
+            }
+            Self::Cuda => {
+                #[cfg(feature = "cuda")]
+                {
+                    // SAFETY: no pointers; native context access is serialized.
+                    let result = unsafe { hgn_cuda_decode_preflight() };
+                    ensure!(
+                        result == 0,
+                        "CUDA decode preflight failed: {}",
+                        native_last_error(self)
+                    );
+                    Ok(())
+                }
+                #[cfg(not(feature = "cuda"))]
+                anyhow::bail!("CUDA decode backend requires a build with --features cuda");
             }
         }
     }
@@ -46,7 +76,7 @@ impl DecodeBackend {
 fn geometry(rows: usize, cols: usize) -> Result<(usize, c_int, c_int)> {
     ensure!(
         rows > 0 && cols > 0 && rows % 128 == 0 && cols % 128 == 0,
-        "HIP decode requires nonempty complete 128-row/column blocks"
+        "GPU decode requires nonempty complete 128-row/column blocks"
     );
     let count = rows
         .checked_mul(cols)
@@ -56,19 +86,24 @@ fn geometry(rows: usize, cols: usize) -> Result<(usize, c_int, c_int)> {
         "decoded block length exceeds address space"
     );
     let bands =
-        c_int::try_from(rows / 128).context("HIP decode band count exceeds native range")?;
-    let cols = c_int::try_from(cols).context("HIP decode column count exceeds native range")?;
+        c_int::try_from(rows / 128).context("GPU decode band count exceeds native range")?;
+    let cols = c_int::try_from(cols).context("GPU decode column count exceeds native range")?;
     Ok((count, bands, cols))
 }
 
 /// Decode one or more I4R bands with one shared input rotation vector.
 /// Scales are the existing contiguous little-endian half plane, without pad.
 pub fn decode_i4r(
+    backend: DecodeBackend,
     block: &EncodedBlock,
     rows: usize,
     cols: usize,
     meta: &QuantMeta<'_>,
 ) -> Result<Vec<f32>> {
+    ensure!(
+        backend.is_gpu(),
+        "CPU backend cannot use GPU-only I4R decode"
+    );
     let (count, _bands, _native_cols) = geometry(rows, cols)?;
     ensure!(
         block.codes.len() == count / 2 && block.scales.len() == count / 64,
@@ -92,33 +127,68 @@ pub fn decode_i4r(
             .all(|bytes| { f16::from_le_bytes([bytes[0], bytes[1]]).is_finite() }),
         "non-finite quantization scale"
     );
-    #[cfg(feature = "hip")]
-    {
-        native_output(
-            count,
-            "I4R",
-            "decoded block contains non-finite values",
-            |out| {
-                // SAFETY: all input extents and output capacity match the checked
-                // shape. Native treats scales as bytes on the host, so casting the
-                // byte plane does not require host uint16_t alignment or a copy.
-                // It synchronizes every transfer before returning, including errors.
-                unsafe {
-                    hgn_hip_decode_i4r(
-                        block.codes.as_ptr(),
-                        block.scales.as_ptr().cast(),
-                        meta.su.as_ptr(),
-                        meta.sv.as_ptr(),
-                        out,
-                        _bands,
-                        _native_cols,
-                    )
-                }
-            },
-        )
+    match backend {
+        DecodeBackend::Hip => {
+            #[cfg(feature = "hip")]
+            {
+                native_output(
+                    backend,
+                    count,
+                    "I4R",
+                    "decoded block contains non-finite values",
+                    |out| {
+                        // SAFETY: all input extents and output capacity match the
+                        // checked shape. Native treats scales as bytes on the host,
+                        // so this cast needs neither host u16 alignment nor a copy.
+                        // Every transfer completes before return, including errors.
+                        unsafe {
+                            hgn_hip_decode_i4r(
+                                block.codes.as_ptr(),
+                                block.scales.as_ptr().cast(),
+                                meta.su.as_ptr(),
+                                meta.sv.as_ptr(),
+                                out,
+                                _bands,
+                                _native_cols,
+                            )
+                        }
+                    },
+                )
+            }
+            #[cfg(not(feature = "hip"))]
+            anyhow::bail!("HIP decode backend requires a build with --features hip")
+        }
+        DecodeBackend::Cuda => {
+            #[cfg(feature = "cuda")]
+            {
+                native_output(
+                    backend,
+                    count,
+                    "I4R",
+                    "decoded block contains non-finite values",
+                    |out| {
+                        // SAFETY: extents match the checked shape. Native reads
+                        // the scale plane as bytes, allowing this unaligned cast,
+                        // and completes all transfers before returning.
+                        unsafe {
+                            hgn_cuda_decode_i4r(
+                                block.codes.as_ptr(),
+                                block.scales.as_ptr().cast(),
+                                meta.su.as_ptr(),
+                                meta.sv.as_ptr(),
+                                out,
+                                _bands,
+                                _native_cols,
+                            )
+                        }
+                    },
+                )
+            }
+            #[cfg(not(feature = "cuda"))]
+            anyhow::bail!("CUDA decode backend requires a build with --features cuda")
+        }
+        DecodeBackend::Cpu => unreachable!("CPU backend rejected before GPU decode"),
     }
-    #[cfg(not(feature = "hip"))]
-    anyhow::bail!("HIP decode backend requires a build with --features hip")
 }
 
 /// Decode independent HT3/HT4 verification bands, including paired gate/up.
@@ -128,6 +198,7 @@ pub fn decode_i4r(
 /// codebook is content-cached by native code, never replaced by an encoder one.
 #[allow(clippy::too_many_arguments)]
 pub fn decode_ht(
+    backend: DecodeBackend,
     bytes: &[u8],
     rows: usize,
     cols: usize,
@@ -138,6 +209,10 @@ pub fn decode_ht(
     tile_offset: usize,
     codebook: &[f32],
 ) -> Result<Vec<f32>> {
+    ensure!(
+        backend.is_gpu(),
+        "CPU backend cannot use GPU-only HT decode"
+    );
     ensure!(bits == 3 || bits == 4, "invalid HT verifier width");
     ensure!(
         (row_tiles == 8 && tile_offset == 0) || (row_tiles == 16 && matches!(tile_offset, 0 | 8)),
@@ -170,30 +245,73 @@ pub fn decode_ht(
         codebook.iter().all(|value| value.is_finite()),
         "nonfinite HT verifier codebook"
     );
-    #[cfg(feature = "hip")]
-    {
-        native_output(_count, "HT", "nonfinite HT verifier value", |out| {
-            // SAFETY: every extent and native integer is checked above. Output
-            // is exclusively borrowed and native success means all values have
-            // been written and all asynchronous work has completed.
-            unsafe {
-                hgn_hip_decode_ht(
-                    bytes.as_ptr(),
-                    codebook.as_ptr(),
-                    su.as_ptr(),
-                    sv.as_ptr(),
-                    out,
-                    _bands,
-                    _native_cols,
-                    bits as c_int,
-                    row_tiles as c_int,
-                    tile_offset as c_int,
+    match backend {
+        DecodeBackend::Hip => {
+            #[cfg(feature = "hip")]
+            {
+                native_output(
+                    backend,
+                    _count,
+                    "HT",
+                    "nonfinite HT verifier value",
+                    |out| {
+                        // SAFETY: every extent and native integer is checked above.
+                        // Output is exclusively borrowed and native success means
+                        // all values are written and asynchronous work is complete.
+                        unsafe {
+                            hgn_hip_decode_ht(
+                                bytes.as_ptr(),
+                                codebook.as_ptr(),
+                                su.as_ptr(),
+                                sv.as_ptr(),
+                                out,
+                                _bands,
+                                _native_cols,
+                                bits as c_int,
+                                row_tiles as c_int,
+                                tile_offset as c_int,
+                            )
+                        }
+                    },
                 )
             }
-        })
+            #[cfg(not(feature = "hip"))]
+            anyhow::bail!("HIP decode backend requires a build with --features hip")
+        }
+        DecodeBackend::Cuda => {
+            #[cfg(feature = "cuda")]
+            {
+                native_output(
+                    backend,
+                    _count,
+                    "HT",
+                    "nonfinite HT verifier value",
+                    |out| {
+                        // SAFETY: checked extents and native integers; the output
+                        // buffer is exclusive and fully initialized synchronously
+                        // on success, with no caller pointers retained.
+                        unsafe {
+                            hgn_cuda_decode_ht(
+                                bytes.as_ptr(),
+                                codebook.as_ptr(),
+                                su.as_ptr(),
+                                sv.as_ptr(),
+                                out,
+                                _bands,
+                                _native_cols,
+                                bits as c_int,
+                                row_tiles as c_int,
+                                tile_offset as c_int,
+                            )
+                        }
+                    },
+                )
+            }
+            #[cfg(not(feature = "cuda"))]
+            anyhow::bail!("CUDA decode backend requires a build with --features cuda")
+        }
+        DecodeBackend::Cpu => unreachable!("CPU backend rejected before GPU decode"),
     }
-    #[cfg(not(feature = "hip"))]
-    anyhow::bail!("HIP decode backend requires a build with --features hip")
 }
 
 #[cfg(feature = "hip")]
@@ -223,21 +341,58 @@ unsafe extern "C" {
     fn ht_hip_last_error() -> *const std::ffi::c_char;
 }
 
-#[cfg(feature = "hip")]
-fn hip_last_error() -> String {
+#[cfg(feature = "cuda")]
+unsafe extern "C" {
+    fn hgn_cuda_decode_i4r(
+        codes: *const u8,
+        scales: *const u16,
+        su: *const f32,
+        sv: *const f32,
+        out: *mut f32,
+        bands: c_int,
+        cols: c_int,
+    ) -> c_int;
+    fn hgn_cuda_decode_ht(
+        bytes: *const u8,
+        codebook: *const f32,
+        su: *const f32,
+        sv: *const f32,
+        out: *mut f32,
+        bands: c_int,
+        cols: c_int,
+        bits: c_int,
+        row_tiles: c_int,
+        tile_offset: c_int,
+    ) -> c_int;
+    fn hgn_cuda_decode_preflight() -> c_int;
+    fn ht_cuda_last_error() -> *const std::ffi::c_char;
+}
+
+#[cfg(any(feature = "hip", feature = "cuda"))]
+fn native_last_error(backend: DecodeBackend) -> String {
     // SAFETY: the shared ABI returns thread-local NUL-terminated text, valid
     // until this thread's next native call. Copy it immediately.
-    let error = unsafe { ht_hip_last_error() };
+    let error = match backend {
+        #[cfg(feature = "hip")]
+        DecodeBackend::Hip => unsafe { ht_hip_last_error() },
+        #[cfg(feature = "cuda")]
+        DecodeBackend::Cuda => unsafe { ht_cuda_last_error() },
+        _ => unreachable!("native error requires an enabled GPU backend"),
+    };
     if error.is_null() {
-        return "native HIP decoder returned no error detail".to_owned();
+        return format!(
+            "native {} decoder returned no error detail",
+            backend.label()
+        );
     }
     unsafe { std::ffi::CStr::from_ptr(error) }
         .to_string_lossy()
         .into_owned()
 }
 
-#[cfg(feature = "hip")]
+#[cfg(any(feature = "hip", feature = "cuda"))]
 fn native_output(
+    backend: DecodeBackend,
     count: usize,
     codec: &str,
     finite_error: &str,
@@ -250,8 +405,9 @@ fn native_output(
     let result = operation(values.as_mut_ptr());
     ensure!(
         result == 0,
-        "HIP {codec} decode failed: {}",
-        hip_last_error()
+        "{} {codec} decode failed: {}",
+        backend.label(),
+        native_last_error(backend)
     );
     // SAFETY: both native decoders synchronously initialize exactly count
     // values on success. A failed partial output keeps length zero and is
@@ -269,125 +425,198 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decode_rejects_shapes_planes_and_metadata_before_native_reads() {
-        let mut block = EncodedBlock {
-            codes: vec![0x88; 128 * 128 / 2],
-            scales: vec![0; 128 * 128 / 64],
-        };
-        let su = vec![1.0; 128];
-        let sv = vec![1.0; 128];
-        let meta = QuantMeta {
-            su: &su,
-            sv: &sv,
-            ..Default::default()
-        };
-        for (rows, cols) in [
-            (0, 128),
-            (128, 0),
-            (127, 128),
-            (128, 129),
-            (usize::MAX & !127, 128),
+    fn decode_backends_parse_and_label_without_feature_gates() {
+        use clap::ValueEnum;
+
+        assert_eq!(DecodeBackend::default(), DecodeBackend::Cpu);
+        for (name, backend, label, is_gpu) in [
+            ("cpu", DecodeBackend::Cpu, "CPU", false),
+            ("hip", DecodeBackend::Hip, "HIP", true),
+            ("cuda", DecodeBackend::Cuda, "CUDA", true),
         ] {
-            assert!(decode_i4r(&block, rows, cols, &meta).is_err());
+            assert_eq!(DecodeBackend::from_str(name, false).unwrap(), backend);
+            assert_eq!(backend.label(), label);
+            assert_eq!(backend.is_gpu(), is_gpu);
         }
-        block.codes.pop();
-        assert!(decode_i4r(&block, 128, 128, &meta)
-            .unwrap_err()
-            .to_string()
-            .contains("plane lengths"));
-        block.codes.push(0x88);
-        block.scales.extend_from_slice(&[0, 0]);
-        assert!(decode_i4r(&block, 128, 128, &meta)
-            .unwrap_err()
-            .to_string()
-            .contains("plane lengths"));
-        block.scales.truncate(256);
-        block.scales[..2].copy_from_slice(&0x7c00u16.to_le_bytes());
-        assert!(decode_i4r(&block, 128, 128, &meta)
-            .unwrap_err()
-            .to_string()
-            .contains("quantization scale"));
-        block.scales[..2].fill(0);
-        for value in [f32::NAN, f32::INFINITY, 0.1, f32::from_bits(1)] {
-            let invalid = vec![value; 128];
-            let meta = QuantMeta {
-                su: &invalid,
-                ..meta
+        assert!(DecodeBackend::from_str("vulkan", false).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_shapes_planes_and_metadata_before_native_reads() {
+        for backend in [DecodeBackend::Hip, DecodeBackend::Cuda] {
+            let mut block = EncodedBlock {
+                codes: vec![0x88; 128 * 128 / 2],
+                scales: vec![0; 128 * 128 / 64],
             };
-            assert!(decode_i4r(&block, 128, 128, &meta)
+            let su = vec![1.0; 128];
+            let sv = vec![1.0; 128];
+            let meta = QuantMeta {
+                su: &su,
+                sv: &sv,
+                ..Default::default()
+            };
+            for (rows, cols, error) in [
+                (0, 128, "complete 128-row/column blocks"),
+                (128, 0, "complete 128-row/column blocks"),
+                (127, 128, "complete 128-row/column blocks"),
+                (128, 129, "complete 128-row/column blocks"),
+                (usize::MAX & !127, 128, "element count overflow"),
+            ] {
+                assert!(decode_i4r(backend, &block, rows, cols, &meta)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(error));
+            }
+            block.codes.pop();
+            assert!(decode_i4r(backend, &block, 128, 128, &meta)
                 .unwrap_err()
                 .to_string()
-                .contains("representable f16"));
+                .contains("plane lengths"));
+            block.codes.push(0x88);
+            block.scales.extend_from_slice(&[0, 0]);
+            assert!(decode_i4r(backend, &block, 128, 128, &meta)
+                .unwrap_err()
+                .to_string()
+                .contains("plane lengths"));
+            block.scales.truncate(256);
+            block.scales[..2].copy_from_slice(&0x7c00u16.to_le_bytes());
+            assert!(decode_i4r(backend, &block, 128, 128, &meta)
+                .unwrap_err()
+                .to_string()
+                .contains("quantization scale"));
+            block.scales[..2].fill(0);
+            for value in [f32::NAN, f32::INFINITY, 0.1, f32::from_bits(1)] {
+                let invalid = vec![value; 128];
+                for meta in [
+                    QuantMeta {
+                        su: &invalid,
+                        ..meta
+                    },
+                    QuantMeta {
+                        sv: &invalid,
+                        ..meta
+                    },
+                ] {
+                    assert!(decode_i4r(backend, &block, 128, 128, &meta)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("representable f16"));
+                }
+            }
+            let meta = QuantMeta {
+                sv: &sv[..127],
+                ..meta
+            };
+            assert!(decode_i4r(backend, &block, 128, 128, &meta)
+                .unwrap_err()
+                .to_string()
+                .contains("vector dimensions"));
         }
-        let meta = QuantMeta {
-            sv: &sv[..127],
-            ..meta
-        };
-        assert!(decode_i4r(&block, 128, 128, &meta)
-            .unwrap_err()
-            .to_string()
-            .contains("vector dimensions"));
     }
 
     #[test]
     fn ht_decode_rejects_invalid_width_layout_and_nonfinite_metadata() {
-        let bytes = vec![0; 128 * 128 / 2];
-        let su = vec![1.0; 128];
-        let sv = vec![1.0; 128];
-        let mut codebook = vec![0.0; 65536];
-        for (bits, tiles, offset) in [(2, 8, 0), (5, 8, 0), (4, 8, 8), (4, 16, 1), (4, 24, 0)] {
-            assert!(decode_ht(&bytes, 128, 128, bits, &su, &sv, tiles, offset, &codebook).is_err());
-        }
-        assert!(decode_ht(
-            &bytes[..bytes.len() - 1],
-            128,
-            128,
-            4,
-            &su,
-            &sv,
-            8,
-            0,
-            &codebook
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("band size"));
-        assert!(
-            decode_ht(&bytes, 128, 128, 4, &su[..127], &sv, 8, 0, &codebook)
+        for backend in [DecodeBackend::Hip, DecodeBackend::Cuda] {
+            let bytes = vec![0; 128 * 128 / 2];
+            let su = vec![1.0; 128];
+            let sv = vec![1.0; 128];
+            let mut codebook = vec![0.0; 65536];
+            for (bits, tiles, offset, error) in [
+                (2, 8, 0, "verifier width"),
+                (5, 8, 0, "verifier width"),
+                (4, 8, 8, "tile geometry"),
+                (4, 16, 1, "tile geometry"),
+                (4, 24, 0, "tile geometry"),
+            ] {
+                assert!(decode_ht(
+                    backend, &bytes, 128, 128, bits, &su, &sv, tiles, offset, &codebook
+                )
                 .unwrap_err()
                 .to_string()
-                .contains("geometry")
-        );
-        assert!(
-            decode_ht(&bytes, 128, 128, 4, &su, &sv, 8, 0, &codebook[..65535])
-                .unwrap_err()
-                .to_string()
-                .contains("codebook length")
-        );
-        codebook[65535] = f32::NAN;
-        assert!(decode_ht(&bytes, 128, 128, 4, &su, &sv, 8, 0, &codebook)
+                .contains(error));
+            }
+            for (rows, cols, error) in [
+                (0, 128, "complete 128-row/column blocks"),
+                (128, 0, "complete 128-row/column blocks"),
+                (127, 128, "complete 128-row/column blocks"),
+                (128, 129, "complete 128-row/column blocks"),
+                (usize::MAX & !127, 128, "element count overflow"),
+            ] {
+                assert!(
+                    decode_ht(backend, &bytes, rows, cols, 4, &su, &sv, 8, 0, &codebook)
+                        .unwrap_err()
+                        .to_string()
+                        .contains(error)
+                );
+            }
+            assert!(decode_ht(
+                backend,
+                &bytes[..bytes.len() - 1],
+                128,
+                128,
+                4,
+                &su,
+                &sv,
+                8,
+                0,
+                &codebook
+            )
             .unwrap_err()
             .to_string()
-            .contains("nonfinite HT verifier codebook"));
-        let invalid = vec![f32::NEG_INFINITY; 128];
-        assert!(
-            decode_ht(&bytes, 128, 128, 4, &su, &invalid, 8, 0, &codebook)
-                .unwrap_err()
-                .to_string()
-                .contains("nonfinite HT verifier rotation")
-        );
-        assert!(decode_ht(&[], usize::MAX & !127, 128, 4, &[], &[], 8, 0, &codebook).is_err());
+            .contains("band size"));
+            assert!(decode_ht(
+                backend,
+                &bytes,
+                128,
+                128,
+                4,
+                &su[..127],
+                &sv,
+                8,
+                0,
+                &codebook
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("geometry"));
+            assert!(decode_ht(
+                backend,
+                &bytes,
+                128,
+                128,
+                4,
+                &su,
+                &sv,
+                8,
+                0,
+                &codebook[..65535]
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("codebook length"));
+            codebook[65535] = f32::NAN;
+            assert!(
+                decode_ht(backend, &bytes, 128, 128, 4, &su, &sv, 8, 0, &codebook)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("nonfinite HT verifier codebook")
+            );
+            let invalid = vec![f32::NEG_INFINITY; 128];
+            assert!(
+                decode_ht(backend, &bytes, 128, 128, 4, &su, &invalid, 8, 0, &codebook)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("nonfinite HT verifier rotation")
+            );
+        }
     }
 
-    #[cfg(not(feature = "hip"))]
-    #[test]
-    fn default_build_has_explicit_hip_unavailable_errors() {
-        DecodeBackend::Cpu.preflight().unwrap();
-        assert!(DecodeBackend::Hip
-            .preflight()
-            .unwrap_err()
-            .to_string()
-            .contains("--features hip"));
+    fn assert_backend_rejected(backend: DecodeBackend, error: &str) {
+        if backend.is_gpu() {
+            assert!(backend.preflight().unwrap_err().to_string().contains(error));
+        } else {
+            backend.preflight().unwrap();
+        }
         let block = EncodedBlock {
             codes: vec![0x88; 8192],
             scales: vec![0; 256],
@@ -398,11 +627,12 @@ mod tests {
             sv: &signs,
             ..Default::default()
         };
-        assert!(decode_i4r(&block, 128, 128, &meta)
+        assert!(decode_i4r(backend, &block, 128, 128, &meta)
             .unwrap_err()
             .to_string()
-            .contains("--features hip"));
+            .contains(error));
         assert!(decode_ht(
+            backend,
             &block.codes,
             128,
             128,
@@ -415,17 +645,69 @@ mod tests {
         )
         .unwrap_err()
         .to_string()
-        .contains("--features hip"));
+        .contains(error));
     }
 
-    #[cfg(feature = "hip")]
+    #[test]
+    fn cpu_backend_cannot_use_gpu_only_helpers() {
+        assert_backend_rejected(DecodeBackend::Cpu, "CPU backend cannot use GPU-only");
+    }
+
+    #[cfg(not(feature = "hip"))]
+    #[test]
+    fn default_build_has_explicit_hip_unavailable_errors() {
+        assert_backend_rejected(
+            DecodeBackend::Hip,
+            "HIP decode backend requires a build with --features hip",
+        );
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn cuda_backend_requires_feature() {
+        assert_backend_rejected(
+            DecodeBackend::Cuda,
+            "CUDA decode backend requires a build with --features cuda",
+        );
+    }
+
+    #[cfg(any(feature = "hip", feature = "cuda"))]
     mod device {
         use super::*;
         use crate::codec::{decode_rows, Encoding};
         use crate::verify::{decode_ht_independent, VERIFICATION_HT_CODEBOOK};
 
+        #[cfg(feature = "hip")]
         unsafe extern "C" {
             fn hipSetDevice(device: c_int) -> c_int;
+        }
+
+        #[cfg(feature = "cuda")]
+        unsafe extern "C" {
+            fn cudaSetDevice(device: c_int) -> c_int;
+        }
+
+        // Deliberately invalid raw ABI calls share the corpus without routing
+        // through Rust validation. The caller must uphold each FFI safety contract.
+        macro_rules! native_call {
+            ($backend:expr, $hip:ident, $cuda:ident $(, $arg:expr)* $(,)?) => {
+                match $backend {
+                    #[cfg(feature = "hip")]
+                    DecodeBackend::Hip => $hip($($arg),*),
+                    #[cfg(feature = "cuda")]
+                    DecodeBackend::Cuda => $cuda($($arg),*),
+                    _ => panic!("native test requires an enabled GPU backend"),
+                }
+            };
+        }
+
+        fn inject_runtime_error(backend: DecodeBackend) {
+            // SAFETY: a negative device ordinal is rejected without switching
+            // devices. Its previously reported error must not taint a valid launch.
+            assert_ne!(
+                unsafe { native_call!(backend, hipSetDevice, cudaSetDevice, -1) },
+                0
+            );
         }
 
         fn equal_bits(actual: &[f32], expected: &[f32]) {
@@ -554,22 +836,46 @@ mod tests {
             output
         }
 
-        #[test]
-        #[ignore = "requires gfx1151 HIP; I4R levels, signed zeros, half subnormals and extreme finite scales"]
-        fn hip_i4r_decode_matches_cpu_edge_corpus() {
-            DecodeBackend::Hip.preflight().unwrap();
+        fn constant_ht_expected(
+            rows: usize,
+            cols: usize,
+            constant: f32,
+            su: &[f32],
+            sv: &[f32],
+        ) -> Vec<f32> {
+            // H * constant * H has only one DC value per 128x128 block.
+            // sv=1/128 preserves the original constant there, including the
+            // smallest subnormal and negative zero.
+            (0..rows * cols)
+                .map(|index| {
+                    let row = index / cols;
+                    let col = index % cols;
+                    let transformed = if row % 128 == 0 && col % 128 == 0 {
+                        f64::from(constant) * 128.0
+                    } else {
+                        0.0
+                    };
+                    (transformed * f64::from(sv[row]) * f64::from(su[row / 128 * cols + col]))
+                        as f32
+                })
+                .collect()
+        }
+
+        fn i4r_decode_matches_cpu_edge_corpus(backend: DecodeBackend) {
+            backend.preflight().unwrap();
             for (rows, cols) in [(128, 128), (256, 640), (128, 2560)] {
                 let (block, su, sv) = i4r_input(rows, cols);
                 let expected = cpu_i4r(&block, rows, cols, &su, &sv);
-                // SAFETY: a negative device ordinal is rejected without a
-                // device switch. Its sticky HIP 7 error must not taint launch.
-                assert_ne!(unsafe { hipSetDevice(-1) }, 0);
+                inject_runtime_error(backend);
                 let meta = QuantMeta {
                     su: &su,
                     sv: &sv,
                     ..Default::default()
                 };
-                equal_bits(&decode_i4r(&block, rows, cols, &meta).unwrap(), &expected);
+                equal_bits(
+                    &decode_i4r(backend, &block, rows, cols, &meta).unwrap(),
+                    &expected,
+                );
             }
             let su: Vec<f32> = (0..128)
                 .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
@@ -587,17 +893,15 @@ mod tests {
                         ..Default::default()
                     };
                     equal_bits(
-                        &decode_i4r(&block, 128, 128, &meta).unwrap(),
+                        &decode_i4r(backend, &block, 128, 128, &meta).unwrap(),
                         &cpu_i4r(&block, 128, 128, &su, &sv),
                     );
                 }
             }
         }
 
-        #[test]
-        #[ignore = "requires gfx1151 HIP; independent HT3/HT4 circular states, paired tiles and f32 subnormals"]
-        fn hip_ht_decode_matches_independent_verifier() {
-            DecodeBackend::Hip.preflight().unwrap();
+        fn ht_decode_matches_independent_verifier(backend: DecodeBackend) {
+            backend.preflight().unwrap();
             let mut saw_subnormal = false;
             for bits in [3, 4] {
                 for (tiles, offset) in [(8, 0), (16, 0), (16, 8)] {
@@ -605,11 +909,10 @@ mod tests {
                         let (bytes, su, sv) = ht_input(rows, cols, bits, tiles);
                         let expected = cpu_ht(&bytes, rows, cols, bits, tiles, offset, &su, &sv);
                         saw_subnormal |= expected.iter().any(|value| value.is_subnormal());
-                        // SAFETY: intentionally retain a previously reported
-                        // runtime failure before a valid independent decode.
-                        assert_ne!(unsafe { hipSetDevice(-1) }, 0);
+                        inject_runtime_error(backend);
                         equal_bits(
                             &decode_ht(
+                                backend,
                                 &bytes,
                                 rows,
                                 cols,
@@ -629,6 +932,7 @@ mod tests {
                         bytes.fill(fill);
                         equal_bits(
                             &decode_ht(
+                                backend,
                                 &bytes,
                                 128,
                                 128,
@@ -651,10 +955,8 @@ mod tests {
             );
         }
 
-        #[test]
-        #[ignore = "requires gfx1151 HIP; exceed bounded workspace in both rectangle dimensions"]
-        fn hip_decode_crosses_band_and_column_batch_boundaries() {
-            DecodeBackend::Hip.preflight().unwrap();
+        fn decode_crosses_band_and_column_batch_boundaries(backend: DecodeBackend) {
+            backend.preflight().unwrap();
             // Native holds 256 128x128 blocks. 257 forces a nonempty tail;
             // the wide case also exercises pitched code/scale/output copies.
             for (rows, cols) in [(128, 257 * 128), (257 * 128, 128)] {
@@ -665,13 +967,14 @@ mod tests {
                     ..Default::default()
                 };
                 equal_bits(
-                    &decode_i4r(&block, rows, cols, &meta).unwrap(),
+                    &decode_i4r(backend, &block, rows, cols, &meta).unwrap(),
                     &cpu_i4r(&block, rows, cols, &su, &sv),
                 );
                 for (bits, tiles, offset) in [(3, 16, 8), (4, 8, 0)] {
                     let (bytes, su, sv) = ht_input(rows, cols, bits, tiles);
                     equal_bits(
                         &decode_ht(
+                            backend,
                             &bytes,
                             rows,
                             cols,
@@ -689,17 +992,18 @@ mod tests {
             }
         }
 
-        #[test]
-        #[ignore = "requires gfx1151 HIP; content cache changes, exact signed zeros and smallest f32 values"]
-        fn hip_ht_decode_caches_contents_not_addresses() {
-            DecodeBackend::Hip.preflight().unwrap();
+        fn ht_decode_caches_contents_not_addresses(backend: DecodeBackend) {
+            backend.preflight().unwrap();
             let (rows, cols) = (256, 256);
             let mut codebook = VERIFICATION_HT_CODEBOOK.to_vec();
             for bits in [3, 4] {
                 let (bytes, su, sv) = ht_input(rows, cols, bits, 16);
                 codebook.copy_from_slice(&VERIFICATION_HT_CODEBOOK);
                 equal_bits(
-                    &decode_ht(&bytes, rows, cols, bits, &su, &sv, 16, 8, &codebook).unwrap(),
+                    &decode_ht(
+                        backend, &bytes, rows, cols, bits, &su, &sv, 16, 8, &codebook,
+                    )
+                    .unwrap(),
                     &cpu_ht(&bytes, rows, cols, bits, 16, 8, &su, &sv),
                 );
                 let su: Vec<f32> = (0..rows / 128 * cols)
@@ -708,41 +1012,28 @@ mod tests {
                 let sv = vec![1.0 / 128.0; rows];
                 for constant in [0.0, -0.0, f32::from_bits(1), -f32::from_bits(1), 1.0, -1.0] {
                     codebook.fill(constant);
-                    // H * constant * H has only one DC value per 128x128
-                    // block. With sv=1/128 that value is the original constant,
-                    // even for the smallest subnormal and negative zero.
-                    let expected: Vec<f32> = (0..rows * cols)
-                        .map(|index| {
-                            let row = index / cols;
-                            let col = index % cols;
-                            let transformed = if row % 128 == 0 && col % 128 == 0 {
-                                f64::from(constant) * 128.0
-                            } else {
-                                0.0
-                            };
-                            (transformed
-                                * f64::from(sv[row])
-                                * f64::from(su[row / 128 * cols + col]))
-                                as f32
-                        })
-                        .collect();
+                    let expected = constant_ht_expected(rows, cols, constant, &su, &sv);
                     equal_bits(
-                        &decode_ht(&bytes, rows, cols, bits, &su, &sv, 16, 8, &codebook).unwrap(),
+                        &decode_ht(
+                            backend, &bytes, rows, cols, bits, &su, &sv, 16, 8, &codebook,
+                        )
+                        .unwrap(),
                         &expected,
                     );
                 }
             }
         }
 
-        #[test]
-        #[ignore = "requires gfx1151 HIP; malformed native ABI extents, output overflow and recovery"]
-        fn hip_decode_errors_do_not_read_invalid_extents_or_poison_context() {
-            DecodeBackend::Hip.preflight().unwrap();
+        fn decode_errors_do_not_read_invalid_extents_or_poison_context(backend: DecodeBackend) {
+            backend.preflight().unwrap();
             // SAFETY: each deliberately invalid ABI call must reject its shape,
             // null pointers, or overflowing address extent before any read.
             unsafe {
                 assert_ne!(
-                    hgn_hip_decode_i4r(
+                    native_call!(
+                        backend,
+                        hgn_hip_decode_i4r,
+                        hgn_cuda_decode_i4r,
                         std::ptr::null(),
                         std::ptr::null(),
                         std::ptr::null(),
@@ -754,7 +1045,10 @@ mod tests {
                     0
                 );
                 assert_ne!(
-                    hgn_hip_decode_i4r(
+                    native_call!(
+                        backend,
+                        hgn_hip_decode_i4r,
+                        hgn_cuda_decode_i4r,
                         1usize as *const u8,
                         2usize as *const u16,
                         4usize as *const f32,
@@ -765,9 +1059,12 @@ mod tests {
                     ),
                     0
                 );
-                assert!(hip_last_error().contains("shape overflows"));
+                assert!(native_last_error(backend).contains("shape overflows"));
                 assert_ne!(
-                    hgn_hip_decode_i4r(
+                    native_call!(
+                        backend,
+                        hgn_hip_decode_i4r,
+                        hgn_cuda_decode_i4r,
                         (usize::MAX - 3) as *const u8,
                         2usize as *const u16,
                         4usize as *const f32,
@@ -778,9 +1075,12 @@ mod tests {
                     ),
                     0
                 );
-                assert!(hip_last_error().contains("buffer extent"));
+                assert!(native_last_error(backend).contains("buffer extent"));
                 assert_ne!(
-                    hgn_hip_decode_ht(
+                    native_call!(
+                        backend,
+                        hgn_hip_decode_ht,
+                        hgn_cuda_decode_ht,
                         std::ptr::null(),
                         std::ptr::null(),
                         std::ptr::null(),
@@ -794,9 +1094,12 @@ mod tests {
                     ),
                     0
                 );
-                assert!(hip_last_error().contains("tile geometry"));
+                assert!(native_last_error(backend).contains("tile geometry"));
                 assert_ne!(
-                    hgn_hip_decode_ht(
+                    native_call!(
+                        backend,
+                        hgn_hip_decode_ht,
+                        hgn_cuda_decode_ht,
                         1usize as *const u8,
                         (usize::MAX - 3) as *const f32,
                         4usize as *const f32,
@@ -810,13 +1113,13 @@ mod tests {
                     ),
                     0
                 );
-                assert!(hip_last_error().contains("buffer extent"));
+                assert!(native_last_error(backend).contains("buffer extent"));
             }
             let bytes = vec![0; 8192];
             let signs = vec![1.0; 128];
             let codebook = vec![f32::MAX; 65536];
             assert!(
-                decode_ht(&bytes, 128, 128, 4, &signs, &signs, 8, 0, &codebook)
+                decode_ht(backend, &bytes, 128, 128, 4, &signs, &signs, 8, 0, &codebook)
                     .unwrap_err()
                     .to_string()
                     .contains("nonfinite HT verifier value")
@@ -824,6 +1127,7 @@ mod tests {
             let (bytes, su, sv) = ht_input(128, 128, 4, 8);
             equal_bits(
                 &decode_ht(
+                    backend,
                     &bytes,
                     128,
                     128,
@@ -838,5 +1142,124 @@ mod tests {
                 &cpu_ht(&bytes, 128, 128, 4, 8, 0, &su, &sv),
             );
         }
+
+        fn decode_serializes_concurrent_callers(backend: DecodeBackend) {
+            backend.preflight().unwrap();
+            let signs = [1.0; 128];
+            let scales = [1.0 / 128.0; 128];
+            let constants = [1.0, -1.0, f32::from_bits(1), -f32::from_bits(1)];
+            // Prepare every oracle before starting threads: an oracle failure
+            // must not strand a caller at the start barrier.
+            let cases: Vec<_> = (0..constants.len())
+                .map(|caller| {
+                    let bits = 3 + caller % 2;
+                    let offset = 8 * (caller / 2);
+                    let block = EncodedBlock {
+                        codes: vec![0x11 * (caller as u8 + 1); 8192],
+                        scales: (0..128)
+                            .flat_map(|_| f16::from_f32(caller as f32 + 1.0).to_le_bytes())
+                            .collect(),
+                    };
+                    let bytes = vec![0x55 * caller as u8; 8 * 16 * 32 * bits];
+                    let expected_i4r = cpu_i4r(&block, 128, 128, &signs, &signs);
+                    let expected_ht = cpu_ht(&bytes, 128, 128, bits, 16, offset, &signs, &scales);
+                    let expected_constant =
+                        constant_ht_expected(128, 128, constants[caller], &signs, &scales);
+                    (
+                        block,
+                        bytes,
+                        expected_i4r,
+                        expected_ht,
+                        expected_constant,
+                        VERIFICATION_HT_CODEBOOK.to_vec(),
+                    )
+                })
+                .collect();
+            let start = std::sync::Barrier::new(cases.len());
+            let (start, signs, scales) = (&start, &signs, &scales);
+            std::thread::scope(|scope| {
+                for (
+                    caller,
+                    (block, bytes, expected_i4r, expected_ht, expected_constant, mut codebook),
+                ) in cases.into_iter().enumerate()
+                {
+                    scope.spawn(move || {
+                        // Only the first call is synchronized. Later assertions
+                        // may fail without trapping another worker at a barrier.
+                        start.wait();
+                        let bits = 3 + caller % 2;
+                        let offset = 8 * (caller / 2);
+                        let meta = QuantMeta {
+                            su: signs,
+                            sv: signs,
+                            ..Default::default()
+                        };
+                        for _ in 0..4 {
+                            inject_runtime_error(backend);
+                            equal_bits(
+                                &decode_i4r(backend, &block, 128, 128, &meta).unwrap(),
+                                &expected_i4r,
+                            );
+                            codebook.copy_from_slice(&VERIFICATION_HT_CODEBOOK);
+                            equal_bits(
+                                &decode_ht(
+                                    backend, &bytes, 128, 128, bits, signs, scales, 16, offset,
+                                    &codebook,
+                                )
+                                .unwrap(),
+                                &expected_ht,
+                            );
+                            // Different contents at stable, thread-owned addresses
+                            // exercise the shared native cache under contention.
+                            codebook.fill(constants[caller]);
+                            equal_bits(
+                                &decode_ht(
+                                    backend, &bytes, 128, 128, bits, signs, scales, 16, offset,
+                                    &codebook,
+                                )
+                                .unwrap(),
+                                &expected_constant,
+                            );
+                        }
+                    });
+                }
+            });
+        }
+
+        macro_rules! device_tests {
+            ($backend:expr, $requirement:literal, $($name:ident => $corpus:ident),+ $(,)?) => {
+                $(
+                    #[test]
+                    #[ignore = $requirement]
+                    fn $name() {
+                        $corpus($backend);
+                    }
+                )+
+            };
+        }
+
+        #[cfg(feature = "hip")]
+        device_tests!(
+            DecodeBackend::Hip,
+            "requires gfx1151 HIP; bit-exact decoding against CPU/independent oracles",
+            hip_i4r_decode_matches_cpu_edge_corpus => i4r_decode_matches_cpu_edge_corpus,
+            hip_ht_decode_matches_independent_verifier => ht_decode_matches_independent_verifier,
+            hip_decode_crosses_band_and_column_batch_boundaries => decode_crosses_band_and_column_batch_boundaries,
+            hip_ht_decode_caches_contents_not_addresses => ht_decode_caches_contents_not_addresses,
+            hip_decode_errors_do_not_read_invalid_extents_or_poison_context => decode_errors_do_not_read_invalid_extents_or_poison_context,
+            hip_decode_serializes_concurrent_callers => decode_serializes_concurrent_callers,
+        );
+
+        #[cfg(feature = "cuda")]
+        device_tests!(
+            DecodeBackend::Cuda,
+            "requires CUDA device; bit-exact decoding against CPU/independent oracles",
+            cuda_i4r_decode_matches_cpu_edge_corpus => i4r_decode_matches_cpu_edge_corpus,
+            cuda_ht_decode_matches_independent_verifier => ht_decode_matches_independent_verifier,
+            cuda_decode_crosses_band_and_column_batch_boundaries => decode_crosses_band_and_column_batch_boundaries,
+            cuda_ht_decode_caches_contents_not_addresses => ht_decode_caches_contents_not_addresses,
+            cuda_decode_errors_do_not_read_invalid_extents_or_poison_context => decode_errors_do_not_read_invalid_extents_or_poison_context,
+            cuda_decode_serializes_concurrent_callers => decode_serializes_concurrent_callers,
+        );
     }
 }

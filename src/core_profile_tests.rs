@@ -277,65 +277,123 @@ fn conversion_work_counts_ngram_passes_and_rotation_writes_not_preparation() {
         assets: Vec::new(),
     };
     validate_plan(&snapshot, &plan).unwrap();
-    let options = Options {
-        ht_backend: codec::HtBackend::Hip,
-        ..Options::default()
-    };
-    let estimate = conversion_work(&snapshot, &plan, &options).unwrap();
-    // 320 values in each table pass, plus 128 signs and two scale values
-    // written once. The earlier 320-value HT scale scan is not counted here.
-    assert_eq!(estimate.total(), 770);
-    assert_eq!(estimate.planned_values(WorkClass::ScanFp8Scale), 320);
-    assert_eq!(
-        estimate.planned_values(WorkClass::encode(Encoding::Fp8G128, codec::HtBackend::Cpu)),
-        320
-    );
-    assert_eq!(estimate.planned_values(WorkClass::WriteRotation), 130);
-    assert_eq!(
-        estimate.planned_values(WorkClass::encode(Encoding::Ht, codec::HtBackend::Hip)),
-        0
-    );
-    let mut overflow = plan;
-    overflow.files[0].tensors[0].shape = vec![u64::MAX];
-    assert!(conversion_work(&snapshot, &overflow, &options).is_err());
+    for backend in [
+        codec::HtBackend::Cpu,
+        codec::HtBackend::Hip,
+        codec::HtBackend::Cuda,
+    ] {
+        let options = Options {
+            ht_backend: backend,
+            ..Options::default()
+        };
+        let estimate = conversion_work(&snapshot, &plan, &options).unwrap();
+        // 320 values in each table pass, plus 128 signs and two scale values
+        // written once. The earlier 320-value HT scale scan is not counted here.
+        assert_eq!(estimate.total(), 770);
+        assert_eq!(estimate.planned_values(WorkClass::ScanFp8Scale), 320);
+        assert_eq!(
+            estimate.planned_values(WorkClass::encode(Encoding::Fp8G128, backend)),
+            320
+        );
+        assert_eq!(estimate.planned_values(WorkClass::WriteRotation), 130);
+        for encoding in [Encoding::Ht, Encoding::Ht3] {
+            assert_eq!(
+                estimate.planned_values(WorkClass::encode(encoding, backend)),
+                0
+            );
+        }
+        let mut overflow = plan.clone();
+        overflow.files[0].tensors[0].shape = vec![u64::MAX];
+        assert!(conversion_work(&snapshot, &overflow, &options).is_err());
+    }
 }
 
 #[test]
 fn conversion_work_classifies_copy_reencoding_and_actual_backend() {
-    let options = Options {
-        ht_backend: codec::HtBackend::Hip,
-        ..Options::default()
-    };
-    for (encoding, dtype) in [
-        (Encoding::Bf16, Dtype::Bf16),
-        (Encoding::F32, Dtype::F32),
-        (Encoding::I64, Dtype::I64),
+    for backend in [
+        codec::HtBackend::Cpu,
+        codec::HtBackend::Hip,
+        codec::HtBackend::Cuda,
     ] {
+        let options = Options {
+            ht_backend: backend,
+            ..Options::default()
+        };
+        for (encoding, dtype) in [
+            (Encoding::Bf16, Dtype::Bf16),
+            (Encoding::F32, Dtype::F32),
+            (Encoding::I64, Dtype::I64),
+        ] {
+            let class = source_work(encoding, dtype, &options);
+            assert_eq!(class, WorkClass::Copy(encoding));
+            assert_eq!(class.backend_label(), "CPU");
+        }
+        // Imported F32 values converted back to BF16 are encoding work, not copies.
         assert_eq!(
-            source_work(encoding, dtype, &options),
-            WorkClass::Copy(encoding)
+            source_work(Encoding::Bf16, Dtype::F32, &options),
+            WorkClass::encode(Encoding::Bf16, codec::HtBackend::Cpu)
         );
+        for encoding in [Encoding::Ht, Encoding::Ht3] {
+            let class = source_work(encoding, Dtype::Bf16, &options);
+            assert_eq!(class, WorkClass::Encode(encoding, backend));
+            assert_eq!(class.backend_label(), backend.label());
+        }
+        for encoding in [
+            Encoding::F16,
+            Encoding::F32,
+            Encoding::I64,
+            Encoding::Fp8G128,
+            Encoding::I4r,
+            Encoding::Q4Cp,
+            Encoding::Q8G64,
+            Encoding::Q6G64,
+        ] {
+            let class = source_work(encoding, Dtype::Bf16, &options);
+            assert_eq!(class, WorkClass::Encode(encoding, codec::HtBackend::Cpu));
+            assert_eq!(class.backend_label(), "CPU");
+        }
     }
-    // Imported F32 values converted back to BF16 are encoding work, not copies.
-    assert_eq!(
-        source_work(Encoding::Bf16, Dtype::F32, &options),
-        WorkClass::encode(Encoding::Bf16, codec::HtBackend::Cpu)
-    );
-    for encoding in [Encoding::Ht, Encoding::Ht3] {
-        assert_eq!(
-            source_work(encoding, Dtype::Bf16, &options),
-            WorkClass::Encode(encoding, codec::HtBackend::Hip)
-        );
-    }
+    assert_eq!(WorkClass::WriteRotation.backend_label(), "CPU");
+    assert_eq!(WorkClass::ScanFp8Scale.backend_label(), "CPU");
+}
+
+#[test]
+fn conversion_work_slots_keep_cpu_hip_cuda_and_nonencoding_classes_distinct() {
+    let mut classes = Vec::new();
     for encoding in [
-        Encoding::I4r,
+        Encoding::Bf16,
+        Encoding::F16,
+        Encoding::F32,
+        Encoding::I64,
         Encoding::Q4Cp,
         Encoding::Q8G64,
         Encoding::Q6G64,
+        Encoding::Fp8G128,
+        Encoding::Ht,
+        Encoding::Ht3,
+        Encoding::I4r,
     ] {
+        classes.push(WorkClass::encode(encoding, codec::HtBackend::Cpu));
+    }
+    for backend in [codec::HtBackend::Hip, codec::HtBackend::Cuda] {
+        for encoding in [Encoding::Ht, Encoding::Ht3] {
+            classes.push(WorkClass::encode(encoding, backend));
+        }
+    }
+    for encoding in [Encoding::Bf16, Encoding::F32, Encoding::I64] {
+        classes.push(WorkClass::Copy(encoding));
+    }
+    classes.extend([WorkClass::WriteRotation, WorkClass::ScanFp8Scale]);
+    let mut estimate = WorkEstimate::default();
+    for (index, &class) in classes.iter().enumerate() {
+        estimate.add(class, index as u64 + 1).unwrap();
+    }
+    assert_eq!(estimate.total(), 210);
+    for (index, &class) in classes.iter().enumerate() {
         assert_eq!(
-            source_work(encoding, Dtype::Bf16, &options),
-            WorkClass::Encode(encoding, codec::HtBackend::Cpu)
+            estimate.planned_values(class),
+            index as u64 + 1,
+            "{class:?}"
         );
     }
 }

@@ -1,8 +1,9 @@
-//! Library-only structural fixture: real CPU/HIP encode, atomic publication,
+//! Library-only structural fixture: real CPU/GPU encode, atomic publication,
 //! independent full verification and byte-for-byte HGN container comparison.
-//! `--root /tmp/tiny-hip` retains inputs/outputs; a CPU-only executable can then
-//! use `--root /tmp/tiny-hip --verify-only` without a GPU or HIP feature.
-//! Select real HIP verification with `--verify-only --decode-backend hip`.
+//! HIP remains the default; `--backend cuda` selects CUDA instead.
+//! `--root /tmp/tiny-cuda --backend cuda` retains inputs and cpu/cuda outputs;
+//! a CPU-only executable can use those arguments plus `--verify-only`.
+//! Select real GPU verification with `--decode-backend hip` or `cuda`.
 
 #[path = "../tests/support/mod.rs"]
 mod support;
@@ -16,7 +17,7 @@ use bf16_to_hgn::{
     verify,
     verify_gpu::DecodeBackend,
 };
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -25,10 +26,35 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[derive(Clone, Copy, ValueEnum)]
+enum GpuBackend {
+    Hip,
+    Cuda,
+}
+
+impl GpuBackend {
+    fn encoder(self) -> HtBackend {
+        match self {
+            Self::Hip => HtBackend::Hip,
+            Self::Cuda => HtBackend::Cuda,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Hip => "hip",
+            Self::Cuda => "cuda",
+        }
+    }
+}
+
 #[derive(Parser)]
-#[command(about = "Real tiny CPU/HIP conversion, independent verification and exact HGN bytes")]
+#[command(about = "Real tiny CPU/GPU conversion, independent verification and exact HGN bytes")]
 struct Args {
-    /// New directory retaining genuine fixture source plus cpu/hip outputs.
+    /// GPU encoder and retained output directory; defaults to HIP.
+    #[arg(long, value_enum, default_value = "hip")]
+    backend: GpuBackend,
+    /// New directory retaining genuine fixture source plus cpu/GPU outputs.
     #[arg(long)]
     root: Option<PathBuf>,
     /// Verify existing outputs and compare bytes; works in CPU-only builds.
@@ -41,13 +67,13 @@ struct Args {
     ht_beam: usize,
 }
 
-fn compare_container(cpu: &Path, hip: &Path) -> Result<Value> {
+fn compare_container(cpu: &Path, gpu: &Path) -> Result<Value> {
     let mut cpu = fs::File::open(cpu)?;
-    let mut hip = fs::File::open(hip)?;
+    let mut gpu = fs::File::open(gpu)?;
     let size = cpu.metadata()?.len();
     ensure!(
-        size == hip.metadata()?.len(),
-        "CPU/HIP container sizes differ"
+        size == gpu.metadata()?.len(),
+        "CPU/GPU container sizes differ"
     );
     let mut remaining = size;
     let mut offset = 0u64;
@@ -57,10 +83,10 @@ fn compare_container(cpu: &Path, hip: &Path) -> Result<Value> {
     while remaining > 0 {
         let take = remaining.min(left.len() as u64) as usize;
         cpu.read_exact(&mut left[..take])?;
-        hip.read_exact(&mut right[..take])?;
+        gpu.read_exact(&mut right[..take])?;
         ensure!(
             left[..take] == right[..take],
-            "CPU/HIP container bytes differ at chunk offset {offset}"
+            "CPU/GPU container bytes differ at chunk offset {offset}"
         );
         hash.update(&left[..take]);
         remaining -= take as u64;
@@ -71,13 +97,17 @@ fn compare_container(cpu: &Path, hip: &Path) -> Result<Value> {
 
 fn verify_and_compare(
     root: &Path,
+    gpu_backend: GpuBackend,
     decode_backend: DecodeBackend,
     progress: &Progress,
 ) -> Result<Value> {
     let snapshot = hf::Snapshot::open(&root.join("source"))?;
     let mut manifests = Vec::new();
     let mut reports = Vec::<Value>::new();
-    for (name, backend) in [("cpu", HtBackend::Cpu), ("hip", HtBackend::Hip)] {
+    for (name, backend) in [
+        ("cpu", HtBackend::Cpu),
+        (gpu_backend.name(), gpu_backend.encoder()),
+    ] {
         let output = root.join(name);
         let manifest: Manifest =
             serde_json::from_value(hf::read_json(&output.join("conversion-manifest.json"))?)
@@ -96,43 +126,45 @@ fn verify_and_compare(
         if let Some(reference) = reports.first() {
             ensure!(
                 reference["verification"] == report,
-                "complete verification reports differ for CPU/HIP encoded payloads"
+                "complete verification reports differ for CPU/GPU encoded payloads"
             );
         }
         reports.push(json!({"backend": backend, "verification": report}));
         manifests.push(manifest);
     }
     let cpu = &manifests[0];
-    let hip = &manifests[1];
-    let mut hip_options = hip.options.clone();
-    hip_options.ht_backend = HtBackend::Cpu;
+    let gpu = &manifests[1];
+    let mut gpu_options = gpu.options.clone();
+    gpu_options.ht_backend = HtBackend::Cpu;
     ensure!(
-        cpu.options == hip_options,
-        "CPU/HIP conversion options differ beyond backend"
+        cpu.options == gpu_options,
+        "CPU/GPU conversion options differ beyond backend"
     );
-    ensure!(cpu.plan == hip.plan, "CPU/HIP plans differ");
+    ensure!(cpu.plan == gpu.plan, "CPU/GPU plans differ");
     ensure!(
-        cpu.sources == hip.sources && cpu.assets == hip.assets,
-        "CPU/HIP source or copied-asset fingerprints differ"
+        cpu.sources == gpu.sources && cpu.assets == gpu.assets,
+        "CPU/GPU source or copied-asset fingerprints differ"
     );
     ensure!(
-        cpu.containers == hip.containers,
-        "CPU/HIP payload layouts or fingerprints differ"
+        cpu.containers == gpu.containers,
+        "CPU/GPU payload layouts or fingerprints differ"
     );
     let mut containers = Vec::new();
     for container in &cpu.containers {
         let comparison = compare_container(
             &root.join("cpu").join(&container.filename),
-            &root.join("hip").join(&container.filename),
+            &root.join(gpu_backend.name()).join(&container.filename),
         )?;
         containers.push(json!({"filename": container.filename, "comparison": comparison}));
     }
     let decode_backend = match decode_backend {
         DecodeBackend::Cpu => "cpu",
         DecodeBackend::Hip => "hip",
+        DecodeBackend::Cuda => "cuda",
     };
     Ok(json!({
         "fixture": "library-only; not an engine-compatible checkpoint or public CLI bypass",
+        "encoding_backend": gpu_backend.encoder(),
         "decode_backend": decode_backend,
         "ht_beam": cpu.options.ht_beam,
         "conversion_encoder_sha256": cpu.encoder_sha256,
@@ -150,7 +182,7 @@ fn main() -> Result<()> {
         seed: 7,
         threads: 1,
         ht_beam: args.ht_beam,
-        ht_backend: HtBackend::Hip,
+        ht_backend: args.backend.encoder(),
     };
     if !args.verify_only {
         // Fail before creating even a fixture directory: never fake a GPU run.
@@ -173,8 +205,11 @@ fn main() -> Result<()> {
             .to_path_buf()
     };
     if !args.verify_only {
-        let (snapshot, plan) = support::hip_fixture(&root)?;
-        for (name, backend) in [("cpu", HtBackend::Cpu), ("hip", HtBackend::Hip)] {
+        let (snapshot, plan) = support::gpu_fixture(&root)?;
+        for (name, backend) in [
+            ("cpu", HtBackend::Cpu),
+            (args.backend.name(), args.backend.encoder()),
+        ] {
             let opts = Options {
                 ht_backend: backend,
                 ..options.clone()
@@ -184,9 +219,55 @@ fn main() -> Result<()> {
     }
     println!(
         "{}",
-        serde_json::to_string_pretty(&verify_and_compare(&root, args.decode_backend, &progress)?)?
+        serde_json::to_string_pretty(&verify_and_compare(
+            &root,
+            args.backend,
+            args.decode_backend,
+            &progress,
+        )?)?
     );
     // Retained roots are never deleted; the default TempDir cleans up its own fixture.
     drop(temporary);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_backend_stays_hip() {
+        let args = Args::parse_from(["tiny_hip_conversion"]);
+        assert!(matches!(args.backend, GpuBackend::Hip));
+        assert!(matches!(args.decode_backend, DecodeBackend::Cpu));
+    }
+
+    #[test]
+    fn cuda_verify_only_defaults_to_cpu_decoder() {
+        let args = Args::parse_from([
+            "tiny_hip_conversion",
+            "--backend",
+            "cuda",
+            "--root",
+            "/tmp/tiny-cuda",
+            "--verify-only",
+        ]);
+        assert!(args.verify_only);
+        assert!(matches!(args.backend, GpuBackend::Cuda));
+        assert!(matches!(args.decode_backend, DecodeBackend::Cpu));
+        assert!(Args::try_parse_from(["tiny_hip_conversion", "--backend", "cpu"]).is_err());
+    }
+
+    #[test]
+    fn cuda_decoder_is_selectable_independently() {
+        let args = Args::parse_from([
+            "tiny_hip_conversion",
+            "--backend",
+            "hip",
+            "--decode-backend",
+            "cuda",
+        ]);
+        assert!(matches!(args.backend, GpuBackend::Hip));
+        assert!(matches!(args.decode_backend, DecodeBackend::Cuda));
+    }
 }

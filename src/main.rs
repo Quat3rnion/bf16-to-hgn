@@ -121,7 +121,7 @@ struct EncodingOptions {
     /// Deterministic approximate HT trellis beam width (1..256).
     #[arg(long, default_value_t = 128)]
     ht_beam: usize,
-    /// HT3/HT4 trellis execution backend; requires --features hip for real HIP encoding.
+    /// HT3/HT4 trellis backend; real GPU execution requires --features hip or cuda.
     #[arg(long, value_enum, default_value_t = HtBackend::Cpu)]
     ht_backend: HtBackend,
 }
@@ -201,6 +201,7 @@ fn run() -> Result<()> {
             output,
             decode_backend,
         } => {
+            decode_backend.preflight()?;
             let options = verify::manifest_options(&output)?;
             let snapshot = input.open()?;
             let plan = architecture::plan(snapshot.as_ref(), &options)?;

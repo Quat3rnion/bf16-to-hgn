@@ -13,6 +13,8 @@
 //! printing, result-vector allocation, and output destruction are excluded.
 //! All returned code/scale bytes, padding, codebook/global scale, and rotation
 //! side planes are fingerprinted; every iteration, thread count and backend must agree.
+//! GPU preflight durations are recorded separately per selected backend.
+//! Only HT3/HT4 use the selected GPU; every other encoding remains CPU.
 
 use anyhow::{bail, ensure, Context, Result};
 use bf16_to_hgn::codec::{
@@ -34,7 +36,8 @@ use std::time::Instant;
 const ROWS: usize = 128;
 const MAX_BAND_VALUES: usize = 8 * 1024 * 1024;
 const MAX_RETAINED_BYTES: u64 = 128 * 1024 * 1024;
-const CONTRACT: &str = "encoder-bench-v1";
+const CONTRACT: &str = "encoder-bench-v2";
+const SCHEMA: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Case {
@@ -182,7 +185,7 @@ struct Args {
     fixtures: Vec<Fixture>,
     #[arg(long, value_delimiter = ',', default_value = "1,8,128")]
     corpus_beams: Vec<usize>,
-    /// Timed HT beam width. CPU permits up to 4096; HIP supports 1..=256.
+    /// Timed HT beam width. CPU permits up to 4096; GPUs support 1..=256.
     #[arg(long, default_value_t = 128)]
     timing_beam: usize,
     /// Indexed HF snapshot; only metadata and the selected BF16 bands are read.
@@ -950,23 +953,24 @@ fn run_workload(
         );
         // Neither backend nor threads is part of the equality key.
         for &backend in &args.backends {
+            let effective_backend = if ht { backend } else { HtBackend::Cpu };
             let timed_region = json!({
                 "public_encoding": true, "validation": true, "codec_allocations": true,
                 "rotation": work.case.rotated(), "input_setup": false, "sign_generation": false,
                 "row_rms": false, "hashing": false, "output_destruction": false,
-                "hip_host_device_copies_and_synchronization": ht && backend == HtBackend::Hip,
-                "hip_device_preflight": false, "preallocated_result_push": true,
+                "gpu_host_device_copies_and_synchronization": effective_backend.is_gpu(),
+                "gpu_device_preflight": false, "preallocated_result_push": true,
             });
             for &threads in &args.threads {
                 for _ in 0..warmup {
-                    let block = encode(work, threads, beam, backend)?;
+                    let block = encode(work, threads, beam, effective_backend)?;
                     check_output(expected, &key, fingerprint(work, &block)?)?;
                 }
                 for sample in 0..repetitions {
                     let mut outputs = Vec::with_capacity(iterations);
                     let start = Instant::now();
                     for _ in 0..iterations {
-                        outputs.push(black_box(encode(work, threads, beam, backend)?));
+                        outputs.push(black_box(encode(work, threads, beam, effective_backend)?));
                     }
                     let elapsed_ns = ns(start)?;
                     let mut output_fingerprint = None;
@@ -979,14 +983,14 @@ fn run_workload(
                     emit(
                         out,
                         &json!({
-                            "schema": 1, "kind": "sample", "contract": CONTRACT,
+                            "schema": SCHEMA, "kind": "sample", "contract": CONTRACT,
                             "label": args.label, "suite": suite, "case": work.case.name(),
                             "encoding_code": work.case.encoding().code(), "encoding_variant": work.case.encoding().variant(),
                             "fixture": work.fixture.name(), "source": work.source, "seed": args.seed,
                             "rows": work.rows, "cols": work.cols, "projection_count": if work.case.paired() { 2 } else { 1 },
                             "payload_rows": payload_rows, "values_per_iteration": values_per_iteration,
                             "beam": if ht { Some(beam) } else { None }, "threads": threads,
-                            "backend": backend, "encoding_backend": if ht { backend } else { HtBackend::Cpu },
+                            "selected_backend": backend, "effective_backend": effective_backend,
                             "sample": sample, "iterations": iterations, "repetitions": repetitions, "warmup": warmup,
                             "elapsed_ns": elapsed_ns, "ns_per_iteration": elapsed_ns as f64 / iterations as f64,
                             "values_per_second": values_per_iteration as f64 * iterations as f64 * 1.0e9 / elapsed_ns.max(1) as f64,
@@ -1047,17 +1051,20 @@ fn main() -> Result<()> {
         "timing beam must be in 1..=4096"
     );
     ensure!(!args.backends.is_empty(), "select at least one backend");
-    let hip_preflight_elapsed_ns = if args.backends.contains(&HtBackend::Hip) {
+    let mut gpu_preflight = Vec::new();
+    for backend in [HtBackend::Hip, HtBackend::Cuda] {
+        if !args.backends.contains(&backend) {
+            continue;
+        }
         ensure!(
             args.timing_beam <= 256 && args.corpus_beams.iter().all(|beam| *beam <= 256),
-            "HIP beams must be in 1..=256"
+            "{} beams must be in 1..=256",
+            backend.label(),
         );
         let start = Instant::now();
-        HtBackend::Hip.preflight()?;
-        Some(ns(start)?)
-    } else {
-        None
-    };
+        backend.preflight()?;
+        gpu_preflight.push(json!({"backend": backend, "elapsed_ns": ns(start)?}));
+    }
     if args.hf.is_none()
         && (args.tensor.is_some()
             || args.up_tensor.is_some()
@@ -1082,7 +1089,7 @@ fn main() -> Result<()> {
     emit(
         &mut out,
         &json!({
-            "schema": 1, "kind": "run", "contract": CONTRACT, "label": args.label,
+            "schema": SCHEMA, "kind": "run", "contract": CONTRACT, "label": args.label,
             "encoder_sha256": bf16_to_hgn::ENCODER_SHA256, "package_version": env!("CARGO_PKG_VERSION"),
             "debug_assertions": cfg!(debug_assertions), "cases": cases.iter().map(|case| case.name()).collect::<Vec<_>>(),
             "threads": args.threads, "backends": args.backends,
@@ -1090,9 +1097,9 @@ fn main() -> Result<()> {
             "iterations": args.iterations, "repetitions": args.repetitions, "warmup": args.warmup,
             "synthetic_cols": args.cols, "fp8_rows": args.fp8_rows, "seed": args.seed,
             "real_band_read_elapsed_ns": real.as_ref().map(|real| real.read_elapsed_ns),
-            "hip_preflight_elapsed_ns": hip_preflight_elapsed_ns,
-            "hip_preflight_before_samples": hip_preflight_elapsed_ns.is_some(),
-            "hip_timing": "Synchronous public encoding includes GPU copies/kernels. Preflight is separate; fresh-process --backends hip --warmup 0 measures first encoding. Subsequent samples reuse native workspace/codebook.",
+            "gpu_preflight_before_samples": !gpu_preflight.is_empty(),
+            "gpu_preflight": gpu_preflight,
+            "gpu_timing": "Synchronous HT encoding includes GPU copies/kernels/synchronization only when effective_backend is a GPU. Preflight is separate; a fresh process with one GPU selected and --warmup 0 measures its first encoding. Subsequent samples reuse native workspace/codebook. Non-HT encodings remain CPU regardless of selected_backend.",
             "input_band_value_limit": MAX_BAND_VALUES, "retained_output_byte_limit": MAX_RETAINED_BYTES,
             "fingerprint": "SHA-256; little-endian raw floats/side planes; tagged component lengths; excludes timing, threads, backend and label",
         }),
@@ -1128,10 +1135,54 @@ mod tests {
         check_output(&mut expected, key, cpu.clone()).unwrap();
         check_output(&mut expected, key, cpu.clone()).unwrap();
         let mut changed_codes = cpu.clone();
-        changed_codes["codes"]["sha256"] = json!("different-hip-bytes");
+        changed_codes["codes"]["sha256"] = json!("different-gpu-bytes");
         assert!(check_output(&mut expected, key, changed_codes).is_err());
         let mut changed_plane = cpu;
         changed_plane["rotation_sv_f16"]["sha256"] = json!("different-scale-bytes");
         assert!(check_output(&mut expected, key, changed_plane).is_err());
+    }
+
+    #[test]
+    fn non_ht_samples_report_cpu_work_for_every_selected_backend() {
+        let args = Args::parse_from(["encoder_bench", "--backends", "cpu,hip,cuda"]);
+        for case in [
+            Case::I4r,
+            Case::Nf4,
+            Case::Q6g64,
+            Case::Q8g64,
+            Case::Fp8g128,
+        ] {
+            let work = prepare(&args, case, Fixture::Ordinary, false, None).unwrap();
+            let mut expected = BTreeMap::new();
+            let mut output = Vec::new();
+            run_workload(&args, &work, false, &mut expected, &mut output).unwrap();
+            let output = String::from_utf8(output).unwrap();
+            let samples: Vec<Value> = output
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(samples.len(), 3);
+            for (sample, selected) in samples.iter().zip(["cpu", "hip", "cuda"]) {
+                assert_eq!(sample["schema"], 2);
+                assert_eq!(sample["contract"], "encoder-bench-v2");
+                assert_eq!(sample["selected_backend"], selected);
+                assert_eq!(sample["effective_backend"], "cpu");
+                assert_eq!(
+                    sample["timed_region"]["gpu_host_device_copies_and_synchronization"],
+                    false
+                );
+                assert_eq!(sample["timed_region"]["gpu_device_preflight"], false);
+                assert_eq!(
+                    sample["output_fingerprint"],
+                    samples[0]["output_fingerprint"]
+                );
+                assert!(sample.get("backend").is_none());
+                assert!(sample.get("encoding_backend").is_none());
+                assert!(sample["timed_region"]
+                    .get("hip_host_device_copies_and_synchronization")
+                    .is_none());
+                assert!(sample["timed_region"].get("hip_device_preflight").is_none());
+            }
+        }
     }
 }

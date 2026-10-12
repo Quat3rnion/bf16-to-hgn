@@ -248,7 +248,7 @@ fn fixture_with_ht3(parent: &Path, include_ht3: bool) -> Result<(Snapshot, Conve
 
 /// Full tiny publication fixture with legal 2-D HT4/HT3 matrices and sidecars.
 /// Compact expert source axes are folded, never admitted as fake fused HGN shapes.
-pub fn hip_fixture(parent: &Path) -> Result<(Snapshot, ConversionPlan)> {
+pub fn gpu_fixture(parent: &Path) -> Result<(Snapshot, ConversionPlan)> {
     let (snapshot, mut plan) = fixture(parent)?;
     for tensor in &mut plan.files[0].tensors {
         match tensor.name.as_str() {

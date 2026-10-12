@@ -317,14 +317,18 @@ fn legacy_options_default_to_v2_and_profiles_serialize_explicitly() -> Result<()
     assert_eq!(old.profile, OutputProfile::V2);
     assert_eq!(old.ht_backend, HtBackend::Cpu);
     assert_eq!(serde_json::to_value(old)?["profile"], "v2");
-    let hip = Options {
-        ht_backend: HtBackend::Hip,
-        ..options()
-    };
-    hip.validate()?; // Semantic validation must not require a GPU or the feature.
-    assert_eq!(serde_json::to_value(hip)?["ht_backend"], "hip");
+    for (backend, name) in [(HtBackend::Hip, "hip"), (HtBackend::Cuda, "cuda")] {
+        let selected = Options {
+            ht_backend: backend,
+            ..options()
+        };
+        selected.validate()?; // Semantic validation requires neither a GPU nor its feature.
+        let json = serde_json::to_value(&selected)?;
+        assert_eq!(json["ht_backend"], name);
+        assert_eq!(serde_json::from_value::<Options>(json)?, selected);
+    }
     assert!(serde_json::from_str::<Options>(
-        r#"{"seed":7,"threads":1,"ht_beam":8,"ht_backend":"cuda"}"#
+        r#"{"seed":7,"threads":1,"ht_beam":8,"ht_backend":"unknown-device"}"#
     )
     .is_err());
     assert_ne!(OutputProfile::V2.policy(), OutputProfile::Ht43.policy());
@@ -624,22 +628,39 @@ fn verification_accepts_hip_metadata_and_schema2_without_backend() -> Result<()>
     )?;
     assert_eq!(verify::manifest_options(&output)?, manifest.options);
     let mut json = serde_json::to_value(&manifest)?;
-    json["options"]["ht_backend"] = serde_json::json!("hip");
+    for (backend, name) in [(HtBackend::Hip, "hip"), (HtBackend::Cuda, "cuda")] {
+        json["options"]["ht_backend"] = serde_json::json!(name);
+        fs::write(
+            output.join("conversion-manifest.json"),
+            serde_json::to_vec_pretty(&json)?,
+        )?;
+        assert_eq!(verify::manifest_options(&output)?.ht_backend, backend);
+        let report = verify::verify(
+            &snapshot,
+            &plan,
+            &output,
+            DecodeBackend::Cpu,
+            &Progress::disabled(),
+        )?;
+        assert_eq!(
+            serde_json::to_value(report)?,
+            serde_json::to_value(&current)?
+        );
+    }
+    json["options"]["ht_backend"] = serde_json::json!("unknown-device");
     fs::write(
         output.join("conversion-manifest.json"),
         serde_json::to_vec_pretty(&json)?,
     )?;
-    assert_eq!(
-        verify::manifest_options(&output)?.ht_backend,
-        HtBackend::Hip
-    );
-    verify::verify(
+    assert!(verify::manifest_options(&output).is_err());
+    assert!(verify::verify(
         &snapshot,
         &plan,
         &output,
         DecodeBackend::Cpu,
         &Progress::disabled(),
-    )?;
+    )
+    .is_err());
     json["options"]
         .as_object_mut()
         .expect("options object")
@@ -704,35 +725,75 @@ fn verification_accepts_hip_metadata_and_schema2_without_backend() -> Result<()>
 #[cfg(not(feature = "hip"))]
 #[test]
 fn hip_conversion_requires_feature_before_staging_or_source_open() -> Result<()> {
+    conversion_requires_feature_before_staging_or_source_open(HtBackend::Hip, "hip")
+}
+
+#[cfg(not(feature = "cuda"))]
+#[test]
+fn cuda_conversion_requires_feature_before_staging_or_source_open() -> Result<()> {
+    conversion_requires_feature_before_staging_or_source_open(HtBackend::Cuda, "cuda")
+}
+
+#[cfg(any(not(feature = "hip"), not(feature = "cuda")))]
+fn conversion_requires_feature_before_staging_or_source_open(
+    backend: HtBackend,
+    feature: &str,
+) -> Result<()> {
     let temporary = tempfile::tempdir()?;
     let (snapshot, plan) = support::fixture(temporary.path())?;
     let output = temporary.path().join("converted");
-    let hip = Options {
-        ht_backend: HtBackend::Hip,
+    let opts = Options {
+        ht_backend: backend,
         ..options()
     };
-    let error =
-        conversion::convert(&snapshot, &plan, &output, &hip, &Progress::disabled()).unwrap_err();
-    assert!(error.to_string().contains("--features hip"));
-    assert!(!output.exists());
-    assert_no_staging(temporary.path())?;
-    let result = std::process::Command::new(env!("CARGO_BIN_EXE_bf16-to-hgn"))
-        .args(["convert", "--ht-backend", "hip", "--source"])
-        .arg(temporary.path().join("missing-source"))
-        .arg("--output")
-        .arg(&output)
-        .output()?;
-    assert_eq!(result.status.code(), Some(2));
-    assert!(String::from_utf8(result.stderr)?.contains("--features hip"));
-    assert!(result.stdout.is_empty());
-    assert!(!output.exists());
-    assert_no_staging(temporary.path())?;
+    // A stale source must not hide the actionable missing-feature error.
+    fs::write(snapshot.root.join("model.safetensors"), b"not safetensors")?;
+    let expected = format!("--features {feature}");
+    for occupied in [false, true] {
+        if occupied {
+            fs::create_dir(&output)?;
+            fs::write(output.join("keep.bin"), b"existing output")?;
+        }
+        let error = conversion::convert(&snapshot, &plan, &output, &opts, &Progress::disabled())
+            .unwrap_err();
+        assert!(error.to_string().contains(&expected), "{error:#}");
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_bf16-to-hgn"))
+            .args(["convert", "--ht-backend", feature, "--source"])
+            .arg(temporary.path().join("missing-source"))
+            .arg("--output")
+            .arg(&output)
+            .output()?;
+        assert_eq!(result.status.code(), Some(2));
+        assert!(String::from_utf8(result.stderr)?.contains(&expected));
+        assert!(result.stdout.is_empty());
+        if occupied {
+            assert_eq!(fs::read(output.join("keep.bin"))?, b"existing output");
+            assert_eq!(fs::read_dir(&output)?.count(), 1);
+        } else {
+            assert!(!output.exists());
+        }
+        assert_no_staging(temporary.path())?;
+    }
     Ok(())
 }
 
 #[cfg(not(feature = "hip"))]
 #[test]
 fn hip_verification_requires_feature_even_without_eligible_tensors() -> Result<()> {
+    verification_requires_feature_even_without_eligible_tensors(DecodeBackend::Hip, "hip")
+}
+
+#[cfg(not(feature = "cuda"))]
+#[test]
+fn cuda_verification_requires_feature_even_without_eligible_tensors() -> Result<()> {
+    verification_requires_feature_even_without_eligible_tensors(DecodeBackend::Cuda, "cuda")
+}
+
+#[cfg(any(not(feature = "hip"), not(feature = "cuda")))]
+fn verification_requires_feature_even_without_eligible_tensors(
+    backend: DecodeBackend,
+    feature: &str,
+) -> Result<()> {
     let temporary = tempfile::tempdir()?;
     let (assets, _) = support::fixture(temporary.path())?;
     let (hgn, plan) = support::imported_norm_fixture(temporary.path(), &[1.0, -0.0, 3.125])?;
@@ -761,25 +822,74 @@ fn hip_verification_requires_feature_even_without_eligible_tensors() -> Result<(
         DecodeBackend::default(),
         &Progress::default(),
     )?;
-    let error = verify::verify(
-        &source,
-        &plan,
-        &output,
-        DecodeBackend::Hip,
-        &Progress::disabled(),
-    )
-    .unwrap_err();
-    assert!(error.to_string().contains("--features hip"));
+    let before = publication_bytes(&output)?;
+    // Backend preflight must precede stale-source checking as well as manifest I/O.
+    fs::write(assets.root.join("model.safetensors"), b"not safetensors")?;
+    let expected = format!("--features {feature}");
+    let missing = temporary.path().join("missing-output");
+    for target in [&output, &missing] {
+        let error =
+            verify::verify(&source, &plan, target, backend, &Progress::disabled()).unwrap_err();
+        assert!(error.to_string().contains(&expected), "{error:#}");
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_bf16-to-hgn"))
+            .args(["verify", "--decode-backend", feature, "--source"])
+            .arg(temporary.path().join("missing-source"))
+            .arg("--output")
+            .arg(target)
+            .output()?;
+        assert_eq!(result.status.code(), Some(2));
+        assert!(String::from_utf8(result.stderr)?.contains(&expected));
+        assert!(result.stdout.is_empty());
+    }
+    assert!(!missing.exists());
+    assert_eq!(publication_bytes(&output)?, before);
+    assert_no_staging(temporary.path())?;
     Ok(())
+}
+
+#[cfg(any(not(feature = "hip"), not(feature = "cuda")))]
+fn publication_bytes(
+    root: &std::path::Path,
+) -> Result<std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>> {
+    fn collect(
+        root: &std::path::Path,
+        directory: &std::path::Path,
+        files: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+    ) -> Result<()> {
+        for entry in fs::read_dir(directory)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                collect(root, &path, files)?;
+            } else {
+                files.insert(path.strip_prefix(root)?.to_path_buf(), fs::read(path)?);
+            }
+        }
+        Ok(())
+    }
+    let mut files = std::collections::BTreeMap::new();
+    collect(root, root, &mut files)?;
+    Ok(files)
 }
 
 #[test]
 fn describing_hip_does_not_initialize_a_device_or_bypass_architecture() -> Result<()> {
+    describing_backend_does_not_initialize_a_device_or_bypass_architecture("hip", "HIP")
+}
+
+#[test]
+fn describing_cuda_does_not_initialize_a_device_or_bypass_architecture() -> Result<()> {
+    describing_backend_does_not_initialize_a_device_or_bypass_architecture("cuda", "CUDA")
+}
+
+fn describing_backend_does_not_initialize_a_device_or_bypass_architecture(
+    backend: &str,
+    label: &str,
+) -> Result<()> {
     let temporary = tempfile::tempdir()?;
     let (snapshot, _) = support::fixture(temporary.path())?;
     for command in ["inspect", "plan", "convert"] {
         let mut cli = std::process::Command::new(env!("CARGO_BIN_EXE_bf16-to-hgn"));
-        cli.args([command, "--ht-backend", "hip", "--source"])
+        cli.args([command, "--ht-backend", backend, "--source"])
             .arg(&snapshot.root);
         if command == "convert" {
             cli.arg("--dry-run")
@@ -789,8 +899,8 @@ fn describing_hip_does_not_initialize_a_device_or_bypass_architecture() -> Resul
         let result = cli.output()?;
         assert_eq!(result.status.code(), Some(2)); // Structural config remains rejected.
         let error = String::from_utf8(result.stderr)?;
-        assert!(!error.contains("--features hip"));
-        assert!(!error.contains("HIP HT preflight"));
+        assert!(!error.contains(&format!("--features {backend}")));
+        assert!(!error.contains(&format!("{label} HT preflight")));
         assert!(result.stdout.is_empty());
     }
     assert_no_staging(temporary.path())?;
@@ -801,8 +911,23 @@ fn describing_hip_does_not_initialize_a_device_or_bypass_architecture() -> Resul
 #[test]
 #[ignore = "requires an available gfx1151 HIP device; encodes and publishes real tiny files"]
 fn hip_tiny_conversion_matches_cpu_all_containers_and_verifies() -> Result<()> {
+    tiny_conversion_matches_cpu_all_containers_and_verifies(HtBackend::Hip, DecodeBackend::Hip)
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires an available CUDA device; encodes and publishes real tiny files"]
+fn cuda_tiny_conversion_matches_cpu_all_containers_and_verifies() -> Result<()> {
+    tiny_conversion_matches_cpu_all_containers_and_verifies(HtBackend::Cuda, DecodeBackend::Cuda)
+}
+
+#[cfg(any(feature = "hip", feature = "cuda"))]
+fn tiny_conversion_matches_cpu_all_containers_and_verifies(
+    gpu_backend: HtBackend,
+    decode_backend: DecodeBackend,
+) -> Result<()> {
     let temporary = tempfile::tempdir()?;
-    let (snapshot, plan) = support::hip_fixture(temporary.path())?;
+    let (snapshot, plan) = support::gpu_fixture(temporary.path())?;
     assert!(plan
         .files
         .iter()
@@ -814,13 +939,9 @@ fn hip_tiny_conversion_matches_cpu_all_containers_and_verifies() -> Result<()> {
         .flat_map(|file| &file.tensors)
         .any(|t| t.encoding == Encoding::Ht));
     let mut baseline = None;
-    for backend in [HtBackend::Cpu, HtBackend::Hip] {
-        let name = if backend == HtBackend::Cpu {
-            "cpu"
-        } else {
-            "hip"
-        };
-        let output = temporary.path().join(name);
+    let mut baseline_report = None;
+    for backend in [HtBackend::Cpu, gpu_backend] {
+        let output = temporary.path().join(backend.label().to_ascii_lowercase());
         let opts = Options {
             profile: OutputProfile::Ht43,
             ht_backend: backend,
@@ -829,13 +950,27 @@ fn hip_tiny_conversion_matches_cpu_all_containers_and_verifies() -> Result<()> {
         let manifest =
             conversion::convert(&snapshot, &plan, &output, &opts, &Progress::disabled())?;
         assert_eq!(manifest.options.ht_backend, backend);
-        verify::verify(
+        let report = verify::verify(
             &snapshot,
             &plan,
             &output,
             DecodeBackend::Cpu,
             &Progress::disabled(),
         )?;
+        let gpu_report = verify::verify(
+            &snapshot,
+            &plan,
+            &output,
+            decode_backend,
+            &Progress::disabled(),
+        )?;
+        let report = serde_json::to_value(report)?;
+        assert_eq!(report, serde_json::to_value(gpu_report)?);
+        if let Some(cpu_report) = &baseline_report {
+            assert_eq!(&report, cpu_report);
+        } else {
+            baseline_report = Some(report);
+        }
         if let Some(cpu) = &baseline {
             let cpu: &bf16_to_hgn::manifest::Manifest = cpu;
             assert_eq!(cpu.containers, manifest.containers);
@@ -860,12 +995,24 @@ fn hip_tiny_conversion_matches_cpu_all_containers_and_verifies() -> Result<()> {
 #[test]
 #[ignore = "requires an available gfx1151 HIP device; compares complete verification reports"]
 fn hip_full_verification_reports_match_cpu_bitwise() -> Result<()> {
+    full_verification_reports_match_cpu_bitwise(DecodeBackend::Hip)
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires an available CUDA device; compares complete verification reports"]
+fn cuda_full_verification_reports_match_cpu_bitwise() -> Result<()> {
+    full_verification_reports_match_cpu_bitwise(DecodeBackend::Cuda)
+}
+
+#[cfg(any(feature = "hip", feature = "cuda"))]
+fn full_verification_reports_match_cpu_bitwise(backend: DecodeBackend) -> Result<()> {
     for profile in [OutputProfile::V2, OutputProfile::Ht43] {
         let temporary = tempfile::tempdir()?;
         let (snapshot, plan) = if profile == OutputProfile::V2 {
             support::fixture(temporary.path())?
         } else {
-            support::hip_fixture(temporary.path())?
+            support::gpu_fixture(temporary.path())?
         };
         let opts = Options {
             profile,
@@ -894,18 +1041,12 @@ fn hip_full_verification_reports_match_cpu_bitwise() -> Result<()> {
             DecodeBackend::Cpu,
             &Progress::disabled(),
         )?;
-        let hip = verify::verify(
-            &snapshot,
-            &plan,
-            &output,
-            DecodeBackend::Hip,
-            &Progress::disabled(),
-        )?;
+        let gpu = verify::verify(&snapshot, &plan, &output, backend, &Progress::disabled())?;
         assert_eq!(cpu.manifest_schema, 2);
         assert!(cpu.provenance_attested);
-        assert_eq!(cpu.errors.len(), hip.errors.len());
+        assert_eq!(cpu.errors.len(), gpu.errors.len());
         for (name, reference) in &cpu.errors {
-            let actual = &hip.errors[name];
+            let actual = &gpu.errors[name];
             assert_eq!(reference.values, actual.values, "{name}");
             assert_eq!(
                 reference.source_squared.to_bits(),
@@ -918,14 +1059,28 @@ fn hip_full_verification_reports_match_cpu_bitwise() -> Result<()> {
                 "{name}"
             );
         }
-        assert_eq!(serde_json::to_value(cpu)?, serde_json::to_value(hip)?);
+        assert_eq!(serde_json::to_value(&cpu)?, serde_json::to_value(gpu)?);
+        // Encoding provenance never chooses the runtime decoder, including I4R.
+        let mut json = serde_json::to_value(&manifest)?;
+        for provenance in ["hip", "cuda"] {
+            json["options"]["ht_backend"] = serde_json::json!(provenance);
+            fs::write(
+                output.join("conversion-manifest.json"),
+                serde_json::to_vec_pretty(&json)?,
+            )?;
+            for runtime in [DecodeBackend::Cpu, backend] {
+                let report =
+                    verify::verify(&snapshot, &plan, &output, runtime, &Progress::disabled())?;
+                assert_eq!(serde_json::to_value(report)?, serde_json::to_value(&cpu)?);
+            }
+        }
     }
     Ok(())
 }
 
 #[test]
 fn backend_selection_preserves_semantic_option_limits() -> Result<()> {
-    for backend in [HtBackend::Cpu, HtBackend::Hip] {
+    for backend in [HtBackend::Cpu, HtBackend::Hip, HtBackend::Cuda] {
         for beam in [1, 256] {
             Options {
                 ht_backend: backend,
@@ -954,4 +1109,26 @@ fn backend_selection_preserves_semantic_option_limits() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[test]
+fn backend_labels_and_defaults_are_available_independently_of_features() {
+    assert_eq!(HtBackend::default(), HtBackend::Cpu);
+    assert_eq!(DecodeBackend::default(), DecodeBackend::Cpu);
+    for (backend, label, gpu) in [
+        (HtBackend::Cpu, "CPU", false),
+        (HtBackend::Hip, "HIP", true),
+        (HtBackend::Cuda, "CUDA", true),
+    ] {
+        assert_eq!(backend.label(), label);
+        assert_eq!(backend.is_gpu(), gpu);
+    }
+    for (backend, label, gpu) in [
+        (DecodeBackend::Cpu, "CPU", false),
+        (DecodeBackend::Hip, "HIP", true),
+        (DecodeBackend::Cuda, "CUDA", true),
+    ] {
+        assert_eq!(backend.label(), label);
+        assert_eq!(backend.is_gpu(), gpu);
+    }
 }

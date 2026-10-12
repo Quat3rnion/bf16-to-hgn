@@ -98,9 +98,23 @@ pub enum HtBackend {
     #[default]
     Cpu,
     Hip,
+    Cuda,
 }
 
 impl HtBackend {
+    /// Device family used by HT trellis search; all other codecs stay on CPU.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU",
+            Self::Hip => "HIP",
+            Self::Cuda => "CUDA",
+        }
+    }
+
+    pub const fn is_gpu(self) -> bool {
+        !matches!(self, Self::Cpu)
+    }
+
     /// Validate real device availability without encoding a band.
     pub fn preflight(self) -> Result<()> {
         match self {
@@ -115,6 +129,21 @@ impl HtBackend {
                 }
                 #[cfg(not(feature = "hip"))]
                 bail!("HIP HT backend requires a build with --features hip");
+            }
+            Self::Cuda => {
+                #[cfg(feature = "cuda")]
+                {
+                    // SAFETY: preflight takes no pointers and synchronizes native context access.
+                    let result = unsafe { ht_cuda_preflight() };
+                    ensure!(
+                        result == 0,
+                        "CUDA HT preflight failed: {}",
+                        cuda_last_error()
+                    );
+                    Ok(())
+                }
+                #[cfg(not(feature = "cuda"))]
+                bail!("CUDA HT backend requires a build with --features cuda");
             }
         }
     }
@@ -719,6 +748,33 @@ fn hip_last_error() -> String {
         .into_owned()
 }
 
+#[cfg(feature = "cuda")]
+unsafe extern "C" {
+    fn ht_encode_bits_cuda(
+        tiles: *const f32,
+        codebook: *const f32,
+        codes: *mut u8,
+        count: c_int,
+        beam: c_int,
+        bits: c_int,
+    ) -> c_int;
+    fn ht_cuda_last_error() -> *const std::ffi::c_char;
+    fn ht_cuda_preflight() -> c_int;
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_last_error() -> String {
+    // SAFETY: the ABI returns a thread-local NUL-terminated error string,
+    // valid until this thread's next native CUDA call. Copy it immediately.
+    let error = unsafe { ht_cuda_last_error() };
+    if error.is_null() {
+        return "native CUDA encoder returned no error detail".to_owned();
+    }
+    unsafe { std::ffi::CStr::from_ptr(error) }
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn validate_ht_backend(meta: &QuantMeta<'_>) -> Result<()> {
     match meta.ht_backend {
         HtBackend::Cpu => ensure!(
@@ -733,6 +789,16 @@ fn validate_ht_backend(meta: &QuantMeta<'_>) -> Result<()> {
             ensure!(
                 cfg!(feature = "hip"),
                 "HIP HT backend requires a build with --features hip"
+            );
+        }
+        HtBackend::Cuda => {
+            ensure!(
+                (1..=256).contains(&meta.ht_beam),
+                "CUDA HT beam must be in 1..=256; beam 0/full-state and larger beams require CPU"
+            );
+            ensure!(
+                cfg!(feature = "cuda"),
+                "CUDA HT backend requires a build with --features cuda"
             );
         }
     }
@@ -840,6 +906,31 @@ fn encode_ht_tiles(tiles: &[f32], meta: &QuantMeta<'_>, bits: usize) -> Result<V
             }
             #[cfg(not(feature = "hip"))]
             bail!("HIP HT backend requires a build with --features hip");
+        }
+        HtBackend::Cuda => {
+            #[cfg(feature = "cuda")]
+            {
+                // SAFETY: the same validated host buffer sizes apply. Native
+                // CUDA copies and synchronizes before returning; it does not
+                // retain the caller's tile/output pointers.
+                let result = unsafe {
+                    ht_encode_bits_cuda(
+                        tiles.as_ptr(),
+                        ht_codebook().as_ptr(),
+                        symbols.as_mut_ptr(),
+                        count,
+                        meta.ht_beam as c_int,
+                        bits as c_int,
+                    )
+                };
+                ensure!(
+                    result == 0,
+                    "CUDA HT encoding failed: {}",
+                    cuda_last_error()
+                );
+            }
+            #[cfg(not(feature = "cuda"))]
+            bail!("CUDA HT backend requires a build with --features cuda");
         }
     }
     ensure!(
@@ -2123,6 +2214,39 @@ mod backend_tests {
         fn hipSetDevice(device: c_int) -> c_int;
     }
 
+    #[cfg(feature = "cuda")]
+    unsafe extern "C" {
+        fn cudaSetDevice(device: c_int) -> c_int;
+    }
+
+    #[cfg(any(feature = "hip", feature = "cuda"))]
+    type GpuEncoder =
+        unsafe extern "C" fn(*const f32, *const f32, *mut u8, c_int, c_int, c_int) -> c_int;
+
+    #[cfg(any(feature = "hip", feature = "cuda"))]
+    fn gpu_encoder(backend: HtBackend) -> GpuEncoder {
+        match backend {
+            #[cfg(feature = "hip")]
+            HtBackend::Hip => ht_encode_bits_hip,
+            #[cfg(feature = "cuda")]
+            HtBackend::Cuda => ht_encode_bits_cuda,
+            _ => panic!("{} encoder feature is not enabled", backend.label()),
+        }
+    }
+
+    #[cfg(any(feature = "hip", feature = "cuda"))]
+    fn gpu_last_error(backend: HtBackend) -> String {
+        match backend {
+            HtBackend::Cpu => "native CPU encoder rejected parameters".to_owned(),
+            #[cfg(feature = "hip")]
+            HtBackend::Hip => hip_last_error(),
+            #[cfg(feature = "cuda")]
+            HtBackend::Cuda => cuda_last_error(),
+            #[cfg(not(all(feature = "hip", feature = "cuda")))]
+            _ => panic!("{} encoder feature is not enabled", backend.label()),
+        }
+    }
+
     #[test]
     fn ht_backend_defaults_and_beam_boundaries() {
         assert_eq!(HtBackend::default(), HtBackend::Cpu);
@@ -2139,25 +2263,35 @@ mod backend_tests {
             ..Default::default()
         })
         .is_err());
-        for beam in [0, 257, 4096, usize::MAX] {
-            let meta = QuantMeta {
-                ht_backend: HtBackend::Hip,
-                ht_beam: beam,
-                ..Default::default()
-            };
-            assert!(validate_ht_backend(&meta)
-                .unwrap_err()
-                .to_string()
-                .contains("1..=256"));
+        for (backend, enabled) in [
+            (HtBackend::Hip, cfg!(feature = "hip")),
+            (HtBackend::Cuda, cfg!(feature = "cuda")),
+        ] {
+            assert!(backend.is_gpu());
+            for beam in [0, 257, 4096, usize::MAX] {
+                let meta = QuantMeta {
+                    ht_backend: backend,
+                    ht_beam: beam,
+                    ..Default::default()
+                };
+                assert!(validate_ht_backend(&meta)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("1..=256"));
+            }
+            for beam in [1, 8, 128, 256] {
+                let meta = QuantMeta {
+                    ht_backend: backend,
+                    ht_beam: beam,
+                    ..Default::default()
+                };
+                assert_eq!(validate_ht_backend(&meta).is_ok(), enabled);
+            }
         }
-        for beam in [1, 8, 128, 256] {
-            let meta = QuantMeta {
-                ht_backend: HtBackend::Hip,
-                ht_beam: beam,
-                ..Default::default()
-            };
-            assert_eq!(validate_ht_backend(&meta).is_ok(), cfg!(feature = "hip"));
-        }
+        assert!(!HtBackend::Cpu.is_gpu());
+        assert_eq!(HtBackend::Cpu.label(), "CPU");
+        assert_eq!(HtBackend::Hip.label(), "HIP");
+        assert_eq!(HtBackend::Cuda.label(), "CUDA");
     }
 
     #[test]
@@ -2172,10 +2306,6 @@ mod backend_tests {
             sv: &sv,
             ht_beam: 0,
             ..Default::default()
-        };
-        let hip = QuantMeta {
-            ht_backend: HtBackend::Hip,
-            ..cpu
         };
         for encoding in [
             Encoding::Bf16,
@@ -2194,14 +2324,20 @@ mod backend_tests {
             };
             let values = &input[..128 * cols];
             let expected = encode_rows(encoding, values, 128, cols, &cpu).unwrap();
-            assert_eq!(
-                encode_rows(encoding, values, 128, cols, &hip).unwrap(),
-                expected
-            );
-            assert_eq!(
-                decode_rows(encoding, &expected, 128, cols, &hip).unwrap(),
-                decode_rows(encoding, &expected, 128, cols, &cpu).unwrap()
-            );
+            for backend in [HtBackend::Hip, HtBackend::Cuda] {
+                let gpu = QuantMeta {
+                    ht_backend: backend,
+                    ..cpu
+                };
+                assert_eq!(
+                    encode_rows(encoding, values, 128, cols, &gpu).unwrap(),
+                    expected
+                );
+                assert_eq!(
+                    decode_rows(encoding, &expected, 128, cols, &gpu).unwrap(),
+                    decode_rows(encoding, &expected, 128, cols, &cpu).unwrap()
+                );
+            }
         }
         for encoding in [Encoding::Ht, Encoding::Ht3] {
             let bytes = payload_layout(encoding, 128, 128).unwrap().len as usize;
@@ -2209,10 +2345,16 @@ mod backend_tests {
                 codes: vec![0; bytes],
                 scales: Vec::new(),
             };
-            assert_eq!(
-                decode_rows(encoding, &block, 128, 128, &hip).unwrap(),
-                decode_rows(encoding, &block, 128, 128, &cpu).unwrap()
-            );
+            for backend in [HtBackend::Hip, HtBackend::Cuda] {
+                let gpu = QuantMeta {
+                    ht_backend: backend,
+                    ..cpu
+                };
+                assert_eq!(
+                    decode_rows(encoding, &block, 128, 128, &gpu).unwrap(),
+                    decode_rows(encoding, &block, 128, 128, &cpu).unwrap()
+                );
+            }
         }
     }
 
@@ -2226,71 +2368,92 @@ mod backend_tests {
             sv: &sv,
             ..Default::default()
         };
-        let hip = QuantMeta {
-            ht_backend: HtBackend::Hip,
-            ..cpu
+        for (left, right) in [
+            (HtBackend::Cpu, HtBackend::Hip),
+            (HtBackend::Cpu, HtBackend::Cuda),
+            (HtBackend::Hip, HtBackend::Cuda),
+        ] {
+            let left = QuantMeta {
+                ht_backend: left,
+                ..cpu
+            };
+            let right = QuantMeta {
+                ht_backend: right,
+                ..cpu
+            };
+            for encoding in [Encoding::Ht, Encoding::Ht3] {
+                let error = encode_ht_gate_up_bands(encoding, &input, &input, 128, &left, &right)
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("same encoder settings"));
+            }
+        }
+    }
+
+    #[cfg(any(not(feature = "hip"), not(feature = "cuda")))]
+    fn dispatch_without_feature_is_an_explicit_error(backend: HtBackend, feature: &str) {
+        assert!(backend
+            .preflight()
+            .unwrap_err()
+            .to_string()
+            .contains(feature));
+        let gpu = QuantMeta {
+            ht_backend: backend,
+            ht_beam: 8,
+            ..Default::default()
         };
-        for encoding in [Encoding::Ht, Encoding::Ht3] {
-            let error = encode_ht_gate_up_bands(encoding, &input, &input, 128, &cpu, &hip)
+        for bits in [3, 4] {
+            let error = encode_ht_tiles(&[0.0; 256], &gpu, bits)
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains("same encoder settings"));
+            assert!(error.contains(feature));
+        }
+        let su = vec![1.0; 128];
+        let sv = vec![1.0; 128];
+        let gpu = QuantMeta {
+            su: &su,
+            sv: &sv,
+            ..gpu
+        };
+        let input = vec![0.0; 128 * 128];
+        for encoding in [Encoding::Ht, Encoding::Ht3] {
+            assert!(encode_rows(encoding, &input, 128, 128, &gpu)
+                .unwrap_err()
+                .to_string()
+                .contains(feature));
+            assert!(
+                encode_ht_gate_up_bands(encoding, &input, &input, 128, &gpu, &gpu)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(feature)
+            );
         }
     }
 
     #[cfg(not(feature = "hip"))]
     #[test]
     fn hip_dispatch_without_feature_is_an_explicit_error() {
-        assert!(HtBackend::Hip
-            .preflight()
-            .unwrap_err()
-            .to_string()
-            .contains("--features hip"));
-        let hip = QuantMeta {
-            ht_backend: HtBackend::Hip,
-            ht_beam: 8,
-            ..Default::default()
-        };
-        for bits in [3, 4] {
-            let error = encode_ht_tiles(&[0.0; 256], &hip, bits)
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("--features hip"));
-        }
-        let su = vec![1.0; 128];
-        let sv = vec![1.0; 128];
-        let hip = QuantMeta {
-            su: &su,
-            sv: &sv,
-            ..hip
-        };
-        let input = vec![0.0; 128 * 128];
-        for encoding in [Encoding::Ht, Encoding::Ht3] {
-            assert!(encode_rows(encoding, &input, 128, 128, &hip)
-                .unwrap_err()
-                .to_string()
-                .contains("--features hip"));
-            assert!(
-                encode_ht_gate_up_bands(encoding, &input, &input, 128, &hip, &hip)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("--features hip")
-            );
-        }
+        dispatch_without_feature_is_an_explicit_error(HtBackend::Hip, "--features hip");
     }
 
-    #[cfg(feature = "hip")]
+    #[cfg(not(feature = "cuda"))]
     #[test]
-    fn hip_native_rejects_invalid_parameters_without_a_device() {
+    fn cuda_dispatch_without_feature_is_an_explicit_error() {
+        dispatch_without_feature_is_an_explicit_error(HtBackend::Cuda, "--features cuda");
+    }
+
+    #[cfg(any(feature = "hip", feature = "cuda"))]
+    fn native_rejects_invalid_parameters_without_a_device(backend: HtBackend) {
+        let encode = gpu_encoder(backend);
         let input = [0.0; 256];
         let codebook = ht_codebook();
         let mut output = [0x55; 256];
         // A count whose complete values exceed the CPU-compatible index range
-        // is rejected by Rust without passing undersized buffers to native HIP.
+        // is rejected by Rust without passing undersized buffers to native GPU code.
         assert!(native_ht_tile_count((c_int::MAX as usize / 256 + 1) * 256).is_err());
         // SAFETY: an empty native call performs no accesses or device work.
         let result = unsafe {
-            ht_encode_bits_hip(
+            encode(
                 input.as_ptr(),
                 codebook.as_ptr(),
                 output.as_mut_ptr(),
@@ -2305,7 +2468,7 @@ mod backend_tests {
             // SAFETY: invalid scalar parameters must be rejected before any
             // buffer access; the valid-count cases have complete host buffers.
             let result = unsafe {
-                ht_encode_bits_hip(
+                encode(
                     input.as_ptr(),
                     codebook.as_ptr(),
                     output.as_mut_ptr(),
@@ -2315,12 +2478,12 @@ mod backend_tests {
                 )
             };
             assert_ne!(result, 0, "count={count} beam={beam} bits={bits}");
-            assert!(!hip_last_error().is_empty());
+            assert!(!gpu_last_error(backend).is_empty());
             assert_eq!(output, [0x55; 256]);
         }
         // SAFETY: null pointers are an explicitly rejected ABI input.
         let result = unsafe {
-            ht_encode_bits_hip(
+            encode(
                 std::ptr::null(),
                 std::ptr::null(),
                 std::ptr::null_mut(),
@@ -2330,7 +2493,7 @@ mod backend_tests {
             )
         };
         assert_ne!(result, 0);
-        assert!(!hip_last_error().is_empty());
+        assert!(!gpu_last_error(backend).is_empty());
         // These nonnull addresses cannot contain even one tile/codebook.
         // The native ABI checks address-plus-extent overflow before device work.
         // Unlike a large valid count paired with a tiny slice, these addresses
@@ -2350,14 +2513,26 @@ mod backend_tests {
         ] {
             // SAFETY: one buffer address overflows even a single-tile extent;
             // native rejects it before accessing any pointer or creating a device.
-            let result = unsafe { ht_encode_bits_hip(tiles, book, codes, 1, 1, 4) };
+            let result = unsafe { encode(tiles, book, codes, 1, 1, 4) };
             assert_ne!(result, 0);
-            assert!(hip_last_error().contains("overflows the host address space"));
+            assert!(gpu_last_error(backend).contains("overflows the host address space"));
             assert_eq!(output, [0x55; 256]);
         }
     }
 
     #[cfg(feature = "hip")]
+    #[test]
+    fn hip_native_rejects_invalid_parameters_without_a_device() {
+        native_rejects_invalid_parameters_without_a_device(HtBackend::Hip);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_native_rejects_invalid_parameters_without_a_device() {
+        native_rejects_invalid_parameters_without_a_device(HtBackend::Cuda);
+    }
+
+    #[cfg(any(feature = "hip", feature = "cuda"))]
     fn native_symbols(
         backend: HtBackend,
         tiles: &[f32],
@@ -2381,7 +2556,7 @@ mod backend_tests {
                     beam as c_int,
                     bits as c_int,
                 ),
-                HtBackend::Hip => ht_encode_bits_hip(
+                gpu => gpu_encoder(gpu)(
                     tiles.as_ptr(),
                     codebook.as_ptr(),
                     symbols.as_mut_ptr(),
@@ -2395,7 +2570,7 @@ mod backend_tests {
             result,
             0,
             "backend={backend:?} beam={beam} bits={bits}: {}",
-            hip_last_error()
+            gpu_last_error(backend)
         );
         assert!(symbols
             .iter()
@@ -2403,7 +2578,7 @@ mod backend_tests {
         symbols
     }
 
-    #[cfg(feature = "hip")]
+    #[cfg(any(feature = "hip", feature = "cuda"))]
     fn tile_corpus(bits: usize) -> Vec<f32> {
         let mut tiles = Vec::new();
         tiles.extend((0..256).map(|i| ((i * 73 % 509) as f32 - 254.0) / 128.0));
@@ -2442,68 +2617,70 @@ mod backend_tests {
         tiles
     }
 
-    #[cfg(feature = "hip")]
-    #[test]
-    #[ignore = "requires an available gfx1151 HIP device; exact CPU/GPU corpus comparison"]
-    fn hip_native_corpus_matches_cpu_ht3_ht4_and_closure() {
-        HtBackend::Hip.preflight().unwrap();
+    #[cfg(any(feature = "hip", feature = "cuda"))]
+    fn native_corpus_matches_cpu_ht3_ht4_and_closure(backend: HtBackend) {
+        backend.preflight().unwrap();
         let mut inject_prior_runtime_failure = true;
         for bits in [3, 4] {
             let tiles = tile_corpus(bits);
             for beam in [1, 7, 8, 128, 256] {
                 let cpu = native_symbols(HtBackend::Cpu, &tiles, ht_codebook(), beam, bits);
                 if inject_prior_runtime_failure {
-                    // SAFETY: HIP accepts a scalar device ordinal and rejects
+                    // SAFETY: each runtime accepts a scalar device ordinal and rejects
                     // a negative ordinal without changing the current device.
                     // Leave that reported runtime error pending deliberately.
-                    assert_ne!(unsafe { hipSetDevice(-1) }, 0);
+                    let result = unsafe {
+                        match backend {
+                            #[cfg(feature = "hip")]
+                            HtBackend::Hip => hipSetDevice(-1),
+                            #[cfg(feature = "cuda")]
+                            HtBackend::Cuda => cudaSetDevice(-1),
+                            _ => unreachable!("GPU test requires its feature"),
+                        }
+                    };
+                    assert_ne!(result, 0);
                     inject_prior_runtime_failure = false;
                 }
-                let hip = native_symbols(HtBackend::Hip, &tiles, ht_codebook(), beam, bits);
-                assert_eq!(hip, cpu, "raw symbols: bits={bits} beam={beam}");
-                assert_eq!(pack_ht_symbols(&hip, bits), pack_ht_symbols(&cpu, bits));
+                let gpu = native_symbols(backend, &tiles, ht_codebook(), beam, bits);
+                assert_eq!(gpu, cpu, "raw symbols: bits={bits} beam={beam}");
+                assert_eq!(pack_ht_symbols(&gpu, bits), pack_ht_symbols(&cpu, bits));
             }
         }
     }
 
-    #[cfg(feature = "hip")]
-    #[test]
-    #[ignore = "requires an available gfx1151 HIP device; every CLI beam, not only powers of two"]
-    fn hip_every_supported_beam_matches_cpu() {
-        HtBackend::Hip.preflight().unwrap();
-        let tile: Vec<f32> = (0..256)
-            .map(|i| ((i * 31 % 127) as f32 - 63.0) / 32.0)
-            .collect();
+    #[cfg(any(feature = "hip", feature = "cuda"))]
+    fn every_supported_beam_matches_cpu(backend: HtBackend) {
+        backend.preflight().unwrap();
         for bits in [3, 4] {
+            let tiles = tile_corpus(bits);
             for beam in 1..=256 {
                 assert_eq!(
-                    native_symbols(HtBackend::Hip, &tile, ht_codebook(), beam, bits),
-                    native_symbols(HtBackend::Cpu, &tile, ht_codebook(), beam, bits),
+                    native_symbols(backend, &tiles, ht_codebook(), beam, bits),
+                    native_symbols(HtBackend::Cpu, &tiles, ht_codebook(), beam, bits),
                     "bits={bits} beam={beam}"
                 );
             }
         }
     }
 
-    #[cfg(feature = "hip")]
-    #[test]
-    #[ignore = "requires an available gfx1151 HIP device; persistent cache and batch boundary"]
-    fn hip_native_batches_and_changed_codebooks_match_cpu() {
-        HtBackend::Hip.preflight().unwrap();
-        // 65 tiles crosses the native bounded 64-tile batch without large buffers.
-        let tiles: Vec<f32> = (0..65 * 256)
+    #[cfg(any(feature = "hip", feature = "cuda"))]
+    fn native_batches_and_changed_codebooks_match_cpu(backend: HtBackend) {
+        backend.preflight().unwrap();
+        // Cross each implementation's largest bounded tile batch.
+        let tiles_per_call = if backend == HtBackend::Cuda { 513 } else { 65 };
+        let tiles: Vec<f32> = (0..tiles_per_call * 256)
             .map(|i| ((i * 17 % 97) as f32 - 48.0) / 32.0)
             .collect();
         let mut codebook = ht_codebook().to_vec();
         for bits in [3, 4] {
             assert_eq!(
-                native_symbols(HtBackend::Hip, &tiles, &codebook, 8, bits),
+                native_symbols(backend, &tiles, &codebook, 8, bits),
                 native_symbols(HtBackend::Cpu, &tiles, &codebook, 8, bits)
             );
             // Modify the same allocation: pointer identity is not a cache key.
             codebook.iter_mut().for_each(|value| *value = -*value);
             assert_eq!(
-                native_symbols(HtBackend::Hip, &tiles, &codebook, 8, bits),
+                native_symbols(backend, &tiles, &codebook, 8, bits),
                 native_symbols(HtBackend::Cpu, &tiles, &codebook, 8, bits)
             );
             let tiny_tiles = vec![1.0e-20; 256];
@@ -2512,18 +2689,16 @@ mod backend_tests {
                 .enumerate()
                 .for_each(|(i, value)| *value = (i % 17) as f32 * 1.0e-21);
             assert_eq!(
-                native_symbols(HtBackend::Hip, &tiny_tiles, &codebook, 128, bits),
+                native_symbols(backend, &tiny_tiles, &codebook, 128, bits),
                 native_symbols(HtBackend::Cpu, &tiny_tiles, &codebook, 128, bits)
             );
             codebook.copy_from_slice(ht_codebook());
         }
     }
 
-    #[cfg(feature = "hip")]
-    #[test]
-    #[ignore = "requires an available gfx1151 HIP device; public rotation and paired-band path"]
-    fn hip_public_bands_and_pairs_match_cpu() {
-        HtBackend::Hip.preflight().unwrap();
+    #[cfg(any(feature = "hip", feature = "cuda"))]
+    fn public_bands_and_pairs_match_cpu(backend: HtBackend) {
+        backend.preflight().unwrap();
         let cols = 128;
         let su = generate_signs(7, "hip-test-su", cols);
         let gate: Vec<f32> = (0..128 * cols)
@@ -2545,20 +2720,154 @@ mod backend_tests {
                     ..Default::default()
                 };
                 let cpu_up = QuantMeta { sv: &up_sv, ..cpu };
-                let hip = QuantMeta {
-                    ht_backend: HtBackend::Hip,
+                let gpu = QuantMeta {
+                    ht_backend: backend,
                     ..cpu
                 };
-                let hip_up = QuantMeta { sv: &up_sv, ..hip };
+                let gpu_up = QuantMeta { sv: &up_sv, ..gpu };
                 assert_eq!(
-                    encode_rows(encoding, &gate, 128, cols, &hip).unwrap(),
+                    encode_rows(encoding, &gate, 128, cols, &gpu).unwrap(),
                     encode_rows(encoding, &gate, 128, cols, &cpu).unwrap()
                 );
                 assert_eq!(
-                    encode_ht_gate_up_bands(encoding, &gate, &up, cols, &hip, &hip_up).unwrap(),
+                    encode_ht_gate_up_bands(encoding, &gate, &up, cols, &gpu, &gpu_up).unwrap(),
                     encode_ht_gate_up_bands(encoding, &gate, &up, cols, &cpu, &cpu_up).unwrap()
                 );
             }
         }
     }
+
+    #[cfg(any(feature = "hip", feature = "cuda"))]
+    fn native_error_recovery_matches_cpu(backend: HtBackend) {
+        backend.preflight().unwrap();
+        let encode = gpu_encoder(backend);
+        let tiles = tile_corpus(3);
+        let bad_tile = [f32::NAN; 256];
+        let mut output = [0x55; 256];
+        for bits in [3, 4] {
+            // SAFETY: one complete tile, a full codebook and exclusive output.
+            // Native reports an empty finite survivor set rather than retaining
+            // any caller pointer; this is not a fatal runtime/device fault.
+            let result = unsafe {
+                encode(
+                    bad_tile.as_ptr(),
+                    ht_codebook().as_ptr(),
+                    output.as_mut_ptr(),
+                    1,
+                    8,
+                    bits as c_int,
+                )
+            };
+            assert_eq!(result, -4);
+            assert!(!gpu_last_error(backend).is_empty());
+            assert_eq!(
+                native_symbols(backend, &tiles, ht_codebook(), 8, bits),
+                native_symbols(HtBackend::Cpu, &tiles, ht_codebook(), 8, bits)
+            );
+        }
+    }
+
+    #[cfg(any(feature = "hip", feature = "cuda"))]
+    fn concurrent_callers_and_codebook_changes_match_cpu(backend: HtBackend) {
+        backend.preflight().unwrap();
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for worker in 0..4 {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let mut codebook = ht_codebook().to_vec();
+                    let beam = [1, 7, 128, 256][worker];
+                    for bits in [3, 4] {
+                        let tiles = tile_corpus(bits);
+                        let sign = if worker % 2 == 0 { 1.0 } else { -1.0 };
+                        let scale = (worker + 1) as f32 / 4.0;
+                        for (value, &original) in codebook.iter_mut().zip(ht_codebook()) {
+                            *value = sign * scale * original;
+                        }
+                        let expected =
+                            native_symbols(HtBackend::Cpu, &tiles, &codebook, beam, bits);
+                        // Synchronize the first call only: a failing worker
+                        // must not strand its peers at a later barrier.
+                        if bits == 3 {
+                            barrier.wait();
+                        }
+                        assert_eq!(
+                            native_symbols(backend, &tiles, &codebook, beam, bits),
+                            expected,
+                            "worker={worker} bits={bits} beam={beam}"
+                        );
+                    }
+                });
+            }
+        });
+    }
+
+    macro_rules! gpu_device_tests {
+        ($feature:literal, $backend:expr,
+         $corpus:ident, $beams:ident, $batches:ident, $bands:ident,
+         $recovery:ident, $concurrent:ident) => {
+            #[cfg(feature = $feature)]
+            #[test]
+            #[ignore = "requires the selected GPU; exact CPU/GPU corpus comparison"]
+            fn $corpus() {
+                native_corpus_matches_cpu_ht3_ht4_and_closure($backend);
+            }
+
+            #[cfg(feature = $feature)]
+            #[test]
+            #[ignore = "requires the selected GPU; full corpus at every beam 1..=256"]
+            fn $beams() {
+                every_supported_beam_matches_cpu($backend);
+            }
+
+            #[cfg(feature = $feature)]
+            #[test]
+            #[ignore = "requires the selected GPU; content caches and bounded batch boundary"]
+            fn $batches() {
+                native_batches_and_changed_codebooks_match_cpu($backend);
+            }
+
+            #[cfg(feature = $feature)]
+            #[test]
+            #[ignore = "requires the selected GPU; public rotations and paired-band path"]
+            fn $bands() {
+                public_bands_and_pairs_match_cpu($backend);
+            }
+
+            #[cfg(feature = $feature)]
+            #[test]
+            #[ignore = "requires the selected GPU; recover after no finite survivors"]
+            fn $recovery() {
+                native_error_recovery_matches_cpu($backend);
+            }
+
+            #[cfg(feature = $feature)]
+            #[test]
+            #[ignore = "requires the selected GPU; simultaneous callers use distinct codebooks"]
+            fn $concurrent() {
+                concurrent_callers_and_codebook_changes_match_cpu($backend);
+            }
+        };
+    }
+
+    gpu_device_tests!(
+        "hip",
+        HtBackend::Hip,
+        hip_native_corpus_matches_cpu_ht3_ht4_and_closure,
+        hip_every_supported_beam_matches_cpu,
+        hip_native_batches_and_changed_codebooks_match_cpu,
+        hip_public_bands_and_pairs_match_cpu,
+        hip_native_error_recovery_matches_cpu,
+        hip_concurrent_callers_and_codebook_changes_match_cpu
+    );
+    gpu_device_tests!(
+        "cuda",
+        HtBackend::Cuda,
+        cuda_native_corpus_matches_cpu_ht3_ht4_and_closure,
+        cuda_every_supported_beam_matches_cpu,
+        cuda_native_batches_and_changed_codebooks_match_cpu,
+        cuda_public_bands_and_pairs_match_cpu,
+        cuda_native_error_recovery_matches_cpu,
+        cuda_concurrent_callers_and_codebook_changes_match_cpu
+    );
 }

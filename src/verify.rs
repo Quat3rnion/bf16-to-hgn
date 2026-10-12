@@ -158,9 +158,7 @@ pub fn verify(
             let errors = payloads
                 .verify_tensor(&mut reader, index, tensor)
                 .with_context(|| format!("verify {}:{}", file_plan.filename, tensor.name))?;
-            if stage.is_enabled() {
-                stage.set_item(&format!("hash {}", tensor.name));
-            }
+            tensor_progress::item(&stage, tensor, "hash", "CPU", 0, 0, "", None);
             let actual = reader.fingerprint(index)?;
             ensure!(
                 actual == output_record.fingerprint,
@@ -195,16 +193,16 @@ pub fn verify(
             }
         }
     }
-    stage.set_item("Checking source coverage");
+    stage.set_item("check source coverage");
     report.source_tensors = payloads.sources.finish()?;
     if let Some(provenance) = manifest.source_provenance {
-        stage.set_item("Checking source provenance");
+        stage.set_item("check source provenance");
         ensure!(
             snapshot.provenance()? == provenance,
             "source physical provenance mismatch"
         );
     }
-    stage.set_item("Finalizing verification");
+    stage.set_item("check source unchanged");
     snapshot.check_unchanged()?;
     stage.finish();
     Ok(report)
@@ -687,9 +685,8 @@ impl PayloadVerifier<'_> {
                     su,
                     sv,
                 )?
-            } else if tensor.encoding == Encoding::I4r && self.decode_backend == DecodeBackend::Hip
-            {
-                verify_gpu::decode_i4r(&block, take, cols, &meta)?
+            } else if tensor.encoding == Encoding::I4r && self.decode_backend.is_gpu() {
+                verify_gpu::decode_i4r(self.decode_backend, &block, take, cols, &meta)?
             } else {
                 codec::decode_rows(tensor.encoding, &block, take, cols, &meta)?
             };
@@ -922,10 +919,8 @@ impl PayloadVerifier<'_> {
         Ok(totals)
     }
     fn backend(&self, tensor: &TensorPlan) -> &'static str {
-        if self.decode_backend == DecodeBackend::Hip
-            && (tensor.encoding.ht_bits().is_some() || tensor.encoding == Encoding::I4r)
-        {
-            "HIP"
+        if tensor.encoding.ht_bits().is_some() || tensor.encoding == Encoding::I4r {
+            self.decode_backend.label()
         } else {
             "CPU"
         }
@@ -1008,7 +1003,8 @@ fn decode_ht_for_verification(
 ) -> Result<Vec<f32>> {
     match backend {
         DecodeBackend::Cpu => decode_ht_independent(bytes, bits, cols, paired, su, sv),
-        DecodeBackend::Hip => verify_gpu::decode_ht(
+        DecodeBackend::Hip | DecodeBackend::Cuda => verify_gpu::decode_ht(
+            backend,
             bytes,
             BLOCK_ROWS,
             cols,

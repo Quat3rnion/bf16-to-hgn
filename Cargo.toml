@@ -8,6 +8,7 @@ build = "build.rs"
 [features]
 default = []
 hip = []
+cuda = []
 
 [dependencies]
 anyhow = "1.0"

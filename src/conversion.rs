@@ -278,7 +278,7 @@ pub fn prepare_rotations(
                         tensor_progress::rows(
                             &stage,
                             weight,
-                            "scan HT scales",
+                            "scan row scales",
                             "CPU",
                             row,
                             take,
@@ -289,7 +289,7 @@ pub fn prepare_rotations(
                         tensor_progress::item(
                             &stage,
                             tensor,
-                            "scan HT scales",
+                            "scan row scales",
                             "CPU",
                             row as u64,
                             rows as u64,
@@ -308,7 +308,7 @@ pub fn prepare_rotations(
                         tensor_progress::rows(
                             &stage,
                             weight,
-                            "scan HT scales",
+                            "scan row scales",
                             "CPU",
                             row,
                             take,
@@ -319,7 +319,7 @@ pub fn prepare_rotations(
                         tensor_progress::item(
                             &stage,
                             tensor,
-                            "scan HT scales",
+                            "scan row scales",
                             "CPU",
                             (row + take) as u64,
                             rows as u64,
@@ -567,16 +567,16 @@ pub fn convert(
             sha256,
         })
         .collect();
-    stage.set_uncounted_item("Copying assets");
+    stage.set_uncounted_item("copy assets");
     let assets = copy_assets(snapshot, plan, staging.path())?;
-    stage.set_uncounted_item("Hashing source metadata");
+    stage.set_uncounted_item("hash source metadata");
     let (_, config_sha256) = hash_file(&snapshot.asset_path("config.json")?)?;
     let index_sha256 = if snapshot.kind() == SourceKind::Hf {
         Some(hash_file(&snapshot.asset_path("model.safetensors.index.json")?)?.1)
     } else {
         None
     };
-    stage.set_uncounted_item("Checking source provenance");
+    stage.set_uncounted_item("check source provenance");
     let source_provenance = snapshot.provenance()?;
     let manifest = Manifest {
         schema: 2,
@@ -596,7 +596,7 @@ pub fn convert(
         assets,
         containers,
     };
-    stage.set_uncounted_item("Publishing output");
+    stage.set_uncounted_item("publish output");
     let manifest_path = staging.path().join("conversion-manifest.json");
     let mut manifest_file = OpenOptions::new()
         .write(true)
@@ -983,12 +983,12 @@ fn encode_table(
                 tensor_progress::item(
                     stage,
                     tensor,
-                    "scan FP8 scale",
+                    "scan global scale",
                     "CPU",
                     (shard * shard_rows + row) as u64,
                     (shards.len() * shard_rows) as u64,
                     "rows",
-                    Some("scan"),
+                    None,
                 );
             }
             let started = stage.start_work();
@@ -1001,12 +1001,12 @@ fn encode_table(
                 tensor_progress::item(
                     stage,
                     tensor,
-                    "scan FP8 scale",
+                    "scan global scale",
                     "CPU",
                     (shard * shard_rows + row) as u64,
                     (shards.len() * shard_rows) as u64,
                     "rows",
-                    Some("scan"),
+                    None,
                 );
             }
             stage.advance_work(WorkClass::ScanFp8Scale, (take * cols) as u64, started);
@@ -1037,7 +1037,7 @@ fn encode_table(
                     (shard * shard_rows + row) as u64,
                     (shards.len() * shard_rows) as u64,
                     "rows",
-                    Some("encode"),
+                    None,
                 );
             }
             let started = stage.start_work();
@@ -1061,7 +1061,7 @@ fn encode_table(
                     (shard * shard_rows + row) as u64,
                     (shards.len() * shard_rows) as u64,
                     "rows",
-                    Some("encode"),
+                    None,
                 );
             }
             stage.advance_work(

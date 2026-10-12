@@ -30,6 +30,18 @@ decoders with ordered binary64 Hadamard unrotation. HT verification receives
 the Rust verifier's independent codebook rather than using the encoder's
 codebook or re-encoding payloads.
 
+ht_trellis_cuda.cu ports those encoder and independent verification kernels
+to CUDA under the same Apache-2.0 license, leaving the HIP source unchanged.
+It retains the selection permutation, parent ties, partial HT3 closure and
+ordered binary32/binary64 arithmetic. CUDA builds disable contraction and
+denormal flushing; no approximate encoding path or CPU fallback is used.
+Persistent bounded workspaces pack each request's histories and beam width
+to increase batch occupancy without changing tile arithmetic or ordering.
+tests/cuda_selection.cu checks full device permutations and heap fallback
+against ordinary libstdc++ 12 or 16, with the version-specific comparator
+adapter required by their internal heap APIs. Its host-only mode emits the
+same corpus fingerprint for cross-host standard-library qualification.
+
 The Rust storage layouts and golden test vectors follow jtsylve/hgn-spec
 1.1.0 at commit 79e75fd4ae7642478823525b0a3212951f584af5:
 https://github.com/jtsylve/hgn-spec/tree/79e75fd4ae7642478823525b0a3212951f584af5

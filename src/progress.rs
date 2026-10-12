@@ -13,45 +13,57 @@
 //! instead sums remaining work at separately measured operation/codec/device
 //! rates, and labels unmeasured classes and uncounted finalization explicitly.
 //!
-//! A live stage draws a short block. For the stage labels and context this
-//! crate reports, each line normally fits in 80 columns, so the overall
-//! counters never push the context off a narrow terminal (a longer line wraps
-//! and the redraw accounts for it):
+//! A live stage draws a block ordered from overall to local work, laid out
+//! again for the terminal's current width at every redraw:
 //!
 //! ```text
-//! ⠙ Convert passes [=========>              ] 512.00G/1.37T values
-//!   12.34M values/s  elapsed 00:12:34  eta ~2h
-//!   encode Ht3 on HIP · layers.12 · expert 37 (512 total) · gate+up
-//!   384/1,280 rows (30%) · layers.12.mlp.experts.gate_up_proj.weight
+//! ⠙ Convert passes  37% [===========>                  ] 512.00G/1.37T values
+//!   elapsed 04:12:34 · ETA ~7h · 33.79M values/s
+//!   encode HT3 on HIP · layers.12.mlp.experts.gate_up_proj.weight
+//!   expert 37 of 512 · gate+up 384/640 row pairs (60%)
 //! ```
 //!
-//! The first two lines are the stage's overall work; the last two show the
-//! latest [`Detail`] (or a single [`Stage::set_item`] label) and appear only
-//! once the caller reports one. A stopped stage keeps them so a failure shows
-//! where it stopped; a completed stage collapses to one "done" line.
+//! The first two lines are the stage's overall work and time; the last two
+//! show the latest [`Detail`] (or one [`Stage::set_item`] line) and appear
+//! only once the caller reports one. To fit a narrow terminal, lines drop
+//! optional fields (rate, gauge, counts, part, item percentage) and shorten
+//! names in the middle, keeping a tensor's layer scope; ETA wording is never
+//! shortened. A stopped stage keeps its context so a failure shows where it
+//! stopped; a completed stage collapses to one "done" line.
 
 use crate::codec::{Encoding, HtBackend};
 use indicatif::{
-    BinaryBytes, HumanCount, HumanDuration, ProgressBar, ProgressDrawTarget, ProgressState,
-    ProgressStyle,
+    BinaryBytes, FormattedDuration, HumanCount, HumanDuration, ProgressBar, ProgressDrawTarget,
+    ProgressState, ProgressStyle,
 };
 use std::{
     borrow::Cow,
     fmt::{self, Write as _},
     io::IsTerminal as _,
+    iter, mem,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
 
 /// Redraw interval while a stage is live, so elapsed time, the spinner, the
-/// latest detail and the rate estimate stay current during long blocks.
+/// latest detail, the rate estimate and the layout for the terminal's current
+/// width stay current.
 const TICK: Duration = Duration::from_millis(250);
-const GAUGE_WIDTH: u64 = 24;
-const RUNNING: &str = "{spinner} {prefix} [{gauge}] {work}\n  {rate}  elapsed {elapsed_precise}  eta {remaining}{detail}";
-const DONE: &str = "{prefix}: done {amount} in {elapsed_precise} ({rate})";
-const STOPPED: &str = "{prefix}: stopped at {work} after {elapsed_precise}{detail}";
-/// Separates fields of a detail line.
+/// Terminal width assumed when none is reported, as indicatif does.
+const FALLBACK_COLUMNS: usize = 80;
+/// The gauge takes the header's spare columns, up to `GAUGE_MAX`, and is left
+/// out when fewer than `GAUGE_MIN` remain.
+const GAUGE_MIN: usize = 8;
+const GAUGE_MAX: usize = 30;
+/// Columns of a shortened tensor name's end that its kept layer scope must
+/// leave; the name gets at least this much room even on a crowded line.
+const NAME_TAIL: usize = 16;
+/// Starts each line below the first, indented by `INDENT` columns.
+const LINE: &str = "\n  ";
+const INDENT: usize = 2;
+/// Separates fields of a line.
 const FIELD: &str = " · ";
+const FINALIZING: &str = "finalizing (outside ETA)";
 
 /// Progress sink handed to long-running library operations.
 ///
@@ -107,12 +119,14 @@ impl Progress {
         if !self.enabled {
             return Stage { live: None, unit };
         }
+        let label = label.into();
         let context = Arc::new(Mutex::new(Context {
+            label_columns: width(&label),
             estimate,
             ..Context::default()
         }));
         let bar = ProgressBar::with_draw_target(Some(total), ProgressDrawTarget::stderr())
-            .with_style(unit.style(RUNNING, &context))
+            .with_style(unit.style(Frame::Running, &context))
             .with_prefix(label);
         bar.enable_steady_tick(TICK);
         Stage {
@@ -133,7 +147,7 @@ pub(crate) enum WorkClass {
 }
 
 const ENCODING_CLASSES: usize = 11;
-const WORK_CLASSES: usize = ENCODING_CLASSES + 2 + 3 + 2;
+const WORK_CLASSES: usize = ENCODING_CLASSES + 4 + 3 + 2;
 
 impl WorkClass {
     pub(crate) fn encode(encoding: Encoding, configured_backend: HtBackend) -> Self {
@@ -147,7 +161,7 @@ impl WorkClass {
 
     pub(crate) fn backend_label(self) -> &'static str {
         match self {
-            Self::Encode(_, HtBackend::Hip) => "HIP",
+            Self::Encode(_, backend) => backend.label(),
             _ => "CPU",
         }
     }
@@ -170,13 +184,17 @@ impl WorkClass {
             },
             Self::Encode(Encoding::Ht, HtBackend::Hip) => ENCODING_CLASSES,
             Self::Encode(Encoding::Ht3, HtBackend::Hip) => ENCODING_CLASSES + 1,
-            Self::Encode(_, HtBackend::Hip) => unreachable!("only HT encoding runs on HIP"),
-            Self::Copy(Encoding::Bf16) => ENCODING_CLASSES + 2,
-            Self::Copy(Encoding::F32) => ENCODING_CLASSES + 3,
-            Self::Copy(Encoding::I64) => ENCODING_CLASSES + 4,
+            Self::Encode(Encoding::Ht, HtBackend::Cuda) => ENCODING_CLASSES + 2,
+            Self::Encode(Encoding::Ht3, HtBackend::Cuda) => ENCODING_CLASSES + 3,
+            Self::Encode(_, HtBackend::Hip | HtBackend::Cuda) => {
+                unreachable!("only HT encoding runs on a GPU")
+            }
+            Self::Copy(Encoding::Bf16) => ENCODING_CLASSES + 4,
+            Self::Copy(Encoding::F32) => ENCODING_CLASSES + 5,
+            Self::Copy(Encoding::I64) => ENCODING_CLASSES + 6,
             Self::Copy(_) => unreachable!("unsupported direct-copy encoding"),
-            Self::WriteRotation => ENCODING_CLASSES + 5,
-            Self::ScanFp8Scale => ENCODING_CLASSES + 6,
+            Self::WriteRotation => ENCODING_CLASSES + 7,
+            Self::ScanFp8Scale => ENCODING_CLASSES + 8,
         }
     }
 }
@@ -273,9 +291,15 @@ enum WorkRemaining {
 }
 
 impl WorkRemaining {
+    /// No measured estimate applies: every counted value is done, or the
+    /// current step is deliberately outside the value-work ETA.
+    fn finalizing(self, outside_eta: bool) -> bool {
+        outside_eta || self == Self::Complete
+    }
+
     fn write(self, outside_eta: bool, out: &mut dyn fmt::Write) -> fmt::Result {
-        if outside_eta || self == Self::Complete {
-            return out.write_str("finalizing (outside ETA)");
+        if self.finalizing(outside_eta) {
+            return out.write_str(FINALIZING);
         }
         let Self::Estimate { measured, learning } = self else {
             unreachable!()
@@ -302,73 +326,128 @@ pub enum Unit {
 }
 
 impl Unit {
-    fn style(self, template: &str, context: &Arc<Mutex<Context>>) -> ProgressStyle {
-        let detail_context = Arc::clone(context);
-        let eta_context = Arc::clone(context);
-        ProgressStyle::with_template(template)
+    /// Everything after the label is one `frame` key, so a redraw lays out all
+    /// of the stage's lines together for the terminal's current width. The
+    /// label is indicatif's prefix: the console crate's `NO_COLOR`/`CLICOLOR`
+    /// rules decide whether it is bold, and no information depends on that.
+    fn style(self, frame: Frame, context: &Arc<Mutex<Context>>) -> ProgressStyle {
+        let context = Arc::clone(context);
+        ProgressStyle::with_template(frame.template())
             .expect("static progress template")
             .with_key(
-                "detail",
-                move |_: &ProgressState, out: &mut dyn fmt::Write| {
-                    let _ = lock(&detail_context).write_lines(out);
-                },
-            )
-            .with_key(
-                "gauge",
-                |state: &ProgressState, out: &mut dyn fmt::Write| {
-                    let _ = write_gauge(state, out);
-                },
-            )
-            .with_key(
-                "work",
+                "frame",
                 move |state: &ProgressState, out: &mut dyn fmt::Write| {
-                    let _ = self.write_work(state, out);
+                    let mut context = lock(&context);
+                    // One reused buffer, handed to indicatif in a single write.
+                    let mut text = mem::take(&mut context.text);
+                    text.clear();
+                    let _ = context.write_frame(self, frame, state, &mut text);
+                    let _ = out.write_str(&text);
+                    context.text = text;
                 },
             )
-            .with_key(
-                "amount",
-                move |state: &ProgressState, out: &mut dyn fmt::Write| {
-                    let _ = self.write_amount(out, state.pos());
-                },
-            )
-            .with_key(
-                "rate",
-                move |state: &ProgressState, out: &mut dyn fmt::Write| {
-                    let _ = self.write_rate(state, out);
-                },
-            )
-            .with_key(
-                "remaining",
-                move |state: &ProgressState, out: &mut dyn fmt::Write| {
-                    let context = lock(&eta_context);
-                    let _ = match &context.estimate {
-                        Some(estimate) => estimate.remaining().write(context.outside_eta, out),
-                        None => write_remaining(state, out),
-                    };
-                },
-            )
+    }
+
+    /// Rounded-down percentage of counted work, a gauge and the counts within
+    /// `columns`. The counts outrank the gauge, which repeats the percentage.
+    fn write_header(self, state: &ProgressState, columns: usize, out: &mut String) -> fmt::Result {
+        let Some(total) = state.len().filter(|&total| total > 0) else {
+            return self.write_work(state, out);
+        };
+        write!(out, "{:>3}%", percent(state.pos(), total))?;
+        let mut spare = columns.saturating_sub(4);
+        let mut counts = ColumnCount(0);
+        self.write_work(state, &mut counts)?;
+        let show_counts = counts.0 < spare;
+        if show_counts {
+            spare -= counts.0 + 1;
+        }
+        if spare >= GAUGE_MIN + 3 {
+            out.push_str(" [");
+            write_gauge(state.pos(), total, (spare - 3).min(GAUGE_MAX), out);
+            out.push(']');
+        }
+        if show_counts {
+            out.push(' ');
+            self.write_work(state, out)?;
+        }
+        Ok(())
+    }
+
+    /// The line a completed stage leaves; its rate is the stage average.
+    fn write_done(self, state: &ProgressState, columns: usize, out: &mut String) -> fmt::Result {
+        fit(out, columns, 2, |out, variant| {
+            out.push_str("done ");
+            self.write_amount(out, state.pos())?;
+            write!(out, " in {}", FormattedDuration(state.elapsed()))?;
+            if variant == 0 {
+                out.push_str(" (avg ");
+                self.write_rate(state, out)?;
+                out.push(')');
+            }
+            Ok(())
+        })
+    }
+
+    /// Where an unfinished stage stopped, never rounded up to complete.
+    fn write_stopped(self, state: &ProgressState, columns: usize, out: &mut String) -> fmt::Result {
+        let total = state.len().filter(|&total| total > 0);
+        fit(out, columns, 2, |out, variant| {
+            out.push_str("stopped at ");
+            match total {
+                Some(total) if variant == 1 => write!(out, "{}%", percent(state.pos(), total))?,
+                _ => {
+                    self.write_work(state, out)?;
+                    if let Some(total) = total {
+                        write!(out, " ({}%)", percent(state.pos(), total))?;
+                    }
+                }
+            }
+            write!(out, " after {}", FormattedDuration(state.elapsed()))
+        })
+    }
+}
+
+/// Which rendering of a stage indicatif draws.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Frame {
+    Running,
+    Done,
+    Stopped,
+}
+
+impl Frame {
+    fn template(self) -> &'static str {
+        match self {
+            Self::Running => "{spinner} {prefix:.bold} {frame}",
+            Self::Done | Self::Stopped => "{prefix:.bold}: {frame}",
+        }
+    }
+
+    /// Columns the template adds to the label on the first line.
+    fn lead(self) -> usize {
+        match self {
+            Self::Running => 3,
+            Self::Done | Self::Stopped => 2,
+        }
     }
 }
 
 /// Live gauge that never fills: a stage whose position already reached its
 /// total may still be running final checks, and only [`Stage::finish`] may
-/// report completion (finished stages use templates without a gauge).
-fn write_gauge(state: &ProgressState, out: &mut dyn fmt::Write) -> fmt::Result {
-    let filled = match state.len() {
-        Some(total) if total > 0 => {
-            let filled = u128::from(state.pos()) * u128::from(GAUGE_WIDTH) / u128::from(total);
-            filled.min(u128::from(GAUGE_WIDTH - 1)) as u64
-        }
-        _ => 0,
-    };
-    for _ in 0..filled {
-        out.write_char('=')?;
-    }
-    out.write_char('>')?;
-    for _ in filled + 1..GAUGE_WIDTH {
-        out.write_char(' ')?;
-    }
-    Ok(())
+/// report completion (finished stages draw no gauge).
+fn write_gauge(position: u64, total: u64, cells: usize, out: &mut String) {
+    let filled = u128::from(position) * cells as u128 / u128::from(total);
+    let filled = filled.min(cells as u128 - 1) as usize;
+    out.extend(iter::repeat_n('=', filled));
+    out.push('>');
+    out.extend(iter::repeat_n(' ', cells - filled - 1));
+}
+
+/// Whole percent, rounded down so 100% appears only once all of the counted
+/// work is reported.
+fn percent(completed: u64, total: u64) -> u128 {
+    u128::from(completed) * 100 / u128::from(total)
 }
 
 impl Unit {
@@ -419,16 +498,18 @@ impl Unit {
     }
 }
 
-/// Remaining time at the recent rate, or `?` when unknown: before measured
-/// progress (instead of indicatif's zero placeholder) and once all counted
-/// work is reported but the stage is still running its closing checks.
-fn write_remaining(state: &ProgressState, out: &mut dyn fmt::Write) -> fmt::Result {
-    let rate = state.per_sec();
-    let counted_all = state.len().is_some_and(|total| state.pos() >= total);
-    if state.pos() == 0 || counted_all || !rate.is_finite() || rate <= 0.0 {
-        return out.write_char('?');
+/// A generic stage's ETA at its recent aggregate rate: `?` before measured
+/// progress (instead of indicatif's zero placeholder), and finalizing once all
+/// counted work is reported while the stage still runs its closing checks.
+fn write_remaining(state: &ProgressState, out: &mut String) -> fmt::Result {
+    if state.len().is_some_and(|total| state.pos() >= total) {
+        return out.write_str(FINALIZING);
     }
-    write!(out, "~{:#}", HumanDuration(state.eta()))
+    let rate = state.per_sec();
+    if state.pos() == 0 || !rate.is_finite() || rate <= 0.0 {
+        return out.write_str("ETA ?");
+    }
+    write!(out, "ETA ~{:#}", HumanDuration(state.eta()))
 }
 
 fn write_si(out: &mut dyn fmt::Write, value: f64) -> fmt::Result {
@@ -449,8 +530,9 @@ fn write_si(out: &mut dyn fmt::Write, value: f64) -> fmt::Result {
 /// Where a stage is within its current item, for [`Stage::set_detail`].
 ///
 /// Every field is borrowed, so building one costs nothing; a live stage copies
-/// it into reused buffers and a disabled stage ignores it. Empty strings and
-/// `None` fields are left out of the display.
+/// it into reused buffers and formats it only when redrawing, and a disabled
+/// stage ignores it. Empty strings and `None` fields are left out of the
+/// display.
 #[derive(Clone, Copy, Debug)]
 pub struct Detail<'a> {
     /// Phase step, such as `encode`, `copy`, `scan` or `decode`.
@@ -458,90 +540,86 @@ pub struct Detail<'a> {
     /// Output tensor name.
     pub tensor: &'a str,
     /// Scope-qualified location such as `layers.2`, `mtp.layers.0` or
-    /// `visual.blocks.3`; `None` for tensors outside any layer.
+    /// `visual.blocks.3`; `None` for tensors outside any layer. A scope that
+    /// begins `tensor` stays visible when a narrow terminal shortens the name;
+    /// any other scope is shown before it.
     pub layer: Option<&'a str>,
     /// Store label of the tensor's encoding.
     pub encoding: &'a str,
-    /// Device actually running this step, such as `CPU` or `HIP`.
+    /// Device actually running this step, such as `CPU`, `HIP` or `CUDA`.
     pub backend: &'a str,
     /// `(index, count)`: zero-based index of the current expert and the number
-    /// of experts in the tensor. Shown as `expert 7 (512 total)`, so the last
-    /// expert of 512 reads `expert 511 (512 total)`.
+    /// of experts in the tensor. Shown as `expert 7 of 512`, so the last
+    /// expert of 512 reads `expert 511 of 512`.
     pub expert: Option<(u64, u64)>,
-    /// Part of the expert or tensor, such as `gate`, `up` or `gate+up`.
+    /// Part of the expert or tensor, such as `gate`, `up` or `gate+up`, drawn
+    /// just before the item progress it qualifies.
     pub part: Option<&'a str>,
     /// Work on the current item finished so far, out of `total`, in `unit`
-    /// (for example `rows`, `bands`, `values` or `bytes`). A `total` of zero
-    /// leaves item progress out.
+    /// (for example `rows`, `row pairs`, `values` or `bytes`). A `total` of
+    /// zero leaves item progress out.
     pub completed: u64,
     pub total: u64,
     pub unit: &'a str,
 }
 
-impl Detail<'_> {
-    /// Operation, encoding and backend, then location, for example
-    /// `encode Ht3 on HIP · layers.12 · expert 37 (512 total) · gate+up`.
-    fn write_scope(&self, out: &mut String) -> fmt::Result {
-        for word in [self.operation, self.encoding] {
-            if !word.is_empty() {
-                if !out.is_empty() {
-                    out.push(' ');
-                }
-                out.push_str(word);
-            }
+/// Append the first of `variants`, written from fullest to most compact, that
+/// fits `columns`. The most compact stays even when it overflows: indicatif
+/// counts the wrapped rows, and wrapping beats hiding a required field.
+fn fit(
+    out: &mut String,
+    columns: usize,
+    variants: usize,
+    mut write: impl FnMut(&mut String, usize) -> fmt::Result,
+) -> fmt::Result {
+    let start = out.len();
+    for variant in 0..variants {
+        out.truncate(start);
+        write(out, variant)?;
+        if width(&out[start..]) <= columns {
+            break;
         }
-        if !self.backend.is_empty() {
-            if !out.is_empty() {
-                out.push_str(" on ");
-            }
-            out.push_str(self.backend);
-        }
-        if let Some(layer) = self.layer {
-            push_field(out, layer);
-        }
-        if let Some((index, count)) = self.expert {
-            separate(out);
-            write!(out, "expert {index} ({count} total)")?;
-        }
-        if let Some(part) = self.part {
-            push_field(out, part);
-        }
-        Ok(())
     }
+    Ok(())
+}
 
-    /// Item progress, then the tensor name, for example
-    /// `384/1,280 rows (30%) · layers.12.mlp.experts.gate_up_proj.weight`.
-    /// The percentage rounds down, so it reads 100% only once all of the
-    /// item's work is reported.
-    fn write_item(&self, out: &mut String) -> fmt::Result {
-        if self.total > 0 {
-            write_count(out, self.unit, self.completed)?;
-            out.push('/');
-            write_count(out, self.unit, self.total)?;
-            if self.unit != "bytes" && !self.unit.is_empty() {
-                out.push(' ');
-                out.push_str(self.unit);
-            }
-            let percent = u128::from(self.completed) * 100 / u128::from(self.total);
-            write!(out, " ({percent}%)")?;
-        }
-        if !self.tensor.is_empty() {
-            push_field(out, self.tensor);
-        }
+/// Columns of drawn text. Everything drawn here (ASCII, `·`, `…` and the
+/// tool's tensor names) takes one column per character; wider text at worst
+/// wraps, and indicatif counts wrapped rows.
+fn width(text: &str) -> usize {
+    text.chars().count()
+}
+
+/// Measures formatted text without storing it.
+struct ColumnCount(usize);
+
+impl fmt::Write for ColumnCount {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        self.0 += width(text);
         Ok(())
     }
 }
 
-/// Start another field of a detail line.
-fn separate(out: &mut String) {
-    if !out.is_empty() {
+/// Append `text` within `columns`. A longer text keeps its first `head`
+/// columns and as much of its end as fits, joined by `…`.
+fn push_elided(out: &mut String, text: &str, head: usize, columns: usize) {
+    let length = width(text);
+    if length <= columns {
+        out.push_str(text);
+        return;
+    }
+    let kept = columns.saturating_sub(1);
+    let head = head.min(kept);
+    out.extend(text.chars().take(head));
+    out.push('…');
+    out.extend(text.chars().skip(length - (kept - head)));
+}
+
+/// Start another field of a line that began at `start`.
+fn separate(out: &mut String, start: usize) {
+    if out.len() > start {
         out.push_str(FIELD);
     }
-}
-
-fn push_field(out: &mut String, field: &str) {
-    separate(out);
-    out.push_str(field);
 }
 
 /// One count of a free-form detail unit: binary sizes for `bytes`, SI
@@ -554,32 +632,258 @@ fn write_count(out: &mut String, unit: &str, value: u64) -> fmt::Result {
     }
 }
 
-/// Latest context of a live stage, drawn below its overall counters. Updated
-/// in place so steady-state updates reuse the same buffers.
+/// Width of the terminal on standard error, read at each redraw so the frame
+/// after a resize is laid out for the new width.
+#[cfg(unix)]
+fn terminal_columns() -> Option<usize> {
+    use std::os::fd::AsRawFd as _;
+    let fd = std::io::stderr().as_raw_fd();
+    let mut size = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: TIOCGWINSZ only writes one `winsize` into this live local.
+    let status = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) };
+    let columns = usize::from(size.ws_col);
+    (status == 0 && columns > 0).then_some(columns)
+}
+
+#[cfg(not(unix))]
+fn terminal_columns() -> Option<usize> {
+    None
+}
+
+/// What a live stage is doing below its overall counters. Updates copy into
+/// these reused buffers; formatting waits for a redraw.
+#[derive(Debug, Default)]
+struct Item {
+    kind: ItemKind,
+    /// A note's text, or a detail's operation.
+    text: String,
+    tensor: String,
+    layer: String,
+    encoding: String,
+    backend: String,
+    expert: Option<(u64, u64)>,
+    part: String,
+    completed: u64,
+    total: u64,
+    unit: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ItemKind {
+    #[default]
+    Empty,
+    Note,
+    Detail,
+}
+
+impl Item {
+    fn set_note(&mut self, text: &str) {
+        self.kind = ItemKind::Note;
+        replace(&mut self.text, text);
+    }
+
+    fn set_detail(&mut self, detail: &Detail<'_>) {
+        self.kind = ItemKind::Detail;
+        replace(&mut self.text, detail.operation);
+        replace(&mut self.tensor, detail.tensor);
+        replace(&mut self.layer, detail.layer.unwrap_or_default());
+        replace(&mut self.encoding, detail.encoding);
+        replace(&mut self.backend, detail.backend);
+        self.expert = detail.expert;
+        replace(&mut self.part, detail.part.unwrap_or_default());
+        self.completed = detail.completed;
+        self.total = detail.total;
+        replace(&mut self.unit, detail.unit);
+    }
+
+    /// The lines below the overall counters, each fitted to `columns` after
+    /// its indent: a note, or a detail's target and position.
+    fn write_lines(&self, columns: usize, out: &mut String) -> fmt::Result {
+        match self.kind {
+            ItemKind::Empty => {}
+            ItemKind::Note => {
+                out.push_str(LINE);
+                push_elided(out, &self.text, columns.saturating_sub(1) / 2, columns);
+            }
+            ItemKind::Detail => {
+                out.push_str(LINE);
+                self.write_target(columns, out);
+                if self.expert.is_some() || !self.part.is_empty() || self.total > 0 {
+                    out.push_str(LINE);
+                    fit(out, columns, 3, |out, variant| {
+                        self.write_position(variant, out)
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Operation, encoding and backend, then the tensor, for example
+    /// `encode HT3 on HIP · layers.12.mlp.experts.gate_up_proj.weight`. Only
+    /// the name is shortened, keeping its layer scope while room allows.
+    fn write_target(&self, columns: usize, out: &mut String) {
+        let start = out.len();
+        for word in [&self.text, &self.encoding] {
+            if !word.is_empty() {
+                if out.len() > start {
+                    out.push(' ');
+                }
+                out.push_str(word);
+            }
+        }
+        if !self.backend.is_empty() {
+            if out.len() > start {
+                out.push_str(" on ");
+            }
+            out.push_str(&self.backend);
+        }
+        let scope = self.scope();
+        if scope.is_none() && !self.layer.is_empty() {
+            separate(out, start);
+            out.push_str(&self.layer);
+        }
+        if !self.tensor.is_empty() {
+            separate(out, start);
+            let used = width(&out[start..]);
+            let room = columns.saturating_sub(used).max(NAME_TAIL + 1);
+            let head = match scope {
+                Some(scope) if scope + NAME_TAIL < room => scope,
+                _ => 0,
+            };
+            push_elided(out, &self.tensor, head, room);
+        }
+    }
+
+    /// Columns of the layer scope and its dot that begin the tensor name, when
+    /// the layer is such a prefix.
+    fn scope(&self) -> Option<usize> {
+        if self.layer.is_empty() {
+            return None;
+        }
+        let rest = self.tensor.strip_prefix(self.layer.as_str())?;
+        match rest.chars().next() {
+            None => Some(width(&self.layer)),
+            Some('.') => Some(width(&self.layer) + 1),
+            Some(_) => None,
+        }
+    }
+
+    /// Position inside the tensor, for example
+    /// `expert 37 of 512 · gate+up 384/640 row pairs (60%)`. Compact variants
+    /// drop the part, then the item percentage, which rounds down so it reads
+    /// 100% only once all of the item's work is reported.
+    fn write_position(&self, variant: usize, out: &mut String) -> fmt::Result {
+        let start = out.len();
+        if let Some((index, count)) = self.expert {
+            write!(out, "expert {index} of {count}")?;
+        }
+        let part = variant == 0 && !self.part.is_empty();
+        if part {
+            separate(out, start);
+            out.push_str(&self.part);
+        }
+        if self.total == 0 {
+            return Ok(());
+        }
+        if part {
+            out.push(' ');
+        } else {
+            separate(out, start);
+        }
+        write_count(out, &self.unit, self.completed)?;
+        out.push('/');
+        write_count(out, &self.unit, self.total)?;
+        if self.unit != "bytes" && !self.unit.is_empty() {
+            out.push(' ');
+            out.push_str(&self.unit);
+        }
+        if variant < 2 {
+            write!(out, " ({}%)", percent(self.completed, self.total))?;
+        }
+        Ok(())
+    }
+}
+
+fn replace(buffer: &mut String, text: &str) {
+    buffer.clear();
+    buffer.push_str(text);
+}
+
+/// A live stage's latest state between redraws.
 #[derive(Debug, Default)]
 struct Context {
-    /// Operation, encoding, backend and location; empty after
-    /// [`Stage::set_item`].
-    scope: String,
-    /// Item progress and tensor name, or a free-form item label.
-    item: String,
+    /// Columns of the stage label, which indicatif draws as the prefix.
+    label_columns: usize,
+    item: Item,
     /// Present only for classified conversion work; generic stages keep their
     /// existing indicatif ETA.
     estimate: Option<WorkEstimate>,
     /// The current step has no value-work budget and is excluded from ETA.
     outside_eta: bool,
+    /// Reused text of the frame being drawn.
+    text: String,
 }
 
 impl Context {
-    /// Each non-empty line, indented under the stage's counters.
-    fn write_lines(&self, out: &mut dyn fmt::Write) -> fmt::Result {
-        for line in [&self.scope, &self.item] {
-            if !line.is_empty() {
-                out.write_str("\n  ")?;
-                out.write_str(line)?;
+    /// Everything after the label, laid out for the terminal's current width.
+    fn write_frame(
+        &self,
+        unit: Unit,
+        frame: Frame,
+        state: &ProgressState,
+        out: &mut String,
+    ) -> fmt::Result {
+        let columns = terminal_columns().unwrap_or(FALLBACK_COLUMNS);
+        let first = columns.saturating_sub(self.label_columns + frame.lead());
+        let below = columns.saturating_sub(INDENT);
+        match frame {
+            Frame::Running => {
+                unit.write_header(state, first, out)?;
+                out.push_str(LINE);
+                self.write_time(unit, state, below, out)?;
             }
+            Frame::Done => return unit.write_done(state, first, out),
+            Frame::Stopped => unit.write_stopped(state, first, out)?,
         }
-        Ok(())
+        self.item.write_lines(below, out)
+    }
+
+    /// Elapsed time and the ETA, then the recent rate when it fits. ETA
+    /// wording is never shortened: its qualifiers are what keep it honest.
+    fn write_time(
+        &self,
+        unit: Unit,
+        state: &ProgressState,
+        columns: usize,
+        out: &mut String,
+    ) -> fmt::Result {
+        fit(out, columns, 2, |out, variant| {
+            write!(out, "elapsed {}", FormattedDuration(state.elapsed()))?;
+            out.push_str(FIELD);
+            self.write_eta(state, out)?;
+            if variant == 0 && state.pos() > 0 {
+                out.push_str(FIELD);
+                unit.write_rate(state, out)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn write_eta(&self, state: &ProgressState, out: &mut String) -> fmt::Result {
+        let Some(estimate) = &self.estimate else {
+            return write_remaining(state, out);
+        };
+        let remaining = estimate.remaining();
+        if !remaining.finalizing(self.outside_eta) {
+            out.push_str("ETA ");
+        }
+        remaining.write(self.outside_eta, out)
     }
 }
 
@@ -646,7 +950,8 @@ impl Stage {
 
     /// Show a free-form item, such as a hashing or finalization step, in place
     /// of any earlier [`Detail`], whose operation, layer and expert would no
-    /// longer describe the work. Drawn on the next redraw.
+    /// longer describe the work. Drawn on the next redraw, shortened in the
+    /// middle when the terminal is too narrow.
     pub fn set_item(&self, item: &str) {
         self.set_item_state(item, false);
     }
@@ -660,24 +965,18 @@ impl Stage {
     fn set_item_state(&self, item: &str, outside_eta: bool) {
         if let Some(live) = &self.live {
             let mut context = lock(&live.context);
-            context.scope.clear();
-            context.item.clear();
-            context.item.push_str(item);
+            context.item.set_note(item);
             context.outside_eta = outside_eta;
         }
     }
 
     /// Show where the stage is within its current item. Call at chunk or band
     /// boundaries next to [`Stage::advance`]; each call replaces the previous
-    /// detail and is drawn on the next redraw, so frequent calls are cheap.
+    /// detail by copying it into reused buffers, and only a redraw formats it,
+    /// so frequent calls are cheap.
     pub fn set_detail(&self, detail: &Detail<'_>) {
         if let Some(live) = &self.live {
-            let mut context = lock(&live.context);
-            let Context { scope, item, .. } = &mut *context;
-            scope.clear();
-            item.clear();
-            let _ = detail.write_scope(scope);
-            let _ = detail.write_item(item);
+            lock(&live.context).item.set_detail(detail);
         }
     }
 
@@ -685,20 +984,20 @@ impl Stage {
     /// any other position is reported as stopped, never rounded to complete.
     pub fn finish(mut self) {
         if let Some(live) = self.live.take() {
-            let template = if live.bar.length() == Some(live.bar.position()) {
-                DONE
+            let frame = if live.bar.length() == Some(live.bar.position()) {
+                Frame::Done
             } else {
-                STOPPED
+                Frame::Stopped
             };
-            self.close(&live, template);
+            self.close(&live, frame);
         }
     }
 
-    fn close(&self, live: &Live, template: &str) {
-        // Join the ticker first so it cannot redraw the running template
-        // between the style change and the final draw.
+    fn close(&self, live: &Live, frame: Frame) {
+        // Join the ticker first so it cannot redraw the running frame between
+        // the style change and the final draw.
         live.bar.disable_steady_tick();
-        live.bar.set_style(self.unit.style(template, &live.context));
+        live.bar.set_style(self.unit.style(frame, &live.context));
         // Abandon keeps the reported position; indicatif's finish would set it
         // to the total.
         live.bar.abandon();
@@ -708,7 +1007,7 @@ impl Stage {
 impl Drop for Stage {
     fn drop(&mut self) {
         if let Some(live) = self.live.take() {
-            self.close(&live, STOPPED);
+            self.close(&live, Frame::Stopped);
         }
     }
 }
@@ -778,6 +1077,8 @@ mod tests {
             WorkClass::encode(Encoding::Ht, HtBackend::Hip),
             WorkClass::encode(Encoding::Ht3, HtBackend::Cpu),
             WorkClass::encode(Encoding::Ht3, HtBackend::Hip),
+            WorkClass::encode(Encoding::Ht, HtBackend::Cuda),
+            WorkClass::encode(Encoding::Ht3, HtBackend::Cuda),
             I4R,
             WorkClass::encode(Encoding::Fp8G128, HtBackend::Hip),
             WorkClass::ScanFp8Scale,
@@ -799,12 +1100,18 @@ mod tests {
                 expected(seconds, classes.len() - sampled)
             );
         }
-        assert_eq!(estimate.remaining(), expected(55, 0));
-        assert_eq!(WorkClass::encode(Encoding::I4r, HtBackend::Hip), I4R);
-        assert_eq!(
-            WorkClass::encode(Encoding::Fp8G128, HtBackend::Hip).backend_label(),
-            "CPU"
-        );
+        assert_eq!(estimate.remaining(), expected(78, 0));
+        for backend in [HtBackend::Hip, HtBackend::Cuda] {
+            assert_eq!(WorkClass::encode(Encoding::I4r, backend), I4R);
+            assert_eq!(
+                WorkClass::encode(Encoding::Fp8G128, backend).backend_label(),
+                "CPU"
+            );
+            assert_eq!(
+                WorkClass::encode(Encoding::Ht, backend).backend_label(),
+                backend.label()
+            );
+        }
     }
 
     #[test]

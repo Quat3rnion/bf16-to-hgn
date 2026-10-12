@@ -30,6 +30,7 @@ fn main() {
         "src/codec.rs",
         "native/ht_trellis.cpp",
         "native/ht_trellis_hip.hip",
+        "native/ht_trellis_cuda.cu",
     ];
     let mut hash = Sha256::new();
     for name in files {
@@ -46,6 +47,7 @@ fn main() {
         hash.finalize()
     );
     let hip = env::var_os("CARGO_FEATURE_HIP").is_some();
+    let cuda = env::var_os("CARGO_FEATURE_CUDA").is_some();
     let mut cpu = cc::Build::new();
     cpu.cpp(true)
         .file("native/ht_trellis.cpp")
@@ -72,6 +74,30 @@ fn main() {
              #endif\n",
         )
         .expect("write HIP CPU compatibility guard");
+        cpu.flag("-include")
+            .flag(guard.to_str().expect("UTF-8 output path"));
+    }
+    if cuda {
+        // CUDA's supported nvcc host toolchain can use libstdc++ 12; the
+        // differential selection probe and cross-host fingerprints qualify
+        // its permutation against the libstdc++ 16 CPU/HIP reference.
+        // Keep the stricter HIP guard above when both features are enabled.
+        let guard = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo output directory"))
+            .join("cuda_cpu_compatibility.h");
+        fs::write(
+            &guard,
+            "#include <algorithm>\n\
+             #if !defined(_GLIBCXX_RELEASE) || (_GLIBCXX_RELEASE != 12 && _GLIBCXX_RELEASE != 16)\n\
+             #error CUDA byte equivalence requires the CPU encoder to use libstdc++ 12 or 16\n\
+             #endif\n\
+             #ifdef _GLIBCXX_PARALLEL\n\
+             #error CUDA byte equivalence requires ordinary libstdc++ nth_element\n\
+             #endif\n\
+             #ifdef __FAST_MATH__\n\
+             #error CUDA byte equivalence requires IEEE floating point without fast-math\n\
+             #endif\n",
+        )
+        .expect("write CUDA CPU compatibility guard");
         cpu.flag("-include")
             .flag(guard.to_str().expect("UTF-8 output path"));
     }
@@ -106,5 +132,34 @@ fn main() {
             rocm.join("lib64").display()
         );
         println!("cargo:rustc-link-lib=amdhip64");
+    }
+    if cuda {
+        println!("cargo:rerun-if-env-changed=NVCC");
+        println!("cargo:rerun-if-env-changed=HGN_CUDA_ARCH");
+        let arch = env::var("HGN_CUDA_ARCH").unwrap_or_else(|_| "89".to_owned());
+        let capability = arch
+            .parse::<u32>()
+            .expect("HGN_CUDA_ARCH must be a numeric compute capability, e.g. 89");
+        assert!(
+            (60..=999).contains(&capability) && !arch.starts_with('0'),
+            "HGN_CUDA_ARCH must be a numeric compute capability >= 60, e.g. 89"
+        );
+        cc::Build::new()
+            .cuda(true)
+            .ccbin(true) // Use the same CXX as the CPU oracle; never bypass nvcc's guard.
+            .cudart("static")
+            .debug(false) // cc otherwise adds -G in Cargo's dev/test profiles.
+            .opt_level(3)
+            .file("native/ht_trellis_cuda.cu")
+            .flag("-std=c++17")
+            .flag(format!("-gencode=arch=compute_{arch},code=sm_{arch}"))
+            .flag(format!("-gencode=arch=compute_{arch},code=compute_{arch}"))
+            .flag("--fmad=false")
+            .flag("--ftz=false")
+            .flag("--prec-div=true")
+            .flag("--prec-sqrt=true")
+            .flag("-Xcompiler=-ffp-contract=off")
+            .flag("-Xcompiler=-fno-fast-math")
+            .compile("hgn_trellis_cuda");
     }
 }
