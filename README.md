@@ -1157,6 +1157,17 @@ Two settings differ from CUDA because they measured faster on gfx1151:
 
 - HT4 uses the uploaded codebook table and `amdgpu_waves_per_eu(16)`.
 - HT3 uses the computed standard codebook and the default occupancy.
+- HT3 keeps 4 register-cached keys per lane instead of 8. Its steps expand
+  at most 1,024 positions, and the smaller cache gives 12 waves per SIMD
+  (HT3 46.0 ms instead of 47.5 ms). HT4 still needs all 8.
+
+A profile pass on gfx1151 (per-phase clock counters) put selection at about
+half of the kernel time and expansion at 30–40%. These variants were
+measured and rejected because they were slower: a barrier-free redundant
+radix scan, per-wave radix histograms, 64/128/512-thread blocks, OR/AND key
+range folded into the expansion reduction, other HT4 occupancy targets
+(12/14; 16 is the compiler maximum, and 18/20 fall back to 12), fewer HT4
+cached keys, and `-mcumode`.
 
 Measured on Frame (Radeon 8060S, ROCm HIP 7.2, GCC 16.2.1) with Halogen
 stopped, beam 128, one 128×2560 band, interleaved with the previous build:

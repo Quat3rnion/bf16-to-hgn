@@ -789,12 +789,14 @@ __device__ __noinline__ void select_prefix(Path *a, int nth, int size,
 // exact permutation whenever an order-dependent equal-cost decision arises.
 // Each warp owns a contiguous segment walked by interleaved lanes (coalesced),
 // and Cached > 0 keeps that many keys per lane in registers.
-constexpr int kCachedKeys = 8;
+// Register-cached keys per lane. HT3 steps expand at most 1024 positions
+// (4 per lane); HT4 needs 8. Fewer keys keep HT3 at 12 waves/SIMD.
+template<int Bits> constexpr int kCachedKeys = Bits == 3 ? 4 : 8;
 template<int Bits, int Cached>
 __device__ __forceinline__ void select_set(const Path *candidates, int size, int count,
                                            BlockState<Bits> &shared, Trace *trace, bool record,
-                                           const uint64_t (&provided)[kCachedKeys]) {
-    static_assert(Cached == 0 || Cached == kCachedKeys, "cached keys come from expansion");
+                                           const uint64_t (&provided)[kCachedKeys<Bits>]) {
+    static_assert(Cached == 0 || Cached == kCachedKeys<Bits>, "cached keys come from expansion");
     constexpr int symbols = 1 << Bits;
     const int warps = kThreads / warpSize;
     constexpr int Slots = Cached > 0 ? Cached : 1;
@@ -1097,7 +1099,7 @@ __device__ void encode_tile(DeviceStorage *storage, const float *tiles, int widt
             const int segment_end = expanded_count * (warp + 1) / warps;
             const float value = x[t];
             unsigned finite = 0;
-            uint64_t keys[kCachedKeys];
+            uint64_t keys[kCachedKeys<Bits>];
             // Fast pass: break equal costs by fast position and only flag
             // them. Without a minimal-cost tie, the winner is independent of
             // active order. With one, replay the exact order and redo it.
@@ -1161,7 +1163,7 @@ __device__ void encode_tile(DeviceStorage *storage, const float *tiles, int widt
                     return best;
                 };
                 #pragma unroll
-                for (int round = 0; round < kCachedKeys; ++round) {
+                for (int round = 0; round < kCachedKeys<Bits>; ++round) {
                     const int position = segment_begin + lane + round * warpSize;
                     keys[round] = ~uint64_t(0);
                     if (position < segment_end) {
@@ -1169,7 +1171,7 @@ __device__ void encode_tile(DeviceStorage *storage, const float *tiles, int widt
                         if (finite_cost(best.cost)) keys[round] = key(best);
                     }
                 }
-                for (int position = segment_begin + lane + kCachedKeys * warpSize; position < segment_end;
+                for (int position = segment_begin + lane + kCachedKeys<Bits> * warpSize; position < segment_end;
                      position += warpSize)
                     expand(position);
                 if (exact || !__syncthreads_or(tied)) break;
@@ -1198,8 +1200,8 @@ __device__ void encode_tile(DeviceStorage *storage, const float *tiles, int widt
             Trace *trace = workspace.trace + t * width;
             if (count < available) {
                 // Register-cached keys cover every steady-state beam<=128 step.
-                if (expanded_count <= kCachedKeys * kThreads)
-                    select_set<Bits, kCachedKeys>(current, expanded_count, count, shared, trace, pass == 1, keys);
+                if (expanded_count <= kCachedKeys<Bits> * kThreads)
+                    select_set<Bits, kCachedKeys<Bits>>(current, expanded_count, count, shared, trace, pass == 1, keys);
                 else
                     select_set<Bits, 0>(current, expanded_count, count, shared, trace, pass == 1, keys);
             } else {
