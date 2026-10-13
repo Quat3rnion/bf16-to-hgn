@@ -1031,7 +1031,8 @@ inference-throughput claim follows from these bounded checks.
 
 ### NVIDIA CUDA Q4C-P encoder and HT search rework (2026-10-12)
 
-`--q4cp-backend cuda` encodes Q4C-P (NF4) groups on the GPU. It is
+`--q4cp-backend cuda` or `--q4cp-backend hip` encodes Q4C-P (NF4) groups on
+the GPU. It is
 independent of `--ht-backend` and `--i4r-backend`. CPU stays the default.
 The manifest records `q4cp_backend`. Older schema-2 manifests without the
 field verify as CPU. There is no CPU fallback: a CUDA error stops the
@@ -1139,9 +1140,9 @@ whole-model conversion times.
 # Q4C-P CPU/CUDA timing; every sample is byte-checked against CPU.
 $CUDA_BENCH --suite timing --cases nf4 --cols 4096 --backends cpu \
   --q4cp-backends cpu,cuda --q4cp-bands 16 --iterations 1 --repetitions 5 --warmup 2
-# Q4C-P device tests.
+# Q4C-P device tests (use --features hip on gfx1151).
 CXX=g++-12 NVCC=nvcc CARGO_TARGET_DIR=/tmp/bf16-hgn-cuda-target CARGO_BUILD_JOBS=1 \
-  cargo test --release --locked --features cuda --test q4cp_cuda -- --ignored
+  cargo test --release --locked --features cuda --test q4cp_gpu -- --ignored
 ```
 
 ### HIP HT search port (2026-10-13)
@@ -1190,6 +1191,22 @@ Evidence for byte identity on gfx1151:
   CPU, and a CPU-only executable verified them.
 - Fault injection of the step replay and the end-of-pass replay made the
   corpus fail.
+
+### HIP Q4C-P encoder (2026-10-13)
+
+`--q4cp-backend hip` uses the same kernel as CUDA: one thread per 32-value
+group, sequential FP64 error sums, strict first-wins candidates and
+lower-level midpoint ties. Half scales use the integer RNE helper of the
+HIP I4R encoder. A scale that is not a finite F16 reruns the CPU reference
+for its exact error. There is no CPU fallback.
+
+On Frame (gfx1151, ROCm 7.2), 128×4096 bands, median of 5 samples, every
+sample byte-checked against CPU: 1 band 1559 Mvalues/s, 16 bands 1619
+Mvalues/s; CPU 71 Mvalues/s (about 22×). The four Q4C-P device tests (shapes,
+custom codebooks, scale-overflow error parity and concurrent callers), the
+NF4 correctness corpus and a tiny conversion with HT and Q4C-P on HIP passed.
+A CPU-only executable verified the containers. Q4C-P is about 2% of HT43
+values, so this saves only minutes in a full conversion.
 
 ## Bounded structural checks
 
@@ -1375,6 +1392,9 @@ loading, full-model inference, inference-quality comparisons or full-model
 throughput. A full v2 conversion is not evidence for HT43 qualification.
 
 ## Changes
+
+- Added opt-in `--q4cp-backend hip`, with the same byte-exact Q4C-P kernel as
+  CUDA and shared GPU dispatch in Rust.
 
 - Ported the CUDA HT search work to HIP, with gfx1151-specific occupancy and
   codebook choices. HIP HT4 is about 7.2× and HT3 about 6.3× faster per
