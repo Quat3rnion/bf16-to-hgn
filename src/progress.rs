@@ -168,6 +168,7 @@ impl From<Q4cpBackend> for Device {
     fn from(backend: Q4cpBackend) -> Self {
         match backend {
             Q4cpBackend::Cpu => Self::Cpu,
+            Q4cpBackend::Hip => Self::Hip,
             Q4cpBackend::Cuda => Self::Cuda,
         }
     }
@@ -196,8 +197,8 @@ pub(crate) enum WorkClass {
 }
 
 const ENCODING_CLASSES: usize = 11;
-/// HT3/HT4 on HIP and CUDA, I4R on HIP and CUDA, and Q4C-P on CUDA.
-const GPU_CLASSES: usize = 7;
+/// HT3/HT4, I4R and Q4C-P, each on HIP and CUDA.
+const GPU_CLASSES: usize = 8;
 const WORK_CLASSES: usize = ENCODING_CLASSES + GPU_CLASSES + 3 + 2;
 
 impl WorkClass {
@@ -249,6 +250,7 @@ impl WorkClass {
             Self::Encode(Encoding::I4r, Device::Cuda) => ENCODING_CLASSES + 4,
             Self::Encode(Encoding::I4r, Device::Hip) => ENCODING_CLASSES + 5,
             Self::Encode(Encoding::Q4Cp, Device::Cuda) => ENCODING_CLASSES + 6,
+            Self::Encode(Encoding::Q4Cp, Device::Hip) => ENCODING_CLASSES + 7,
             Self::Encode(_, Device::Hip | Device::Cuda) => {
                 unreachable!("only HT, I4R and Q4C-P encoding run on a GPU")
             }

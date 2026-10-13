@@ -217,6 +217,7 @@ impl I4rBackend {
 pub enum Q4cpBackend {
     #[default]
     Cpu,
+    Hip,
     Cuda,
 }
 
@@ -224,6 +225,7 @@ impl Q4cpBackend {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Cpu => "CPU",
+            Self::Hip => "HIP",
             Self::Cuda => "CUDA",
         }
     }
@@ -236,6 +238,17 @@ impl Q4cpBackend {
     pub fn preflight(self) -> Result<()> {
         match self {
             Self::Cpu => Ok(()),
+            Self::Hip => {
+                #[cfg(feature = "hip")]
+                {
+                    // SAFETY: preflight takes no pointers and synchronizes native context access.
+                    let result = unsafe { hgn_hip_q4cp_preflight() };
+                    ensure!(result == 0, "HIP Q4C-P preflight failed: {}", hip_last_error());
+                    Ok(())
+                }
+                #[cfg(not(feature = "hip"))]
+                bail!("HIP Q4C-P backend requires a build with --features hip");
+            }
             Self::Cuda => {
                 #[cfg(feature = "cuda")]
                 {
@@ -653,56 +666,78 @@ fn q4_midpoints(cb: &[f32; 16]) -> [f32; 15] {
     mids
 }
 
-fn encode_q4_cuda(input: &[f32], rows: usize, cols: usize, cb: &[f32; 16]) -> Result<EncodedBlock> {
-    #[cfg(feature = "cuda")]
-    {
-        validate_codebook(cb)?;
-        let stride = pad((cols / 16) as u64, 16)? as usize;
-        let groups = input.len() / 32;
-        let mids = q4_midpoints(cb);
-        let mut codes = vec![0u8; input.len() / 2];
-        let mut halves = vec![0u16; groups];
-        // SAFETY: input holds groups*32 finite values (checked by the caller);
-        // exclusive outputs hold exactly groups*16 bytes and groups half words.
-        // Native CUDA synchronizes before return and retains no host pointers.
-        let result = unsafe {
-            hgn_cuda_encode_q4cp(
-                input.as_ptr(),
-                cb.as_ptr(),
-                mids.as_ptr(),
-                codes.as_mut_ptr(),
-                halves.as_mut_ptr(),
-                groups,
-            )
-        };
-        if result == CUDA_Q4CP_SCALE_OVERFLOW {
-            // Reproduce the CPU reference's exact first-group error message.
-            encode_q4(input, rows, cols, cb)?;
-            bail!("CUDA Q4C-P reported a non-finite f16 scale that the CPU reference accepted");
-        }
-        ensure!(
-            result == 0,
-            "CUDA Q4C-P encoding failed: {}",
-            cuda_last_error()
+/// GPU Q4C-P (CUDA or HIP). There is no CPU fallback; a scale that is not a
+/// finite half reruns the CPU reference only to report its exact error.
+// Feature-free builds have no GPU arm: everything after the match is dead.
+#[allow(unused_variables, unreachable_code)]
+fn encode_q4_gpu(
+    backend: Q4cpBackend,
+    input: &[f32],
+    rows: usize,
+    cols: usize,
+    cb: &[f32; 16],
+) -> Result<EncodedBlock> {
+    type Native = unsafe extern "C" fn(*const f32, *const f32, *const f32, *mut u8, *mut u16, usize) -> c_int;
+    let (native, last_error): (Native, fn() -> String) = match backend {
+        #[cfg(feature = "cuda")]
+        Q4cpBackend::Cuda => (hgn_cuda_encode_q4cp, cuda_last_error),
+        #[cfg(feature = "hip")]
+        Q4cpBackend::Hip => (hgn_hip_encode_q4cp, hip_last_error),
+        Q4cpBackend::Cpu => unreachable!("CPU Q4C-P does not use a native backend"),
+        #[allow(unreachable_patterns)]
+        _ => bail!(
+            "{} Q4C-P backend requires a build with --features {}",
+            backend.label(),
+            backend.label().to_ascii_lowercase()
+        ),
+    };
+    validate_codebook(cb)?;
+    let stride = pad((cols / 16) as u64, 16)? as usize;
+    let groups = input.len() / 32;
+    let mids = q4_midpoints(cb);
+    let mut codes = vec![0u8; input.len() / 2];
+    let mut halves = vec![0u16; groups];
+    // SAFETY: input holds groups*32 finite values (checked by the caller);
+    // exclusive outputs hold exactly groups*16 bytes and groups half words.
+    // The native backend synchronizes before return and retains no host pointers.
+    let result = unsafe {
+        native(
+            input.as_ptr(),
+            cb.as_ptr(),
+            mids.as_ptr(),
+            codes.as_mut_ptr(),
+            halves.as_mut_ptr(),
+            groups,
+        )
+    };
+    if result == GPU_Q4CP_SCALE_OVERFLOW {
+        // Reproduce the CPU reference's exact first-group error message.
+        encode_q4(input, rows, cols, cb)?;
+        bail!(
+            "{} Q4C-P reported a non-finite f16 scale that the CPU reference accepted",
+            backend.label()
         );
-        let per_row = cols / 32;
-        let mut scales = vec![0u8; rows * stride];
-        for (out, row_halves) in scales
-            .chunks_exact_mut(stride)
-            .zip(halves.chunks_exact(per_row))
-        {
-            for (g, half) in row_halves.iter().enumerate() {
-                out[2 * g..2 * g + 2].copy_from_slice(&half.to_le_bytes());
-            }
-        }
-        Ok(EncodedBlock { codes, scales })
     }
-    #[cfg(not(feature = "cuda"))]
+    ensure!(
+        result == 0,
+        "{} Q4C-P encoding failed: {}",
+        backend.label(),
+        last_error()
+    );
+    let per_row = cols / 32;
+    let mut scales = vec![0u8; rows * stride];
+    for (out, row_halves) in scales
+        .chunks_exact_mut(stride)
+        .zip(halves.chunks_exact(per_row))
     {
-        let _ = (input, rows, cols, cb);
-        bail!("CUDA Q4C-P backend requires a build with --features cuda");
+        for (g, half) in row_halves.iter().enumerate() {
+            out[2 * g..2 * g + 2].copy_from_slice(&half.to_le_bytes());
+        }
     }
+    Ok(EncodedBlock { codes, scales })
 }
+
+const GPU_Q4CP_SCALE_OVERFLOW: c_int = -6;
 
 fn encode_q4(input: &[f32], rows: usize, cols: usize, cb: &[f32; 16]) -> Result<EncodedBlock> {
     validate_codebook(cb)?;
@@ -900,6 +935,15 @@ unsafe extern "C" {
     fn ht_hip_last_error() -> *const std::ffi::c_char;
     fn ht_hip_preflight() -> c_int;
     fn hgn_hip_i4r_preflight() -> c_int;
+    fn hgn_hip_q4cp_preflight() -> c_int;
+    fn hgn_hip_encode_q4cp(
+        src: *const f32,
+        codebook: *const f32,
+        midpoints: *const f32,
+        codes: *mut u8,
+        scales: *mut u16,
+        groups: usize,
+    ) -> c_int;
     fn hgn_hip_encode_ht(
         sources: *const *const f32,
         su: *const f32,
@@ -981,8 +1025,6 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-#[cfg(feature = "cuda")]
-const CUDA_Q4CP_SCALE_OVERFLOW: c_int = -6;
 
 #[cfg(feature = "cuda")]
 fn cuda_last_error() -> String {
@@ -1386,7 +1428,7 @@ pub fn encode_rows(
         Encoding::I64 => bail!("I64 cannot be encoded through f32; preserve source integer bytes"),
         Encoding::Q4Cp => match meta.q4cp_backend {
             Q4cpBackend::Cpu => encode_q4(input, rows, cols, meta.codebook),
-            Q4cpBackend::Cuda => encode_q4_cuda(input, rows, cols, meta.codebook),
+            backend => encode_q4_gpu(backend, input, rows, cols, meta.codebook),
         },
         Encoding::Q8G64 => encode_affine(input, rows, cols, 8),
         Encoding::Q6G64 => encode_affine(input, rows, cols, 6),

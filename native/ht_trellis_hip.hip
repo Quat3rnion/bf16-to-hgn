@@ -1,4 +1,4 @@
-// HIP HT/I4R encoders and independent verification decode/unrotation.
+// HIP HT/I4R/Q4C-P encoders and independent verification decode/unrotation.
 // The CPU implementations remain the references; this file never calls them.
 //
 // Selection below is an independent implementation of the observable
@@ -12,6 +12,7 @@
 
 #include <array>
 #include <cfenv>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -142,6 +143,28 @@ static_assert(kI4rThreads % 64 == 0); // Complete physical waves in wave32 and w
 static_assert(sizeof(I4rStorage) == 52756488);
 static_assert(sizeof(DeviceStorage) + sizeof(DecodeStorage) + sizeof(I4rStorage)
               <= 272u * 1024u * 1024u);
+
+// Q4C-P groups of 32 values are independent; batches are flat group runs,
+// never rows, so arbitrarily wide or short matrices need no strided copies.
+// The host scatters compact half scales into its padded scale rows.
+constexpr int kQ4Group = 32;
+constexpr int kQ4Groups = 1 << 18;
+constexpr int kQ4Threads = 128;
+constexpr int kQ4Candidates = 5;
+constexpr int kQ4ScaleOverflow = -6;
+struct Q4Params {
+    float codebook[16];
+    float midpoints[15];
+    float cmax;
+};
+struct Q4Storage {
+    float values[kQ4Groups * kQ4Group];
+    uint8_t codes[kQ4Groups * kQ4Group / 2];
+    uint16_t scales[kQ4Groups];
+    unsigned scale_overflow;
+};
+static_assert(kQ4Groups % kQ4Threads == 0);
+static_assert(sizeof(Q4Storage) <= 38u * 1024u * 1024u);
 
 __device__ __forceinline__ float decode_half(uint16_t bits) {
     const unsigned sign = unsigned(bits & 0x8000) << 16;
@@ -368,6 +391,75 @@ __global__ __launch_bounds__(kThreads) void ht_forward_columns(
         tiles[size_t(tile) * kLength + (col % 16 / 8) * 128 + (row % 16) * 8 + col % 8] = value;
     }
 }
+
+__device__ __forceinline__ int q4_code(float normalized, const Q4Params &params) {
+    // CPU partition_point over nondecreasing midpoints: the count of
+    // midpoints strictly below the value, so exact ties select the lower level.
+    int code = 0;
+    #pragma unroll
+    for (int index = 0; index < 15; ++index) code += params.midpoints[index] < normalized;
+    return code;
+}
+
+// One thread owns one 32-value group. The five candidate scales and each
+// candidate's FP64 error sum stay sequential, matching the CPU's rounding
+// order and its strict first-win comparison.
+__global__ __launch_bounds__(kQ4Threads) void q4_quantize(Q4Storage *storage, Q4Params params,
+                                                         int groups) {
+    // Stride 33 removes the 32-way bank conflict of per-thread group rows.
+    __shared__ float values[kQ4Threads * (kQ4Group + 1)];
+    const int thread = int(threadIdx.x);
+    const int base = int(blockIdx.x) * kQ4Threads;
+    const int active = groups - base < kQ4Threads ? groups - base : kQ4Threads;
+    for (int index = thread; index < active * kQ4Group; index += kQ4Threads)
+        values[(index / kQ4Group) * (kQ4Group + 1) + index % kQ4Group]
+            = storage->values[size_t(base) * kQ4Group + index];
+    __syncthreads();
+    if (thread >= active) return;
+    const float *group = values + thread * (kQ4Group + 1);
+    float absmax = 0.0f;
+    for (int index = 0; index < kQ4Group; ++index) absmax = fmaxf(absmax, fabsf(group[index]));
+    const float multipliers[kQ4Candidates] = {1.0f, 0.95f, 0.9f, 0.85f, 0.8f};
+    const float ratio = __fdiv_rn(absmax, params.cmax);
+    double best_error = __longlong_as_double(0x7ff0000000000000LL);
+    uint16_t best_half = 0;
+    for (int candidate = 0; candidate < kQ4Candidates; ++candidate) {
+        const uint16_t half_bits = i4r_half_rne(__fmul_rn(ratio, multipliers[candidate]));
+        if ((half_bits & 0x7c00) == 0x7c00) {
+            // The host reruns the CPU encoder for its exact first-group error.
+            atomicExch(&storage->scale_overflow, 1u);
+            return;
+        }
+        const float scale = decode_half(half_bits);
+        const float divisor = scale == 0.0f ? 1.0f : scale;
+        double error = 0.0;
+        #pragma unroll 1
+        for (int index = 0; index < kQ4Group; ++index) {
+            const float value = group[index];
+            const int code = q4_code(__fdiv_rn(value, divisor), params);
+            const double delta = __dsub_rn(__dmul_rn(double(params.codebook[code]), double(scale)),
+                                           double(value));
+            error = __dadd_rn(error, __dmul_rn(delta, delta));
+        }
+        if (error < best_error) {
+            best_error = error;
+            best_half = half_bits;
+        }
+    }
+    const float scale = decode_half(best_half);
+    const float divisor = scale == 0.0f ? 1.0f : scale;
+    const size_t group_index = size_t(base) + size_t(thread);
+    alignas(16) uint8_t packed[kQ4Group / 2];
+    for (int index = 0; index < kQ4Group / 2; ++index) {
+        const int first = q4_code(__fdiv_rn(group[2 * index], divisor), params);
+        const int second = q4_code(__fdiv_rn(group[2 * index + 1], divisor), params);
+        packed[index] = uint8_t(first | (second << 4));
+    }
+    *reinterpret_cast<uint4 *>(storage->codes + group_index * (kQ4Group / 2))
+        = *reinterpret_cast<const uint4 *>(packed);
+    storage->scales[group_index] = best_half;
+}
+
 
 __device__ __forceinline__ int i4r_round_code(float value, float divisor) {
     // build.rs explicitly enables correctly rounded HIP binary32 division.
@@ -1309,6 +1401,7 @@ struct Context {
     DeviceStorage *storage = nullptr;
     DecodeStorage *decode_storage = nullptr;
     I4rStorage *i4r_storage = nullptr;
+    Q4Storage *q4_storage = nullptr;
     float *ht_tiles = nullptr; // Rotated tiles of one GPU-rotated HT call (grow-only).
     size_t ht_tiles_capacity = 0;
     std::array<float, kStates> cached_codebook;
@@ -1316,6 +1409,7 @@ struct Context {
     // Remains alive while an error path drains a queued D2H transfer.
     std::array<TileStatus, kBatch> tile_status;
     I4rStatus i4r_status{};
+    unsigned q4_status = 0;
     bool codebook_valid = false;
     bool decode_codebook_valid = false;
     int multiprocessors = 0;
@@ -1364,6 +1458,16 @@ struct Context {
         return 0;
     }
 
+    int ensure_q4_encoder() {
+        if (q4_storage) return 0;
+        const hipError_t error = hipMalloc(reinterpret_cast<void **>(&q4_storage), sizeof(Q4Storage));
+        if (error != hipSuccess) {
+            q4_storage = nullptr;
+            return hip_failure(error, "allocate bounded HIP Q4C-P workspace");
+        }
+        return 0;
+    }
+
     int ensure_i4r_encoder() {
         if (i4r_storage) return 0;
         const hipError_t error = hipMalloc(reinterpret_cast<void **>(&i4r_storage), sizeof(I4rStorage));
@@ -1377,7 +1481,7 @@ struct Context {
     ~Context() {
         // Process-lifetime resources only; never touch another device's
         // allocations or reset a device shared with an inference server.
-        if (!stream && !storage && !decode_storage && !i4r_storage && !ht_tiles) return;
+        if (!stream && !storage && !decode_storage && !i4r_storage && !ht_tiles && !q4_storage) return;
         int previous = 0;
         hipError_t error = hipGetDevice(&previous);
         if (error == hipSuccess) error = hipSetDevice(0);
@@ -1399,6 +1503,11 @@ struct Context {
             error = hipFree(decode_storage);
             if (error != hipSuccess)
                 std::fprintf(stderr, "HIP cleanup: free verification workspace: %s\n", hipGetErrorString(error));
+        }
+        if (q4_storage) {
+            error = hipFree(q4_storage);
+            if (error != hipSuccess)
+                std::fprintf(stderr, "HIP cleanup: free Q4C-P workspace: %s\n", hipGetErrorString(error));
         }
         if (ht_tiles) {
             error = hipFree(ht_tiles);
@@ -1762,6 +1871,44 @@ int encode_ht_rows(Context &state, const float *const *sources, const float *su,
     return encode(state, state.ht_tiles, codebook, symbols, int(values / kLength), beam, bits, true);
 }
 
+int encode_q4(Context &state, const float *source, const Q4Params &params,
+              uint8_t *codes, uint16_t *scales, size_t groups) {
+    const int allocation = state.ensure_q4_encoder();
+    if (allocation != 0) return allocation;
+    Q4Storage *storage = state.q4_storage;
+    for (size_t base = 0; base < groups; base += size_t(kQ4Groups)) {
+        int batch = int(groups - base < size_t(kQ4Groups) ? groups - base : size_t(kQ4Groups));
+        hipError_t error = hipMemsetAsync(&storage->scale_overflow, 0, sizeof(unsigned), state.stream);
+        if (error != hipSuccess) return hip_failure(error, "clear HIP Q4C-P batch status");
+        error = hipMemcpyAsync(storage->values, source + base * kQ4Group,
+                                size_t(batch) * kQ4Group * sizeof(float), hipMemcpyHostToDevice, state.stream);
+        if (error != hipSuccess) return hip_failure(error, "upload HIP Q4C-P source groups");
+        void *arguments[] = {&storage, const_cast<Q4Params *>(&params), &batch};
+        error = hipLaunchKernel(reinterpret_cast<const void *>(q4_quantize),
+            dim3(unsigned((batch + kQ4Threads - 1) / kQ4Threads)), dim3(kQ4Threads),
+            arguments, 0, state.stream);
+        if (error != hipSuccess) return hip_failure(error, "launch HIP Q4C-P quantizer");
+        error = hipMemcpyAsync(&state.q4_status, &storage->scale_overflow, sizeof(unsigned),
+                                hipMemcpyDeviceToHost, state.stream);
+        if (error != hipSuccess) return hip_failure(error, "download HIP Q4C-P batch status");
+        error = hipMemcpyAsync(codes + base * (kQ4Group / 2), storage->codes,
+                                size_t(batch) * (kQ4Group / 2), hipMemcpyDeviceToHost, state.stream);
+        if (error != hipSuccess) return hip_failure(error, "download HIP Q4C-P codes");
+        error = hipMemcpyAsync(scales + base, storage->scales, size_t(batch) * sizeof(uint16_t),
+                                hipMemcpyDeviceToHost, state.stream);
+        if (error != hipSuccess) return hip_failure(error, "download HIP Q4C-P half scales");
+        error = hipStreamSynchronize(state.stream);
+        if (error != hipSuccess) return hip_failure(error, "complete HIP Q4C-P batch");
+        if (state.q4_status) {
+            std::snprintf(last_error, sizeof(last_error),
+                "HIP Q4C-P quantization scale exceeds finite f16 range in group batch starting at group %zu",
+                base);
+            return kQ4ScaleOverflow;
+        }
+    }
+    return 0;
+}
+
 hipError_t copy_decode_rectangle(void *destination, size_t destination_pitch,
                                 const void *source, size_t source_pitch,
                                 size_t width, size_t rows, hipMemcpyKind kind,
@@ -1922,6 +2069,42 @@ extern "C" int hgn_hip_encode_ht(const float *const *sources, const float *su,
         if (!sources[part] || !svs[part]) return fail(-1, "HIP HT encode requires nonnull part buffers");
     return with_context([&](Context &state) {
         return encode_ht_rows(state, sources, su, svs, parts, codebook, symbols, bands, cols, beam, bits);
+    });
+}
+
+extern "C" int hgn_hip_q4cp_preflight() {
+    last_error[0] = '\0';
+    return with_context([](Context &state) { return state.ensure_q4_encoder(); });
+}
+
+// codebook: 16 strictly increasing finite values; midpoints: the 15 host-rounded
+// binary32 midpoints. codes receive groups*16 bytes and scales groups half
+// words in group order. Returns -6 when a candidate scale is not a finite
+// half; callers rerun the CPU reference for its exact error.
+extern "C" int hgn_hip_encode_q4cp(const float *source, const float *codebook,
+                                   const float *midpoints, uint8_t *codes, uint16_t *scales,
+                                   size_t groups) {
+    last_error[0] = '\0';
+    if (groups == 0) return 0;
+    if (!source || !codebook || !midpoints || !codes || !scales)
+        return fail(-1, "HIP Q4C-P encode requires nonnull buffers");
+    if (groups > std::numeric_limits<size_t>::max() / kQ4Group / sizeof(float))
+        return fail(-1, "HIP Q4C-P encode shape overflows the host address space");
+    if (address_overflows(source, groups * kQ4Group * sizeof(float))
+        || address_overflows(codes, groups * (kQ4Group / 2))
+        || address_overflows(scales, groups * sizeof(uint16_t)))
+        return fail(-1, "HIP Q4C-P encode buffer extent overflows the host address space");
+    Q4Params params{};
+    std::memcpy(params.codebook, codebook, sizeof(params.codebook));
+    std::memcpy(params.midpoints, midpoints, sizeof(params.midpoints));
+    for (int index = 0; index < 16; ++index)
+        if (!std::isfinite(params.codebook[index]) || (index > 0 && !(params.codebook[index - 1] < params.codebook[index])))
+            return fail(-1, "HIP Q4C-P codebook must be finite and strictly increasing");
+    const float low = std::fabs(params.codebook[0]);
+    const float high = std::fabs(params.codebook[15]);
+    params.cmax = low > high ? low : high;
+    return with_context([&](Context &state) {
+        return encode_q4(state, source, params, codes, scales, groups);
     });
 }
 

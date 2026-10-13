@@ -559,12 +559,18 @@ fn q4cp_gpu_batches_respect_value_budget_portions_and_short_matrices() {
 
 #[test]
 fn q4cp_backend_selects_only_q4cp_device() {
+    for backend in [codec::Q4cpBackend::Hip, codec::Q4cpBackend::Cuda] {
+        q4cp_backend_selects_only_q4cp_device_for(backend);
+    }
+}
+
+fn q4cp_backend_selects_only_q4cp_device_for(backend: codec::Q4cpBackend) {
     let options = Options {
-        q4cp_backend: codec::Q4cpBackend::Cuda,
+        q4cp_backend: backend,
         ..Options::default()
     };
     let class = source_work(Encoding::Q4Cp, Dtype::Bf16, &options);
-    assert_eq!(class.backend_label(), "CUDA");
+    assert_eq!(class.backend_label(), backend.label());
     for encoding in [Encoding::Q8G64, Encoding::Q6G64, Encoding::Ht, Encoding::I4r] {
         assert_eq!(
             source_work(encoding, Dtype::Bf16, &options).backend_label(),

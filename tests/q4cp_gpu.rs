@@ -1,5 +1,5 @@
 use bf16_to_hgn::codec::{encode_rows, Encoding, Q4cpBackend, QuantMeta};
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hip"))]
 use bf16_to_hgn::codec::NF4_CODEBOOK;
 
 #[test]
@@ -10,23 +10,34 @@ fn q4cp_default_backend_is_cpu() {
 #[cfg(not(feature = "cuda"))]
 #[test]
 fn q4cp_cuda_requires_feature_without_falling_back_to_cpu() {
+    requires_feature(Q4cpBackend::Cuda, "cuda");
+}
+
+#[cfg(not(feature = "hip"))]
+#[test]
+fn q4cp_hip_requires_feature_without_falling_back_to_cpu() {
+    requires_feature(Q4cpBackend::Hip, "hip");
+}
+
+#[cfg(any(not(feature = "cuda"), not(feature = "hip")))]
+fn requires_feature(backend: Q4cpBackend, feature: &str) {
     let input = vec![0.5; 64];
     let meta = QuantMeta {
-        q4cp_backend: Q4cpBackend::Cuda,
+        q4cp_backend: backend,
         ..QuantMeta::default()
     };
     for error in [
-        Q4cpBackend::Cuda.preflight().unwrap_err(),
+        backend.preflight().unwrap_err(),
         encode_rows(Encoding::Q4Cp, &input, 2, 32, &meta).unwrap_err(),
     ] {
         let text = error.to_string();
-        assert!(text.contains("CUDA Q4C-P"), "{text}");
-        assert!(text.contains("--features cuda"), "{text}");
+        assert!(text.contains(&format!("{} Q4C-P", backend.label())), "{text}");
+        assert!(text.contains(&format!("--features {feature}")), "{text}");
     }
 }
 
-#[cfg(feature = "cuda")]
-mod cuda {
+#[cfg(any(feature = "cuda", feature = "hip"))]
+mod gpu {
     use super::*;
 
     /// Deterministic xorshift values with exact ties, signed zeros, half
@@ -61,13 +72,13 @@ mod cuda {
             .collect()
     }
 
-    fn assert_same(rows: usize, cols: usize, input: &[f32], codebook: &[f32; 16]) {
+    fn assert_same(backend: Q4cpBackend, rows: usize, cols: usize, input: &[f32], codebook: &[f32; 16]) {
         let cpu = QuantMeta {
             codebook,
             ..QuantMeta::default()
         };
         let gpu = QuantMeta {
-            q4cp_backend: Q4cpBackend::Cuda,
+            q4cp_backend: backend,
             ..cpu
         };
         let expected = encode_rows(Encoding::Q4Cp, input, rows, cols, &cpu).unwrap();
@@ -79,17 +90,17 @@ mod cuda {
             assert_eq!(a.len(), e.len(), "{plane} length {rows}x{cols}");
             if let Some(index) = a.iter().zip(e.iter()).position(|(x, y)| x != y) {
                 panic!(
-                    "{plane} byte {index} differs for {rows}x{cols}: CUDA {:#04x}, CPU {:#04x}",
-                    a[index], e[index]
+                    "{plane} byte {index} differs for {rows}x{cols}: {} {:#04x}, CPU {:#04x}",
+                    backend.label(),
+                    a[index],
+                    e[index]
                 );
             }
         }
     }
 
-    #[test]
-    #[ignore = "requires a visible CUDA device"]
-    fn cuda_q4cp_matches_cpu_bytes_across_shapes() {
-        Q4cpBackend::Cuda.preflight().unwrap();
+    pub(super) fn matches_cpu_bytes_across_shapes(backend: Q4cpBackend) {
+        backend.preflight().unwrap();
         for (rows, cols, salt) in [
             (1, 32, 1),
             (1, 64, 2),
@@ -101,13 +112,11 @@ mod cuda {
             (1100, 8192, 7),
         ] {
             let input = values(rows * cols, salt);
-            assert_same(rows, cols, &input, &NF4_CODEBOOK);
+            assert_same(backend, rows, cols, &input, &NF4_CODEBOOK);
         }
     }
 
-    #[test]
-    #[ignore = "requires a visible CUDA device"]
-    fn cuda_q4cp_matches_cpu_bytes_for_custom_codebooks() {
+    pub(super) fn matches_cpu_bytes_for_custom_codebooks(backend: Q4cpBackend) {
         let uniform: [f32; 16] = std::array::from_fn(|i| (i as f32 - 7.5) / 7.5);
         let skewed: [f32; 16] = std::array::from_fn(|i| (i as f32 - 3.0) * 0.37 + 1.0e-3);
         let tiny: [f32; 16] = std::array::from_fn(|i| (i as f32 + 1.0) * 1.0e-3);
@@ -118,19 +127,17 @@ mod cuda {
                 .into_iter()
                 .map(|value| value * cmax)
                 .collect();
-            assert_same(64, 512, &input, codebook);
+            assert_same(backend, 64, 512, &input, codebook);
         }
     }
 
-    #[test]
-    #[ignore = "requires a visible CUDA device"]
-    fn cuda_q4cp_scale_overflow_reports_cpu_error() {
+    pub(super) fn scale_overflow_reports_cpu_error(backend: Q4cpBackend) {
         let mut input = vec![0.25f32; 4 * 64];
         input[3 * 64 + 40] = 70000.0;
         input[2 * 64 + 1] = 80000.0;
         let cpu = QuantMeta::default();
         let gpu = QuantMeta {
-            q4cp_backend: Q4cpBackend::Cuda,
+            q4cp_backend: backend,
             ..cpu
         };
         let expected = encode_rows(Encoding::Q4Cp, &input, 4, 64, &cpu).unwrap_err();
@@ -138,19 +145,65 @@ mod cuda {
         assert_eq!(format!("{actual:#}"), format!("{expected:#}"));
         // The device stays usable after the reported overflow.
         let input = values(4 * 64, 9);
-        assert_same(4, 64, &input, &NF4_CODEBOOK);
+        assert_same(backend, 4, 64, &input, &NF4_CODEBOOK);
     }
 
-    #[test]
-    #[ignore = "requires a visible CUDA device"]
-    fn cuda_q4cp_concurrent_callers_match_cpu() {
+    pub(super) fn concurrent_callers_match_cpu(backend: Q4cpBackend) {
         std::thread::scope(|scope| {
             for salt in 0..4 {
                 scope.spawn(move || {
                     let input = values(256 * 1024, 200 + salt);
-                    assert_same(256, 1024, &input, &NF4_CODEBOOK);
+                    assert_same(backend, 256, 1024, &input, &NF4_CODEBOOK);
                 });
             }
         });
     }
 }
+
+macro_rules! q4cp_device_tests {
+    ($feature:literal, $backend:expr, $ignore:literal, $shapes:ident, $codebooks:ident, $overflow:ident, $concurrent:ident) => {
+        #[cfg(feature = $feature)]
+        #[test]
+        #[ignore = $ignore]
+        fn $shapes() {
+            gpu::matches_cpu_bytes_across_shapes($backend);
+        }
+        #[cfg(feature = $feature)]
+        #[test]
+        #[ignore = $ignore]
+        fn $codebooks() {
+            gpu::matches_cpu_bytes_for_custom_codebooks($backend);
+        }
+        #[cfg(feature = $feature)]
+        #[test]
+        #[ignore = $ignore]
+        fn $overflow() {
+            gpu::scale_overflow_reports_cpu_error($backend);
+        }
+        #[cfg(feature = $feature)]
+        #[test]
+        #[ignore = $ignore]
+        fn $concurrent() {
+            gpu::concurrent_callers_match_cpu($backend);
+        }
+    };
+}
+
+q4cp_device_tests!(
+    "cuda",
+    Q4cpBackend::Cuda,
+    "requires a visible CUDA device",
+    cuda_q4cp_matches_cpu_bytes_across_shapes,
+    cuda_q4cp_matches_cpu_bytes_for_custom_codebooks,
+    cuda_q4cp_scale_overflow_reports_cpu_error,
+    cuda_q4cp_concurrent_callers_match_cpu
+);
+q4cp_device_tests!(
+    "hip",
+    Q4cpBackend::Hip,
+    "requires a visible gfx1151 HIP device",
+    hip_q4cp_matches_cpu_bytes_across_shapes,
+    hip_q4cp_matches_cpu_bytes_for_custom_codebooks,
+    hip_q4cp_scale_overflow_reports_cpu_error,
+    hip_q4cp_concurrent_callers_match_cpu
+);

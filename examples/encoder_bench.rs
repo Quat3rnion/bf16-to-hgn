@@ -17,7 +17,7 @@
 //! GPU preflight durations are recorded separately per selected backend.
 //! --backends remains HT-only. I4R independently uses --i4r-backends cpu,hip,cuda
 //! and --i4r-bands 1..=32; each iteration encodes the entire batch in one call.
-//! NF4/Q4C-P likewise uses --q4cp-backends cpu,cuda and --q4cp-bands 1..=32.
+//! NF4/Q4C-P likewise uses --q4cp-backends cpu,hip,cuda and --q4cp-bands 1..=32.
 
 use anyhow::{bail, ensure, Context, Result};
 use bf16_to_hgn::codec::{
@@ -1215,11 +1215,14 @@ fn main() -> Result<()> {
             "backend": backend, "encoding": "i4r", "elapsed_ns": ns(start)?,
         }));
     }
-    if args.q4cp_backends.contains(&Q4cpBackend::Cuda) {
+    for backend in [Q4cpBackend::Hip, Q4cpBackend::Cuda] {
+        if !args.q4cp_backends.contains(&backend) {
+            continue;
+        }
         let start = Instant::now();
-        Q4cpBackend::Cuda.preflight()?;
+        backend.preflight()?;
         gpu_preflight.push(json!({
-            "backend": Q4cpBackend::Cuda, "encoding": "q4cp", "elapsed_ns": ns(start)?,
+            "backend": backend, "encoding": "q4cp", "elapsed_ns": ns(start)?,
         }));
     }
     if args.hf.is_none()
