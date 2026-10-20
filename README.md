@@ -1468,3 +1468,9 @@ throughput. A full v2 conversion is not evidence for HT43 qualification.
   schema-1 raw HF hashes remain explicitly distinguished during verification.
 - Added executable tiny conversions for HF/HGN/GGUF → HT43 and bounded
   regression coverage; no hidden calibration or stock-weight substitution.
+
+## License
+
+Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option.
+
+The vendored trellis encoder in `native/` is licensed under Apache-2.0 only. See `native/LICENSE` and `native/NOTICE`.
