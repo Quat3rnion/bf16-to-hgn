@@ -8,6 +8,7 @@ pub mod hf;
 pub mod hgn_source;
 pub mod manifest;
 pub mod progress;
+pub mod resume;
 pub mod source;
 mod tensor_progress;
 pub(crate) mod verification_manifest;
