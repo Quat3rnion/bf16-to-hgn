@@ -5,6 +5,7 @@ use crate::{
     manifest::{AssetRecord, ContainerRecord, Manifest, Options, OutputRecord, SourceRecord},
     numel,
     progress::{Progress, Stage, Unit, WorkClass, WorkEstimate},
+    resume,
     rows_cols,
     source::{SourceKind, TensorSource, ASSET_NAMES},
     tensor_progress, ConversionPlan, Origin, TensorPlan, ENCODER_SHA256, SPEC_COMMIT, SPEC_VERSION,
@@ -16,6 +17,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
+    sync::Arc,
 };
 
 const COPY_CHUNK: usize = 8 * 1024 * 1024;
@@ -447,6 +449,157 @@ pub fn validate_ple(snapshot: &dyn TensorSource, plan: &ConversionPlan) -> Resul
     Ok(())
 }
 
+/// Called after each journaled unit with its kind (`"tensor"` or `"chunk"`)
+/// and this run's cumulative count for that kind. Test-only interruption hook.
+pub type AbortHook = Arc<dyn Fn(&str, u64) -> Result<()> + Send + Sync>;
+
+#[derive(Default)]
+pub struct ResumeOptions {
+    /// Use the deterministic fingerprinted staging dir + journal + lock.
+    pub enabled: bool,
+    pub abort_hook: Option<AbortHook>,
+}
+
+/// Staging bookkeeping. `Fresh` is the historical random `TempDir` whose drop
+/// cleans up on failure; `Resume` keeps its deterministic directory, journal
+/// and lock on failure so the next run can continue.
+enum Staging {
+    Fresh(tempfile::TempDir),
+    Resume(Box<ResumeRun>),
+}
+
+struct ResumeRun {
+    dir: PathBuf,
+    journal_path: PathBuf,
+    lock_path: PathBuf,
+    lock: Option<resume::LockGuard>,
+    journal: resume::Journal,
+    state: resume::ResumeState,
+    hook: Option<AbortHook>,
+}
+
+impl Staging {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Fresh(temp) => temp.path(),
+            Self::Resume(run) => &run.dir,
+        }
+    }
+}
+
+#[derive(Default)]
+struct RunCounters {
+    tensors: u64,
+    chunks: u64,
+}
+
+/// Per-tensor chunk journaling context. `completed_units` leading write units
+/// are already on disk (payload-verified at journal load); they are replayed
+/// for source-hash continuity but never re-encoded or rewritten. Every other
+/// completed unit is appended to the journal as one fsync'd line.
+struct ChunkJournal<'a> {
+    journal: Option<&'a mut resume::Journal>,
+    hook: Option<&'a AbortHook>,
+    counters: &'a mut RunCounters,
+    file: usize,
+    tensor: usize,
+    /// Absolute staging-file offset of this tensor's payload.
+    base: u64,
+    completed_units: usize,
+    unit: usize,
+}
+
+impl<'a> ChunkJournal<'a> {
+    fn new(
+        staging: &'a mut Staging,
+        counters: &'a mut RunCounters,
+        file: usize,
+        tensor: usize,
+        base: u64,
+        completed_units: usize,
+    ) -> Self {
+        match staging {
+            Staging::Resume(run) => Self {
+                journal: Some(&mut run.journal),
+                hook: run.hook.as_ref(),
+                counters,
+                file,
+                tensor,
+                base,
+                completed_units,
+                unit: 0,
+            },
+            Staging::Fresh(_) => Self {
+                journal: None,
+                hook: None,
+                counters,
+                file,
+                tensor,
+                base,
+                completed_units: 0,
+                unit: 0,
+            },
+        }
+    }
+
+    /// Journal-less context: non-resume runs and private streaming tests.
+    #[cfg(test)]
+    fn disabled(counters: &'a mut RunCounters) -> Self {
+        Self {
+            journal: None,
+            hook: None,
+            counters,
+            file: 0,
+            tensor: 0,
+            base: 0,
+            completed_units: 0,
+            unit: 0,
+        }
+    }
+
+    /// True while the current unit was completed and verified in a prior run.
+    fn replaying(&self) -> bool {
+        self.unit < self.completed_units
+    }
+
+    fn next_unit(&mut self) {
+        self.unit += 1;
+    }
+
+    /// Journal one completed write unit. Spans are payload-relative offsets;
+    /// the recorded sha256 covers the concatenated written bytes in span order.
+    /// The payload is flushed before the record so a crash can never leave a
+    /// journaled unit whose bytes did not reach disk.
+    fn record(&mut self, writer: &Writer, spans: &[(u64, u64)], bytes: &[&[u8]]) -> Result<()> {
+        let mut hash = Sha256::new();
+        for chunk in bytes {
+            hash.update(chunk);
+        }
+        self.record_with_sha(writer, spans, format!("{:x}", hash.finalize()))
+    }
+
+    fn record_with_sha(&mut self, writer: &Writer, spans: &[(u64, u64)], sha256: String) -> Result<()> {
+        if let Some(journal) = self.journal.as_deref_mut() {
+            writer.sync_payload()?;
+            journal.append(&resume::Record::Chunk {
+                file: self.file,
+                tensor: self.tensor,
+                unit: self.unit,
+                spans: spans
+                    .iter()
+                    .map(|&(offset, size)| (self.base + offset, size))
+                    .collect(),
+                payload_sha256: sha256,
+            })?;
+            self.counters.chunks += 1;
+            if let Some(hook) = self.hook {
+                hook("chunk", self.counters.chunks)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A structural library entry point. The public CLI always uses architecture::plan.
 pub fn convert(
     snapshot: &dyn TensorSource,
@@ -454,6 +607,31 @@ pub fn convert(
     output: &Path,
     options: &Options,
     progress: &Progress,
+) -> Result<Manifest> {
+    convert_impl(snapshot, plan, output, options, progress, &ResumeOptions::default())
+}
+
+/// `convert` with opt-in resumable staging: a deterministic fingerprint-named
+/// staging directory, an fsync'd JSONL journal, and a sibling flock. With
+/// `enabled == false` the behavior is byte-identical to [`convert`].
+pub fn convert_with_resume(
+    snapshot: &dyn TensorSource,
+    plan: &ConversionPlan,
+    output: &Path,
+    options: &Options,
+    progress: &Progress,
+    resume_options: &ResumeOptions,
+) -> Result<Manifest> {
+    convert_impl(snapshot, plan, output, options, progress, resume_options)
+}
+
+fn convert_impl(
+    snapshot: &dyn TensorSource,
+    plan: &ConversionPlan,
+    output: &Path,
+    options: &Options,
+    progress: &Progress,
+    resume_options: &ResumeOptions,
 ) -> Result<Manifest> {
     ensure!(
         cfg!(any(target_os = "linux", target_os = "macos")),
@@ -466,88 +644,303 @@ pub fn convert(
     let destination = destination_path(snapshot, output)?;
     let parent = destination.parent().context("output has no parent")?;
     let required_bytes = planned_bytes(plan)?;
-    check_space(parent, required_bytes)?;
-    let staging = tempfile::Builder::new()
-        .prefix(".bf16-to-hgn-")
-        .tempdir_in(parent)?;
+    let mut staging = if resume_options.enabled {
+        let build = resume::fingerprint(snapshot, plan, options, &destination)?;
+        let (dir, journal_path, lock_path) = resume::staging_paths(parent, &build.name_digest);
+        // Fail fast on a concurrent run for the same job identity.
+        let lock = resume::LockGuard::acquire(&lock_path)?;
+        // Bytes already allocated by a previous run need no additional space.
+        let allocated = resume::allocated_bytes(&dir)?;
+        check_space(parent, required_bytes.saturating_sub(allocated))?;
+        let (journal, state) = resume::Journal::open_or_init(&dir, &journal_path, &build, plan)?;
+        Staging::Resume(Box::new(ResumeRun {
+            dir,
+            journal_path,
+            lock_path,
+            lock: Some(lock),
+            journal,
+            state,
+            hook: resume_options.abort_hook.clone(),
+        }))
+    } else {
+        check_space(parent, required_bytes)?;
+        Staging::Fresh(
+            tempfile::Builder::new()
+                .prefix(".bf16-to-hgn-")
+                .tempdir_in(parent)?,
+        )
+    };
+    let result = run_staged(
+        snapshot,
+        plan,
+        options,
+        progress,
+        &expected_sources,
+        &destination,
+        &mut staging,
+    );
+    match result {
+        Ok(manifest) => Ok(manifest),
+        Err(error) => {
+            if let Staging::Resume(run) = &staging {
+                eprintln!(
+                    "bf16-to-hgn: keeping resume state in {}; rerun the same command with --resume to continue",
+                    run.dir.display()
+                );
+                return Err(error).context(format!(
+                    "resume state kept in {}; rerun with --resume to continue",
+                    run.dir.display()
+                ));
+            }
+            Err(error)
+        }
+    }
+}
+
+fn run_staged(
+    snapshot: &dyn TensorSource,
+    plan: &ConversionPlan,
+    options: &Options,
+    progress: &Progress,
+    expected_sources: &BTreeSet<String>,
+    destination: &Path,
+    staging: &mut Staging,
+) -> Result<Manifest> {
     let vectors = prepare_rotations(snapshot, plan, options, progress)?;
     let stage = if progress.is_enabled() {
         progress.work_stage("Convert passes", conversion_work(snapshot, plan, options)?)
     } else {
         progress.stage("Convert passes", 0, Unit::Values)
     };
+    let mut counters = RunCounters::default();
     let mut source_hashes = BTreeMap::new();
     let mut containers = Vec::new();
-    for file in &plan.files {
+    for (file_index, file) in plan.files.iter().enumerate() {
+        // A finished file from a previous run keeps its on-disk header/table;
+        // rebuild the manifest record from its journal entry instead of
+        // re-reading the whole payload.
+        let file_record = match &*staging {
+            Staging::Resume(run) => run.state.file_records.get(&file_index).cloned(),
+            Staging::Fresh(_) => None,
+        };
+        if let Some(records) = file_record {
+            let run = match &*staging {
+                Staging::Resume(run) => run,
+                Staging::Fresh(_) => unreachable!("file record without resume staging"),
+            };
+            let layout = container::layout(file)?;
+            ensure!(
+                records.len() == layout.entries.len(),
+                "journal file record size mismatch"
+            );
+            let mut tensors = Vec::with_capacity(records.len());
+            for (record, entry) in records.iter().zip(&layout.entries) {
+                ensure!(
+                    record.name == entry.name
+                        && record.offset == entry.offset
+                        && record.size == entry.size,
+                    "journal file record does not match the planned layout"
+                );
+                tensors.push(OutputRecord {
+                    entry: container::Entry {
+                        checksum: record.checksum,
+                        ..entry.clone()
+                    },
+                    fingerprint: container::Fingerprint {
+                        size: record.size,
+                        sha256: record.sha256.clone(),
+                        xor32: record.xor32,
+                    },
+                });
+            }
+            for (index, tensor) in file.tensors.iter().enumerate() {
+                advance_skipped(&stage, snapshot, tensor, options)?;
+                let done = run
+                    .state
+                    .completed_tensors
+                    .get(&(file_index, index))
+                    .context("journal file record without its tensor records")?;
+                source_hashes.extend(done.source_sha256.clone());
+            }
+            containers.push(ContainerRecord {
+                filename: file.filename.clone(),
+                layout,
+                tensors,
+            });
+            continue;
+        }
         if stage.is_enabled() {
             stage.set_uncounted_item(&format!("create {}", file.filename));
         }
-        let mut writer = Writer::create(&staging.path().join(&file.filename), file)?;
-        for (index, tensor) in file.tensors.iter().enumerate() {
-            match &tensor.origin {
-                Origin::Signs { .. } | Origin::HtScales { .. } => {
-                    let values = vectors
-                        .get(&tensor.name)
-                        .context("missing prepared rotation")?;
-                    tensor_progress::item(
-                        &stage,
-                        tensor,
-                        "write rotation",
-                        "CPU",
-                        0,
-                        values.len() as u64,
-                        "values",
-                        None,
-                    );
-                    let started = stage.start_work();
-                    let mut bytes = Vec::with_capacity(values.len() * 2);
-                    for &value in values {
-                        bytes
-                            .extend_from_slice(&half::f16::from_f32(value).to_bits().to_le_bytes());
-                    }
-                    writer.write_at(index, 0, &bytes)?;
-                    tensor_progress::item(
-                        &stage,
-                        tensor,
-                        "write rotation",
-                        "CPU",
-                        values.len() as u64,
-                        values.len() as u64,
-                        "values",
-                        None,
-                    );
-                    stage.advance_work(WorkClass::WriteRotation, values.len() as u64, started);
-                }
-                Origin::Tensor { name } => {
-                    let info = &snapshot.tensors()[name];
-                    let hash = encode_tensor(
-                        snapshot,
-                        info,
-                        tensor,
-                        index,
-                        &mut writer,
-                        &vectors,
-                        options,
-                        &stage,
-                    )?;
-                    source_hashes.insert(name.clone(), hash);
-                }
-                Origin::Ngram { shards } => encode_table(
-                    snapshot,
-                    tensor,
-                    shards,
-                    index,
-                    &mut writer,
-                    &mut source_hashes,
-                    options,
-                    &stage,
-                )?,
+        let mut writer = match &mut *staging {
+            Staging::Fresh(temp) => Writer::create(&temp.path().join(&file.filename), file)?,
+            Staging::Resume(run) => {
+                let path = run.dir.join(&file.filename);
+                // Stale files whose journal entries were dropped (missing or
+                // wrong-sized at load time) are recreated from scratch.
+                resume::clean_stale_staging(&path, container::layout(file)?.file_size)?;
+                Writer::open_continue(&path, file)?
             }
+        };
+        for (index, tensor) in file.tensors.iter().enumerate() {
+            let (skip, completed_units) = match &*staging {
+                Staging::Resume(run) => (
+                    run.state
+                        .completed_tensors
+                        .get(&(file_index, index))
+                        .cloned(),
+                    run.state
+                        .partial
+                        .as_ref()
+                        .filter(|partial| {
+                            partial.file == file_index && partial.tensor == index
+                        })
+                        .map_or(0, |partial| partial.units),
+                ),
+                Staging::Fresh(_) => (None, 0),
+            };
+            if let Some(done) = skip {
+                advance_skipped(&stage, snapshot, tensor, options)?;
+                source_hashes.extend(done.source_sha256);
+                continue;
+            }
+            let base = writer.layout.entries[index].offset;
+            let source_map = {
+                let mut journal = ChunkJournal::new(
+                    staging,
+                    &mut counters,
+                    file_index,
+                    index,
+                    base,
+                    completed_units,
+                );
+                match &tensor.origin {
+                    Origin::Signs { .. } | Origin::HtScales { .. } => {
+                        let values = vectors
+                            .get(&tensor.name)
+                            .context("missing prepared rotation")?;
+                        tensor_progress::item(
+                            &stage,
+                            tensor,
+                            "write rotation",
+                            "CPU",
+                            0,
+                            values.len() as u64,
+                            "values",
+                            None,
+                        );
+                        let started = stage.start_work();
+                        let mut bytes = Vec::with_capacity(values.len() * 2);
+                        for &value in values {
+                            bytes.extend_from_slice(
+                                &half::f16::from_f32(value).to_bits().to_le_bytes(),
+                            );
+                        }
+                        writer.write_at(index, 0, &bytes)?;
+                        tensor_progress::item(
+                            &stage,
+                            tensor,
+                            "write rotation",
+                            "CPU",
+                            values.len() as u64,
+                            values.len() as u64,
+                            "values",
+                            None,
+                        );
+                        stage.advance_work(WorkClass::WriteRotation, values.len() as u64, started);
+                        BTreeMap::new()
+                    }
+                    Origin::Tensor { name } => {
+                        let info = &snapshot.tensors()[name];
+                        let hash = encode_tensor(
+                            snapshot,
+                            info,
+                            tensor,
+                            index,
+                            &mut writer,
+                            &vectors,
+                            options,
+                            &stage,
+                            &mut journal,
+                        )?;
+                        let mut map = BTreeMap::new();
+                        map.insert(name.clone(), hash);
+                        map
+                    }
+                    Origin::Ngram { shards } => {
+                        encode_table(
+                            snapshot,
+                            tensor,
+                            shards,
+                            index,
+                            &mut writer,
+                            &mut source_hashes,
+                            options,
+                            &stage,
+                            &mut journal,
+                        )?;
+                        shards
+                            .iter()
+                            .map(|name| {
+                                Ok((
+                                    name.clone(),
+                                    source_hashes
+                                        .get(name)
+                                        .context("missing n-gram shard hash")?
+                                        .clone(),
+                                ))
+                            })
+                            .collect::<Result<BTreeMap<_, _>>>()?
+                    }
+                }
+            };
+            if let Staging::Resume(run) = &mut *staging {
+                // Flush and checksum the completed payload before its record:
+                // a journaled tensor must survive a crash byte-for-byte.
+                writer.sync_payload()?;
+                let entry = &writer.layout.entries[index];
+                let mut handle = File::open(run.dir.join(&file.filename))?;
+                let fingerprint =
+                    container::fingerprint(&mut handle, entry.offset, entry.size)?;
+                run.journal.append(&resume::Record::Tensor {
+                    file: file_index,
+                    tensor: index,
+                    name: tensor.name.clone(),
+                    payload_offset: entry.offset,
+                    payload_size: entry.size,
+                    payload_sha256: fingerprint.sha256,
+                    source_sha256: source_map.clone(),
+                })?;
+                counters.tensors += 1;
+                if let Some(hook) = &run.hook {
+                    hook("tensor", counters.tensors)?;
+                }
+            }
+            source_hashes.extend(source_map);
         }
         if stage.is_enabled() {
             stage.set_uncounted_item(&format!("hash {}", file.filename));
         }
         let (layout, fingerprints) = writer.finish()?;
+        if let Staging::Resume(run) = &mut *staging {
+            run.journal.append(&resume::Record::File {
+                file: file_index,
+                filename: file.filename.clone(),
+                entries: layout
+                    .entries
+                    .iter()
+                    .zip(&fingerprints)
+                    .map(|(entry, fingerprint)| resume::FileEntryRecord {
+                        name: entry.name.clone(),
+                        offset: entry.offset,
+                        size: entry.size,
+                        checksum: entry.checksum,
+                        sha256: fingerprint.sha256.clone(),
+                        xor32: fingerprint.xor32,
+                    })
+                    .collect(),
+            })?;
+        }
         let tensors = layout
             .entries
             .iter()
@@ -562,7 +955,7 @@ pub fn convert(
         });
     }
     ensure!(
-        source_hashes.keys().cloned().collect::<BTreeSet<_>>() == expected_sources,
+        source_hashes.keys().cloned().collect::<BTreeSet<_>>() == *expected_sources,
         "conversion did not consume every source tensor"
     );
     let sources = source_hashes
@@ -573,7 +966,7 @@ pub fn convert(
         })
         .collect();
     stage.set_uncounted_item("copy assets");
-    let assets = copy_assets(snapshot, plan, staging.path())?;
+    let assets = copy_assets_resumable(snapshot, plan, staging)?;
     stage.set_uncounted_item("hash source metadata");
     let (_, config_sha256) = hash_file(&snapshot.asset_path("config.json")?)?;
     let index_sha256 = if snapshot.kind() == SourceKind::Hf {
@@ -603,6 +996,18 @@ pub fn convert(
     };
     stage.set_uncounted_item("publish output");
     let manifest_path = staging.path().join("conversion-manifest.json");
+    if let Staging::Resume(_) = staging {
+        // A previous run may have died between the manifest write and the
+        // rename. The manifest is never journaled; rewrite it from scratch.
+        match fs::remove_file(&manifest_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .context("removing stale staged conversion-manifest.json")
+            }
+        }
+    }
     let mut manifest_file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -612,15 +1017,108 @@ pub fn convert(
     manifest_file.sync_all()?;
     snapshot.check_unchanged()?;
     File::open(staging.path())?.sync_all()?;
-    publish_no_clobber(staging.path(), &destination)?;
+    publish_no_clobber(staging.path(), destination)?;
+    let parent = destination.parent().context("output has no parent")?;
     if let Err(error) = File::open(parent).and_then(|directory| directory.sync_all()) {
         // This path was created by our successful no-replace rename, never an existing destination.
-        fs::remove_dir_all(&destination)
+        fs::remove_dir_all(destination)
             .context("publication sync failed and newly published output cleanup failed")?;
         return Err(error).context("publication sync failed; removed newly published output");
     }
+    // Success: the journal and lock are staging siblings; the published tree
+    // never contains them. Remove both now that the output is durable.
+    if let Staging::Resume(run) = staging {
+        if let Err(error) = fs::remove_file(&run.journal_path) {
+            eprintln!(
+                "bf16-to-hgn: published successfully but could not remove journal {}: {error}",
+                run.journal_path.display()
+            );
+        }
+        drop(run.lock.take());
+        if let Err(error) = fs::remove_file(&run.lock_path) {
+            eprintln!(
+                "bf16-to-hgn: published successfully but could not remove lock {}: {error}",
+                run.lock_path.display()
+            );
+        }
+    }
     stage.finish();
     Ok(manifest)
+}
+
+/// Charge a skipped (already journaled) tensor's estimated work so progress
+/// totals stay consistent on resumed runs.
+fn advance_skipped(
+    stage: &Stage,
+    snapshot: &dyn TensorSource,
+    tensor: &TensorPlan,
+    options: &Options,
+) -> Result<()> {
+    if !stage.is_enabled() {
+        return Ok(());
+    }
+    let values = numel(&tensor.shape)?;
+    match &tensor.origin {
+        Origin::Tensor { name } => {
+            let class = source_work(tensor.encoding, snapshot.tensors()[name].dtype, options);
+            let started = stage.start_work();
+            stage.advance_work(class, values, started);
+        }
+        Origin::Signs { .. } | Origin::HtScales { .. } => {
+            let started = stage.start_work();
+            stage.advance_work(WorkClass::WriteRotation, values, started);
+        }
+        Origin::Ngram { .. } => {
+            let scan = stage.start_work();
+            stage.advance_work(WorkClass::ScanFp8Scale, values, scan);
+            let encode = stage.start_work();
+            stage.advance_work(
+                WorkClass::encode(
+                    Encoding::Fp8G128,
+                    codec::HtBackend::Cpu,
+                    codec::I4rBackend::Cpu,
+                    codec::Q4cpBackend::Cpu,
+                ),
+                values,
+                encode,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Assets are journaled as one all-or-nothing unit. A journaled copy whose
+/// staging files all still exist is reused; otherwise any unjournaled partial
+/// copies are removed and the assets are recopied and journaled (recovery
+/// rule for missing staging files).
+fn copy_assets_resumable(
+    snapshot: &dyn TensorSource,
+    plan: &ConversionPlan,
+    staging: &mut Staging,
+) -> Result<Vec<AssetRecord>> {
+    if let Staging::Resume(run) = &*staging {
+        if let Some(records) = &run.state.assets {
+            return Ok(records.clone());
+        }
+        for (_, destination) in asset_destinations(plan)? {
+            let path = run.dir.join(&destination);
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("removing unjournaled staged asset {}", path.display())
+                    })
+                }
+            }
+        }
+    }
+    let records = copy_assets(snapshot, plan, staging.path())?;
+    if let Staging::Resume(run) = staging {
+        run.journal
+            .append(&resume::Record::Assets { records: records.clone() })?;
+    }
+    Ok(records)
 }
 
 fn encode_tensor(
@@ -632,6 +1130,7 @@ fn encode_tensor(
     vectors: &BTreeMap<String, Vec<f32>>,
     options: &Options,
     stage: &Stage,
+    journal: &mut ChunkJournal,
 ) -> Result<String> {
     let mut hash = Sha256::new();
     let class = source_work(tensor.encoding, info.dtype, options);
@@ -650,7 +1149,14 @@ fn encode_tensor(
                 }
             }
             hash.update(&bytes);
-            writer.write_at(index, offset, &bytes)?;
+            if journal.replaying() {
+                // Payload verified on disk from a prior run; the source hash
+                // replay above keeps the manifest digest identical.
+            } else {
+                writer.write_at(index, offset, &bytes)?;
+                journal.record(writer, &[(offset, len as u64)], &[&bytes])?;
+            }
+            journal.next_unit();
             offset += len as u64;
             tensor_progress::item(
                 stage, tensor, "copy", "CPU", offset, info.size, "bytes", None,
@@ -664,13 +1170,14 @@ fn encode_tensor(
         && tensor.name.ends_with(".gate_up_proj.weight")
     {
         return encode_gate_up(
-            snapshot, info, tensor, index, writer, vectors, options, stage,
+            snapshot, info, tensor, index, writer, vectors, options, stage, journal,
         );
     }
     let (rows, cols) = rows_cols(&tensor.shape)?;
     let layout = codec::payload_layout(tensor.encoding, rows, cols)?;
     let defaults = QuantMeta::default();
     if tensor.encoding == Encoding::Q4Cp {
+        // Idempotent on resume: the same 64 codebook bytes are rewritten.
         let mut bytes = [0u8; 64];
         for (i, &value) in defaults.codebook.iter().enumerate() {
             bytes[i * 4..i * 4 + 4].copy_from_slice(&value.to_le_bytes());
@@ -693,45 +1200,54 @@ fn encode_tensor(
             );
         }
         let started = stage.start_work();
+        // Replay still reads and hashes the source: the canonical source hash
+        // must continue seamlessly across resumed chunk boundaries.
         let (raw, values) = read_source_values(snapshot, info, (row * cols) as u64, take * cols)?;
         hash.update(raw);
-        let (su, sv) = rotation_slice(tensor, vectors, row, take)?;
-        let meta = QuantMeta {
-            su,
-            sv,
-            threads: options.threads,
-            ht_beam: options.ht_beam,
-            ht_backend: options.ht_backend,
-            i4r_backend: options.i4r_backend,
-            q4cp_backend: options.q4cp_backend,
-            ..QuantMeta::default()
-        };
-        let block = codec::encode_rows(tensor.encoding, &values, take, cols, &meta)
-            .with_context(|| format!("encode {} rows {row}..{}", tensor.name, row + take))?;
-        if matches!(tensor.encoding, Encoding::Q4Cp | Encoding::I4r) {
-            ensure!(
-                block.codes.len() == take * cols / 2
-                    && block.scales.len() as u64 == take as u64 * layout.scale_row_stride,
-                "codec planar size mismatch"
-            );
-            writer.write_at(
-                index,
-                layout.codes_offset + (row * cols / 2) as u64,
-                &block.codes,
-            )?;
-            writer.write_at(
-                index,
-                layout.scales_offset + row as u64 * layout.scale_row_stride,
-                &block.scales,
-            )?;
-        } else {
-            let stride = layout.len / rows as u64;
-            ensure!(
-                block.scales.is_empty() && block.codes.len() as u64 == take as u64 * stride,
-                "codec block size mismatch"
-            );
-            writer.write_at(index, row as u64 * stride, &block.codes)?;
+        if !journal.replaying() {
+            let (su, sv) = rotation_slice(tensor, vectors, row, take)?;
+            let meta = QuantMeta {
+                su,
+                sv,
+                threads: options.threads,
+                ht_beam: options.ht_beam,
+                ht_backend: options.ht_backend,
+                i4r_backend: options.i4r_backend,
+                q4cp_backend: options.q4cp_backend,
+                ..QuantMeta::default()
+            };
+            let block = codec::encode_rows(tensor.encoding, &values, take, cols, &meta)
+                .with_context(|| format!("encode {} rows {row}..{}", tensor.name, row + take))?;
+            if matches!(tensor.encoding, Encoding::Q4Cp | Encoding::I4r) {
+                ensure!(
+                    block.codes.len() == take * cols / 2
+                        && block.scales.len() as u64 == take as u64 * layout.scale_row_stride,
+                    "codec planar size mismatch"
+                );
+                let codes_offset = layout.codes_offset + (row * cols / 2) as u64;
+                let scales_offset = layout.scales_offset + row as u64 * layout.scale_row_stride;
+                writer.write_at(index, codes_offset, &block.codes)?;
+                writer.write_at(index, scales_offset, &block.scales)?;
+                journal.record(
+                    writer,
+                    &[
+                        (codes_offset, block.codes.len() as u64),
+                        (scales_offset, block.scales.len() as u64),
+                    ],
+                    &[&block.codes, &block.scales],
+                )?;
+            } else {
+                let stride = layout.len / rows as u64;
+                ensure!(
+                    block.scales.is_empty() && block.codes.len() as u64 == take as u64 * stride,
+                    "codec block size mismatch"
+                );
+                let offset = row as u64 * stride;
+                writer.write_at(index, offset, &block.codes)?;
+                journal.record(writer, &[(offset, block.codes.len() as u64)], &[&block.codes])?;
+            }
         }
+        journal.next_unit();
         if stage.is_enabled() {
             tensor_progress::rows(
                 stage,
@@ -885,6 +1401,7 @@ fn encode_gate_up(
     vectors: &BTreeMap<String, Vec<f32>>,
     options: &Options,
     stage: &Stage,
+    journal: &mut ChunkJournal,
 ) -> Result<String> {
     let class = WorkClass::encode(tensor.encoding, options.ht_backend, options.i4r_backend, options.q4cp_backend);
     let experts = usize::try_from(tensor.shape[0])?;
@@ -907,6 +1424,11 @@ fn encode_gate_up(
     let mut offset = 0;
     for expert in 0..experts {
         up_bytes.clear();
+        // One chunk unit per expert: a multi-GB fused expert tensor interrupted
+        // mid-run resumes at the next expert, never re-encoding finished ones.
+        let replay = journal.replaying();
+        let expert_start = offset;
+        let mut expert_sha = Sha256::new();
         for band in (0..half_rows).step_by(MATRIX_ROWS) {
             let gate_row = expert * expert_rows + band;
             let up_row = gate_row + half_rows;
@@ -923,41 +1445,46 @@ fn encode_gate_up(
                 );
             }
             let started = stage.start_work();
+            // Replay re-reads the source so the canonical hash order is
+            // identical, but skips the expensive paired-band encode.
             let (gate_raw, gate) =
                 read_source_values(snapshot, info, (gate_row * cols) as u64, MATRIX_ROWS * cols)?;
             let (up_raw, up) =
                 read_source_values(snapshot, info, (up_row * cols) as u64, MATRIX_ROWS * cols)?;
             hash.update(gate_raw);
             up_bytes.extend_from_slice(&up_raw);
-            let (su, gate_sv) = rotation_slice(tensor, vectors, gate_row, MATRIX_ROWS)?;
-            let (_, up_sv) = rotation_slice(tensor, vectors, up_row, MATRIX_ROWS)?;
-            let gate_meta = QuantMeta {
-                su,
-                sv: gate_sv,
-                threads: options.threads,
-                ht_beam: options.ht_beam,
-                ht_backend: options.ht_backend,
-                i4r_backend: options.i4r_backend,
-                q4cp_backend: options.q4cp_backend,
-                ..QuantMeta::default()
-            };
-            let up_meta = QuantMeta {
-                sv: up_sv,
-                ..gate_meta
-            };
-            let bytes = codec::encode_ht_gate_up_bands(
-                tensor.encoding,
-                &gate,
-                &up,
-                cols,
-                &gate_meta,
-                &up_meta,
-            )?;
-            ensure!(
-                bytes.len() as u64 == pair_bytes,
-                "paired HT encoder size mismatch"
-            );
-            writer.write_at(index, offset, &bytes)?;
+            if !replay {
+                let (su, gate_sv) = rotation_slice(tensor, vectors, gate_row, MATRIX_ROWS)?;
+                let (_, up_sv) = rotation_slice(tensor, vectors, up_row, MATRIX_ROWS)?;
+                let gate_meta = QuantMeta {
+                    su,
+                    sv: gate_sv,
+                    threads: options.threads,
+                    ht_beam: options.ht_beam,
+                    ht_backend: options.ht_backend,
+                    i4r_backend: options.i4r_backend,
+                    q4cp_backend: options.q4cp_backend,
+                    ..QuantMeta::default()
+                };
+                let up_meta = QuantMeta {
+                    sv: up_sv,
+                    ..gate_meta
+                };
+                let bytes = codec::encode_ht_gate_up_bands(
+                    tensor.encoding,
+                    &gate,
+                    &up,
+                    cols,
+                    &gate_meta,
+                    &up_meta,
+                )?;
+                ensure!(
+                    bytes.len() as u64 == pair_bytes,
+                    "paired HT encoder size mismatch"
+                );
+                writer.write_at(index, offset, &bytes)?;
+                expert_sha.update(&bytes);
+            }
             offset = offset
                 .checked_add(pair_bytes)
                 .context("expert payload offset overflow")?;
@@ -984,6 +1511,14 @@ fn encode_gate_up(
             }
             stage.advance_work(class, (2 * MATRIX_ROWS * cols) as u64, started);
         }
+        if !replay {
+            journal.record_with_sha(
+                writer,
+                &[(expert_start, offset - expert_start)],
+                format!("{:x}", expert_sha.finalize()),
+            )?;
+        }
+        journal.next_unit();
     }
     ensure!(
         offset == writer.layout.entries[index].size,
@@ -1057,6 +1592,7 @@ fn encode_table(
     hashes: &mut BTreeMap<String, String>,
     options: &Options,
     stage: &Stage,
+    journal: &mut ChunkJournal,
 ) -> Result<()> {
     let cols = usize::try_from(tensor.shape[2])?;
     let shard_rows = usize::try_from(tensor.shape[1])?;
@@ -1130,16 +1666,28 @@ fn encode_table(
                 );
             }
             let started = stage.start_work();
+            // Replay re-reads and re-hashes the source rows so per-shard
+            // digests continue seamlessly, but skips the FP8 encode.
             let (raw, values) =
                 read_source_values(snapshot, info, (row * cols) as u64, take * cols)?;
             hash.update(raw);
-            let block = codec::encode_rows(Encoding::Fp8G128, &values, take, cols, &meta)?;
-            ensure!(
-                block.codes.len() == take * cols && block.scales.is_empty(),
-                "FP8 codec size mismatch"
-            );
-            writer.write_at(index, output_offset, &block.codes)?;
-            output_offset += block.codes.len() as u64;
+            if journal.replaying() {
+                output_offset += (take * cols) as u64;
+            } else {
+                let block = codec::encode_rows(Encoding::Fp8G128, &values, take, cols, &meta)?;
+                ensure!(
+                    block.codes.len() == take * cols && block.scales.is_empty(),
+                    "FP8 codec size mismatch"
+                );
+                writer.write_at(index, output_offset, &block.codes)?;
+                journal.record(
+                    writer,
+                    &[(output_offset, block.codes.len() as u64)],
+                    &[&block.codes],
+                )?;
+                output_offset += block.codes.len() as u64;
+            }
+            journal.next_unit();
             row += take;
             if stage.is_enabled() {
                 tensor_progress::item(
@@ -1173,6 +1721,7 @@ fn encode_table(
             .context("table rows overflow")?,
         cols,
     )?;
+    // Idempotent on resume: the scale trailer is rewritten unconditionally.
     writer.write_at(index, layout.len - 4, &scale.to_le_bytes())?;
     Ok(())
 }

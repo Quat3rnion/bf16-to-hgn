@@ -277,6 +277,13 @@ $BIN convert --source /path/to/hf-bf16 --output /path/to/new-hf-v2 \
   --seed 0 --threads 1 --ht-beam 128
 $BIN verify --source /path/to/hf-bf16 --output /path/to/new-hf-v2
 
+# Resumable conversion: add --resume to both the initial run and any rerun.
+# An interrupted run keeps its fingerprinted staging directory and journal;
+# rerunning the identical command with --resume continues where it stopped.
+$BIN convert --source /path/to/hf-bf16 --output /path/to/new-hf-v2 \
+  --seed 0 --threads 1 --ht-beam 128 --resume
+$BIN verify --source /path/to/hf-bf16 --output /path/to/new-hf-v2
+
 # Native HGN with embedded MTP and explicitly matching assets/ngram/vision.
 $BIN convert --source-format hgn --source /path/to/native/model.hgn \
   --assets /path/to/matching-assets \
@@ -392,6 +399,37 @@ source inputs/assets/sidecars are refused. The tool never modifies the input,
 services, or a live checkpoint. A process killed without cleanup may leave an
 unpublished `.bf16-to-hgn-*` staging directory; it is never treated as a
 finished output or resumed automatically.
+
+`convert --resume` makes an interrupted conversion continuable. Instead of a
+random staging directory it uses a deterministic one beside the output,
+`.bf16-to-hgn-resume-<16 hex>`, named by a job-identity digest (source kind,
+all physical input paths+sizes, destination). Sibling files
+`<staging>.journal` and `<staging>.lock` live outside the staging directory,
+so the published tree is byte-identical to a non-resume run. The journal is
+an fsync'd JSONL log: a header line holding the full validity fingerprint
+(tool/encoder aggregate hash, per-file path+size+mtime stats of every
+physical input including sidecars/assets, HF index digest, profile, backends,
+ht-beam, seed, threads, planned file list, planned bytes, planned tensor-table
+digest — metadata-only, never payload rehashing), then one line per completed
+tensor and per completed intra-tensor chunk unit (row band, expert, copy or
+table chunk) with its payload span and SHA-256, one line per finished file,
+and one line for the copied assets. Rerunning the identical command with
+`--resume` re-checksums the last 8 completed units against actual staging
+bytes, truncates the journal to the last verified unit on any mismatch (the
+affected tensor is re-encoded deterministically), and continues writers at
+the journaled offsets; completed tensors and files are skipped, with their
+source hashes replayed from the source read (not re-encoded). Recovery rules:
+a missing staging directory resets a stale journal and starts over; missing or
+wrong-sized staging files drop their journal records and are recreated; a
+torn trailing journal line is discarded. A fingerprint mismatch (changed
+seed, beam, threads, profile, backends, tool version or source files) is a
+hard error naming the changed fields — never a silent restart; remove the
+staging directory and its `.journal`/`.lock` siblings to convert with
+different options. The sibling lock makes a second concurrent run on the same
+job fail fast. On success the output is published atomically as usual and the
+journal and lock are removed; on failure they are kept and the error tells you
+to rerun with `--resume`. Without `--resume`, staging, cleanup and publication
+behavior are exactly as before.
 
 For serving, select the engine's matching native-v2 or native-HT43 loader for
 `model.hgn`, its n-gram file and tokenizer. MTP weights are inside the output
@@ -542,7 +580,9 @@ means CPU. These provenance fields are separate from verification-time
 `--decode-backend`, which does not rewrite them. CPU-only builds can verify
 HIP- or CUDA-produced output without a GPU. Container bytes must match the
 same-toolchain CPU reference; the manifest legitimately differs in backend
-metadata. Changing backends does not resume an unfinished conversion.
+metadata. Changing backends does not resume an unfinished conversion; with
+`--resume`, any backend change alters the journal fingerprint and the rerun
+is rejected until the staging directory is removed.
 
 The BF16 source is approximately 360 GB. Including n-gram and vision, outputs
 are approximately **119 GB for v2** or **110 GB for HT43** (decimal, excluding

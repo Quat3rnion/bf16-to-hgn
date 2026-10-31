@@ -62,6 +62,13 @@ enum Command {
         /// Validate and print the plan; do not create output files or read tensor payloads.
         #[arg(long)]
         dry_run: bool,
+        /// Continue an interrupted conversion from its fingerprinted staging journal.
+        /// The staging directory, journal and lock are deterministic per source,
+        /// destination and encoding options; an interrupted run keeps them, and a
+        /// rerun with --resume verifies the journal header and completed payloads
+        /// before continuing. Without --resume, behavior is unchanged.
+        #[arg(long)]
+        resume: bool,
         #[command(flatten)]
         encoding: EncodingOptions,
     },
@@ -190,6 +197,7 @@ fn run() -> Result<()> {
             input,
             output,
             dry_run,
+            resume,
             encoding,
         } => {
             let options = encoding.options()?;
@@ -202,12 +210,16 @@ fn run() -> Result<()> {
             if dry_run {
                 print_json(&plan_report(snapshot.as_ref(), &plan, &options)?)?;
             } else {
-                let manifest = conversion::convert(
+                let manifest = conversion::convert_with_resume(
                     snapshot.as_ref(),
                     &plan,
                     &output,
                     &options,
                     &Progress::stderr(),
+                    &conversion::ResumeOptions {
+                        enabled: resume,
+                        abort_hook: test_abort_hook(),
+                    },
                 )?;
                 print_json(
                     &json!({ "published": true, "source_tensors": manifest.sources.len(), "output_tensors": manifest.containers.iter().map(|c| c.tensors.len()).sum::<usize>(), "manifest": "conversion-manifest.json", "source_format": manifest.source_kind, "profile": manifest.options.profile, "ht_backend": manifest.options.ht_backend, "i4r_backend": manifest.options.i4r_backend, "q4cp_backend": manifest.options.q4cp_backend, "policy": manifest.policy }),
@@ -286,4 +298,21 @@ fn print_json(value: &impl serde::Serialize) -> Result<()> {
     use std::io::Write;
     output.write_all(b"\n")?;
     Ok(())
+}
+
+/// Hidden integration-test hook: abort a conversion mid-stream after N
+/// journaled tensors so an interrupted --resume run can be simulated
+/// deterministically. Never set outside tests.
+fn test_abort_hook() -> Option<conversion::AbortHook> {
+    let limit = std::env::var("HGN_TEST_ABORT_AFTER_TENSORS")
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(std::sync::Arc::new(move |kind: &str, count: u64| {
+        if kind == "tensor" && count >= limit {
+            anyhow::bail!("test abort: reached HGN_TEST_ABORT_AFTER_TENSORS={limit}");
+        }
+        Ok(())
+    }))
 }

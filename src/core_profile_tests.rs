@@ -84,6 +84,8 @@ fn paired_stream_encode_and_independent_verify_cover_canonical_source_order() {
             ht_beam: 1,
             ..Options::default()
         };
+        let mut counters = RunCounters::default();
+        let mut journal = ChunkJournal::disabled(&mut counters);
         let hash = encode_tensor(
             &snapshot,
             &snapshot.tensors["expert"],
@@ -97,6 +99,7 @@ fn paired_stream_encode_and_independent_verify_cover_canonical_source_order() {
                 0,
                 crate::progress::Unit::Values,
             ),
+            &mut journal,
         )
         .unwrap();
         assert_eq!(hash, snapshot.hash_tensor("expert").unwrap());
