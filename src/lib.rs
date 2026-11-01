@@ -7,6 +7,7 @@ pub mod gguf_source;
 pub mod hf;
 pub mod hgn_source;
 pub mod manifest;
+pub mod pool;
 pub mod progress;
 pub mod resume;
 pub mod source;
