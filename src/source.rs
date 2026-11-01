@@ -47,7 +47,7 @@ pub struct SourceOptions {
     pub mtp: Option<PathBuf>,
 }
 
-pub trait TensorSource: Debug {
+pub trait TensorSource: Debug + Send + Sync {
     /// Immutable physical source root (directory or model file).
     fn root(&self) -> &Path;
     fn tensors(&self) -> &BTreeMap<String, TensorInfo>;

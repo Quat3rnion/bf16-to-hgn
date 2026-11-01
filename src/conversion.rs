@@ -4,10 +4,11 @@ use crate::{
     hf::{Dtype, TensorInfo},
     manifest::{AssetRecord, ContainerRecord, Manifest, Options, OutputRecord, SourceRecord},
     numel,
+    pool::{self, GpuDevice},
     progress::{Progress, Stage, Unit, WorkClass, WorkEstimate},
     rows_cols,
     source::{SourceKind, TensorSource, ASSET_NAMES},
-    tensor_progress, ConversionPlan, Origin, TensorPlan, ENCODER_SHA256, SPEC_COMMIT, SPEC_VERSION,
+    tensor_progress, ConversionPlan, ContainerPlan, Origin, TensorPlan, ENCODER_SHA256, SPEC_COMMIT, SPEC_VERSION,
 };
 use anyhow::{bail, ensure, Context, Result};
 use sha2::{Digest, Sha256};
@@ -16,7 +17,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
-};
+    sync::{Arc, Mutex},};
 
 const COPY_CHUNK: usize = 8 * 1024 * 1024;
 const MATRIX_ROWS: usize = 128;
@@ -447,7 +448,111 @@ pub fn validate_ple(snapshot: &dyn TensorSource, plan: &ConversionPlan) -> Resul
     Ok(())
 }
 
-/// A structural library entry point. The public CLI always uses architecture::plan.
+/// Per-file write context shared by the sequential pipeline and the
+/// multi-GPU pool (whose workers rebuild it from mutex guards per job).
+struct FileRun<'a> {
+    writer: &'a mut Writer,
+    source_hashes: &'a mut BTreeMap<String, String>,
+    dir: &'a Path,
+}
+
+/// Pool-owned per-file state: the same fields as FileRun behind mutexes so
+/// every device worker can encode its tensors concurrently. Positional
+/// writes make tensor completion order irrelevant.
+struct PoolRun {
+    writer: Mutex<Writer>,
+    source_hashes: Mutex<BTreeMap<String, String>>,
+    failure: Mutex<Option<anyhow::Error>>,
+}
+
+/// Encode one tensor into its staging-file slot.
+fn process_tensor(
+    snapshot: &dyn TensorSource,
+    tensor: &TensorPlan,
+    index: usize,
+    run: &mut FileRun<'_>,
+    vectors: &BTreeMap<String, Vec<f32>>,
+    options: &Options,
+    stage: &Stage,
+) -> Result<()> {
+    let source_map = match &tensor.origin {
+        Origin::Signs { .. } | Origin::HtScales { .. } => {
+            let values = vectors
+                .get(&tensor.name)
+                .context("missing prepared rotation")?;
+            tensor_progress::item(
+                stage,
+                tensor,
+                "write rotation",
+                "CPU",
+                0,
+                values.len() as u64,
+                "values",
+                None,
+            );
+            let started = stage.start_work();
+            let mut bytes = Vec::with_capacity(values.len() * 2);
+            for &value in values {
+                bytes.extend_from_slice(&half::f16::from_f32(value).to_bits().to_le_bytes());
+            }
+            run.writer.write_at(index, 0, &bytes)?;
+            tensor_progress::item(
+                stage,
+                tensor,
+                "write rotation",
+                "CPU",
+                values.len() as u64,
+                values.len() as u64,
+                "values",
+                None,
+            );
+            stage.advance_work(WorkClass::WriteRotation, values.len() as u64, started);
+            BTreeMap::new()
+        }
+        Origin::Tensor { name } => {
+            let info = &snapshot.tensors()[name];
+            let hash = encode_tensor(
+                snapshot,
+                info,
+                tensor,
+                index,
+                run.writer,
+                vectors,
+                options,
+                stage,
+            )?;
+            let mut map = BTreeMap::new();
+            map.insert(name.clone(), hash);
+            map
+        }
+        Origin::Ngram { shards } => {
+            encode_table(
+                snapshot,
+                tensor,
+                shards,
+                index,
+                run.writer,
+                run.source_hashes,
+                options,
+                stage,
+            )?;
+            shards
+                .iter()
+                .map(|name| {
+                    Ok((
+                        name.clone(),
+                        run.source_hashes
+                            .get(name)
+                            .context("missing n-gram shard hash")?
+                            .clone(),
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?
+        }
+    };
+    run.source_hashes.extend(source_map);
+    Ok(())
+}/// A structural library entry point. The public CLI always uses architecture::plan.
 pub fn convert(
     snapshot: &dyn TensorSource,
     plan: &ConversionPlan,
@@ -455,7 +560,32 @@ pub fn convert(
     options: &Options,
     progress: &Progress,
 ) -> Result<Manifest> {
-    ensure!(
+    convert_with_devices(snapshot, plan, output, options, progress, &[])
+}
+
+/// `convert` with an explicit GPU device pool: tensor encoding runs
+/// concurrently across `--devices` (one worker per device, tensors assigned
+/// round-robin). Omitting devices keeps the single `--ht-backend` pipeline
+/// byte-for-byte.
+pub fn convert_with_devices(
+    snapshot: &dyn TensorSource,
+    plan: &ConversionPlan,
+    output: &Path,
+    options: &Options,
+    progress: &Progress,
+    devices: &[GpuDevice],
+) -> Result<Manifest> {
+    convert_impl(snapshot, plan, output, options, progress, devices)
+}
+
+fn convert_impl(
+    snapshot: &dyn TensorSource,
+    plan: &ConversionPlan,
+    output: &Path,
+    options: &Options,
+    progress: &Progress,
+    devices: &[GpuDevice],
+) -> Result<Manifest> {    ensure!(
         cfg!(any(target_os = "linux", target_os = "macos")),
         "atomic no-clobber publication is supported on Linux/macOS only"
     );
@@ -470,6 +600,29 @@ pub fn convert(
     let staging = tempfile::Builder::new()
         .prefix(".bf16-to-hgn-")
         .tempdir_in(parent)?;
+    run_staged(
+        snapshot,
+        plan,
+        options,
+        progress,
+        &expected_sources,
+        &destination,
+        &staging,
+        devices,
+    )
+}
+
+fn run_staged(
+    snapshot: &dyn TensorSource,
+    plan: &ConversionPlan,
+    options: &Options,
+    progress: &Progress,
+    expected_sources: &BTreeSet<String>,
+    destination: &Path,
+    staging: &tempfile::TempDir,
+    devices: &[GpuDevice],
+) -> Result<Manifest> {
+    let parent = destination.parent().context("output has no parent")?;
     let vectors = prepare_rotations(snapshot, plan, options, progress)?;
     let stage = if progress.is_enabled() {
         progress.work_stage("Convert passes", conversion_work(snapshot, plan, options)?)
@@ -483,66 +636,79 @@ pub fn convert(
             stage.set_uncounted_item(&format!("create {}", file.filename));
         }
         let mut writer = Writer::create(&staging.path().join(&file.filename), file)?;
-        for (index, tensor) in file.tensors.iter().enumerate() {
-            match &tensor.origin {
-                Origin::Signs { .. } | Origin::HtScales { .. } => {
-                    let values = vectors
-                        .get(&tensor.name)
-                        .context("missing prepared rotation")?;
-                    tensor_progress::item(
-                        &stage,
-                        tensor,
-                        "write rotation",
-                        "CPU",
-                        0,
-                        values.len() as u64,
-                        "values",
-                        None,
-                    );
-                    let started = stage.start_work();
-                    let mut bytes = Vec::with_capacity(values.len() * 2);
-                    for &value in values {
-                        bytes
-                            .extend_from_slice(&half::f16::from_f32(value).to_bits().to_le_bytes());
-                    }
-                    writer.write_at(index, 0, &bytes)?;
-                    tensor_progress::item(
-                        &stage,
-                        tensor,
-                        "write rotation",
-                        "CPU",
-                        values.len() as u64,
-                        values.len() as u64,
-                        "values",
-                        None,
-                    );
-                    stage.advance_work(WorkClass::WriteRotation, values.len() as u64, started);
-                }
-                Origin::Tensor { name } => {
-                    let info = &snapshot.tensors()[name];
-                    let hash = encode_tensor(
-                        snapshot,
-                        info,
-                        tensor,
-                        index,
-                        &mut writer,
-                        &vectors,
-                        options,
-                        &stage,
-                    )?;
-                    source_hashes.insert(name.clone(), hash);
-                }
-                Origin::Ngram { shards } => encode_table(
+        // The staging directory and manifest hash map are shared by the
+        // tensor loop; the pool path moves them behind mutexes, the
+        // sequential path borrows them directly.
+        let dir = staging.path().to_path_buf();
+        if devices.is_empty() {
+            for (index, tensor) in file.tensors.iter().enumerate() {
+                let mut run = FileRun {
+                    writer: &mut writer,
+                    source_hashes: &mut source_hashes,
+                    dir: &dir,
+                };
+                process_tensor(
                     snapshot,
                     tensor,
-                    shards,
                     index,
-                    &mut writer,
-                    &mut source_hashes,
+                    &mut run,
+                    &vectors,
                     options,
                     &stage,
-                )?,
+                )?;
             }
+        } else {
+            let shared = Arc::new(PoolRun {
+                writer: Mutex::new(writer),
+                source_hashes: Mutex::new(BTreeMap::new()),
+                failure: Mutex::new(None),
+            });
+            let depth = 4 * devices.len();
+            let vectors_ref = &vectors;
+            let stage_ref = &stage;
+            std::thread::scope(|scope| -> Result<()> {
+                let pool = pool::DevicePool::new(scope, devices, depth);
+                for (index, tensor) in file.tensors.iter().enumerate() {
+                    let backend = devices[index % devices.len()].backend;
+                    let device_options = Options {
+                        ht_backend: backend,
+                        ..*options
+                    };
+                    let shared = shared.clone();
+                    let dir = dir.clone();
+                    pool.submit(move || {
+                        let mut writer_guard = shared.writer.lock().unwrap();
+                        let mut hashes_guard = shared.source_hashes.lock().unwrap();
+                        let mut run = FileRun {
+                            writer: &mut *writer_guard,
+                            source_hashes: &mut *hashes_guard,
+                            dir: &dir,
+                        };
+                        if let Err(error) = process_tensor(
+                            snapshot,
+                            tensor,
+                            index,
+                            &mut run,
+                            vectors_ref,
+                            &device_options,
+                            stage_ref,
+                        ) {
+                            let mut failure = shared.failure.lock().unwrap();
+                            if failure.is_none() {
+                                *failure = Some(error);
+                            }
+                        }
+                    })?;
+                }
+                pool.join()
+            })?;
+            let shared =
+                Arc::try_unwrap(shared).map_err(|_| anyhow::anyhow!("device pool state busy"))?;
+            if let Some(error) = shared.failure.into_inner().expect("pool failure slot") {
+                return Err(error);
+            }
+            source_hashes.extend(shared.source_hashes.into_inner().expect("pool hashes"));
+            writer = shared.writer.into_inner().expect("pool writer");
         }
         if stage.is_enabled() {
             stage.set_uncounted_item(&format!("hash {}", file.filename));
@@ -562,7 +728,7 @@ pub fn convert(
         });
     }
     ensure!(
-        source_hashes.keys().cloned().collect::<BTreeSet<_>>() == expected_sources,
+        source_hashes.keys().cloned().collect::<BTreeSet<_>>() == *expected_sources,
         "conversion did not consume every source tensor"
     );
     let sources = source_hashes

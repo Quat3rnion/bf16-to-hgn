@@ -1565,3 +1565,20 @@ fn i4r_device_unavailable_fails_before_source_open_or_staging(
     }
     Ok(())
 }
+
+#[test]
+fn materializes_matrix_hgn_for_cli_spot_check() -> Result<()> {
+    let dir = std::path::Path::new("/tmp/bf16-matrix-new");
+    let _ = fs::remove_dir_all(dir);
+    fs::create_dir_all(dir)?;
+    let (snapshot, plan) = support::matrix_fixture(dir, OutputProfile::Ht43)?;
+    let options = Options {
+        profile: OutputProfile::Ht43,
+        seed: 7,
+        threads: 1,
+        ht_beam: 8,
+        ..Options::default()
+    };
+    conversion::convert(&snapshot, &plan, &dir.join("hgn"), &options, &Progress::disabled())?;
+    Ok(())
+}

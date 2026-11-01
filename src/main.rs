@@ -4,6 +4,7 @@ use bf16_to_hgn::{
     codec::{HtBackend, I4rBackend, Q4cpBackend},
     container, conversion,
     manifest::{Options, OutputProfile},
+    pool,
     progress::Progress,
     source::{self, SourceKind, SourceOptions, TensorSource},
     verify,
@@ -62,7 +63,12 @@ enum Command {
         /// Validate and print the plan; do not create output files or read tensor payloads.
         #[arg(long)]
         dry_run: bool,
-        #[command(flatten)]
+        /// GPU device list for concurrent tensor encoding, e.g. hip:0,cuda:0.
+        /// Each entry is backend:index (cpu, hip, or cuda); the prototype
+        /// uses index 0 per backend. Omit to encode on the single
+        /// --ht-backend device exactly as before.
+        #[arg(long)]
+        devices: Option<String>,        #[command(flatten)]
         encoding: EncodingOptions,
     },
     /// Check actual source hashes, every output payload/layout, and decoded values.
@@ -190,9 +196,14 @@ fn run() -> Result<()> {
             input,
             output,
             dry_run,
+            devices,
             encoding,
         } => {
             let options = encoding.options()?;
+            let devices = match devices.as_deref() {
+                Some(spec) => pool::parse_devices(spec)?,
+                None => Vec::new(),
+            };
             if !dry_run {
                 options.validate_for_execution()?;
             }
@@ -202,12 +213,13 @@ fn run() -> Result<()> {
             if dry_run {
                 print_json(&plan_report(snapshot.as_ref(), &plan, &options)?)?;
             } else {
-                let manifest = conversion::convert(
+                let manifest = conversion::convert_with_devices(
                     snapshot.as_ref(),
                     &plan,
                     &output,
                     &options,
                     &Progress::stderr(),
+                    &devices,
                 )?;
                 print_json(
                     &json!({ "published": true, "source_tensors": manifest.sources.len(), "output_tensors": manifest.containers.iter().map(|c| c.tensors.len()).sum::<usize>(), "manifest": "conversion-manifest.json", "source_format": manifest.source_kind, "profile": manifest.options.profile, "ht_backend": manifest.options.ht_backend, "i4r_backend": manifest.options.i4r_backend, "q4cp_backend": manifest.options.q4cp_backend, "policy": manifest.policy }),
