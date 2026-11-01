@@ -4,11 +4,12 @@ use crate::{
     hf::{Dtype, TensorInfo},
     manifest::{AssetRecord, ContainerRecord, Manifest, Options, OutputRecord, SourceRecord},
     numel,
+    pool::{self, GpuDevice},
     progress::{Progress, Stage, Unit, WorkClass, WorkEstimate},
     resume,
     rows_cols,
     source::{SourceKind, TensorSource, ASSET_NAMES},
-    tensor_progress, ConversionPlan, Origin, TensorPlan, ENCODER_SHA256, SPEC_COMMIT, SPEC_VERSION,
+    tensor_progress, ConversionPlan, ContainerPlan, Origin, TensorPlan, ENCODER_SHA256, SPEC_COMMIT, SPEC_VERSION,
 };
 use anyhow::{bail, ensure, Context, Result};
 use sha2::{Digest, Sha256};
@@ -17,7 +18,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 const COPY_CHUNK: usize = 8 * 1024 * 1024;
@@ -473,7 +474,9 @@ struct ResumeRun {
     journal_path: PathBuf,
     lock_path: PathBuf,
     lock: Option<resume::LockGuard>,
-    journal: resume::Journal,
+    /// Wrapped so the multi-GPU pool workers can share the append+fsync
+    /// journal; entries are keyed by tensor+chunk so append order is free.
+    journal: Option<resume::Journal>,
     state: resume::ResumeState,
     hook: Option<AbortHook>,
 }
@@ -519,26 +522,38 @@ impl<'a> ChunkJournal<'a> {
         completed_units: usize,
     ) -> Self {
         match staging {
-            Staging::Resume(run) => Self {
-                journal: Some(&mut run.journal),
-                hook: run.hook.as_ref(),
+            Staging::Resume(run) => Self::from_parts(
+                run.journal.as_mut(),
+                run.hook.as_ref(),
                 counters,
                 file,
                 tensor,
                 base,
                 completed_units,
-                unit: 0,
-            },
-            Staging::Fresh(_) => Self {
-                journal: None,
-                hook: None,
-                counters,
-                file,
-                tensor,
-                base,
-                completed_units: 0,
-                unit: 0,
-            },
+            ),
+            Staging::Fresh(_) => Self::from_parts(None, None, counters, file, tensor, base, 0),
+        }
+    }
+
+    /// Journal context built from parts, shared with the multi-GPU pool path.
+    fn from_parts(
+        journal: Option<&'a mut resume::Journal>,
+        hook: Option<&'a AbortHook>,
+        counters: &'a mut RunCounters,
+        file: usize,
+        tensor: usize,
+        base: u64,
+        completed_units: usize,
+    ) -> Self {
+        Self {
+            journal,
+            hook,
+            counters,
+            file,
+            tensor,
+            base,
+            completed_units,
+            unit: 0,
         }
     }
 
@@ -600,6 +615,182 @@ impl<'a> ChunkJournal<'a> {
     }
 }
 
+/// Per-file write/journal context shared by the sequential pipeline and the
+/// multi-GPU pool (whose workers rebuild it from mutex guards per job).
+struct FileRun<'a> {
+    writer: &'a mut Writer,
+    journal: &'a mut Option<resume::Journal>,
+    hook: Option<&'a AbortHook>,
+    counters: &'a mut RunCounters,
+    source_hashes: &'a mut BTreeMap<String, String>,
+    dir: &'a Path,
+}
+
+/// Pool-owned per-file state: the same fields as FileRun behind mutexes so
+/// every device worker can encode and journal its tensors concurrently.
+struct PoolRun {
+    writer: Mutex<Writer>,
+    journal: Mutex<Option<resume::Journal>>,
+    counters: Mutex<RunCounters>,
+    source_hashes: Mutex<BTreeMap<String, String>>,
+    failure: Mutex<Option<anyhow::Error>>,
+}
+
+/// Resume bookkeeping for one planned tensor: its completed record and the
+/// number of leading journal units already on disk.
+fn completed_units_for(
+    staging: &Staging,
+    file_index: usize,
+    index: usize,
+) -> (Option<resume::CompletedTensor>, usize) {
+    match staging {
+        Staging::Resume(run) => (
+            run.state
+                .completed_tensors
+                .get(&(file_index, index))
+                .cloned(),
+            run.state
+                .partial
+                .as_ref()
+                .filter(|partial| partial.file == file_index && partial.tensor == index)
+                .map_or(0, |partial| partial.units),
+        ),
+        Staging::Fresh(_) => (None, 0),
+    }
+}
+
+/// Encode one tensor into its staging-file slot and journal the completed
+/// unit. Positional writes make tensor completion order irrelevant, so pool
+/// workers may finish tensors in any order.
+fn process_tensor(
+    snapshot: &dyn TensorSource,
+    file: &ContainerPlan,
+    file_index: usize,
+    tensor: &TensorPlan,
+    index: usize,
+    completed_units: usize,
+    run: &mut FileRun<'_>,
+    vectors: &BTreeMap<String, Vec<f32>>,
+    options: &Options,
+    stage: &Stage,
+) -> Result<()> {
+    let base = run.writer.layout.entries[index].offset;
+    let source_map = {
+        let mut journal = ChunkJournal::from_parts(
+            run.journal.as_mut(),
+            run.hook,
+            run.counters,
+            file_index,
+            index,
+            base,
+            completed_units,
+        );
+        match &tensor.origin {
+            Origin::Signs { .. } | Origin::HtScales { .. } => {
+                let values = vectors
+                    .get(&tensor.name)
+                    .context("missing prepared rotation")?;
+                tensor_progress::item(
+                    stage,
+                    tensor,
+                    "write rotation",
+                    "CPU",
+                    0,
+                    values.len() as u64,
+                    "values",
+                    None,
+                );
+                let started = stage.start_work();
+                let mut bytes = Vec::with_capacity(values.len() * 2);
+                for &value in values {
+                    bytes.extend_from_slice(&half::f16::from_f32(value).to_bits().to_le_bytes());
+                }
+                run.writer.write_at(index, 0, &bytes)?;
+                tensor_progress::item(
+                    stage,
+                    tensor,
+                    "write rotation",
+                    "CPU",
+                    values.len() as u64,
+                    values.len() as u64,
+                    "values",
+                    None,
+                );
+                stage.advance_work(WorkClass::WriteRotation, values.len() as u64, started);
+                BTreeMap::new()
+            }
+            Origin::Tensor { name } => {
+                let info = &snapshot.tensors()[name];
+                let hash = encode_tensor(
+                    snapshot,
+                    info,
+                    tensor,
+                    index,
+                    run.writer,
+                    vectors,
+                    options,
+                    stage,
+                    &mut journal,
+                )?;
+                let mut map = BTreeMap::new();
+                map.insert(name.clone(), hash);
+                map
+            }
+            Origin::Ngram { shards } => {
+                encode_table(
+                    snapshot,
+                    tensor,
+                    shards,
+                    index,
+                    run.writer,
+                    run.source_hashes,
+                    options,
+                    stage,
+                    &mut journal,
+                )?;
+                shards
+                    .iter()
+                    .map(|name| {
+                        Ok((
+                            name.clone(),
+                            run.source_hashes
+                                .get(name)
+                                .context("missing n-gram shard hash")?
+                                .clone(),
+                        ))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()?
+            }
+        }
+    };
+    if run.journal.is_some() {
+        // Flush and checksum the completed payload before its record:
+        // a journaled tensor must survive a crash byte-for-byte.
+        run.writer.sync_payload()?;
+        let entry = &run.writer.layout.entries[index];
+        let mut handle = File::open(run.dir.join(&file.filename))?;
+        let fingerprint = container::fingerprint(&mut handle, entry.offset, entry.size)?;
+        run.journal
+            .as_mut()
+            .expect("resume journal")
+            .append(&resume::Record::Tensor {
+                file: file_index,
+                tensor: index,
+                name: tensor.name.clone(),
+                payload_offset: entry.offset,
+                payload_size: entry.size,
+                payload_sha256: fingerprint.sha256,
+                source_sha256: source_map.clone(),
+            })?;
+        run.counters.tensors += 1;
+        if let Some(hook) = run.hook {
+            hook("tensor", run.counters.tensors)?;
+        }
+    }
+    run.source_hashes.extend(source_map);
+    Ok(())
+}
+
 /// A structural library entry point. The public CLI always uses architecture::plan.
 pub fn convert(
     snapshot: &dyn TensorSource,
@@ -608,7 +799,7 @@ pub fn convert(
     options: &Options,
     progress: &Progress,
 ) -> Result<Manifest> {
-    convert_impl(snapshot, plan, output, options, progress, &ResumeOptions::default())
+    convert_impl(snapshot, plan, output, options, progress, &ResumeOptions::default(), &[])
 }
 
 /// `convert` with opt-in resumable staging: a deterministic fingerprint-named
@@ -622,7 +813,31 @@ pub fn convert_with_resume(
     progress: &Progress,
     resume_options: &ResumeOptions,
 ) -> Result<Manifest> {
-    convert_impl(snapshot, plan, output, options, progress, resume_options)
+    convert_with_devices(snapshot, plan, output, options, progress, resume_options, &[])
+}
+
+/// `convert_with_resume` with an explicit GPU device pool: tensor encoding
+/// runs concurrently across `--devices` (one worker per device, tensors
+/// assigned round-robin). Omitting devices keeps the single `--ht-backend`
+/// pipeline byte-for-byte.
+pub fn convert_with_devices(
+    snapshot: &dyn TensorSource,
+    plan: &ConversionPlan,
+    output: &Path,
+    options: &Options,
+    progress: &Progress,
+    resume_options: &ResumeOptions,
+    devices: &[GpuDevice],
+) -> Result<Manifest> {
+    convert_impl(
+        snapshot,
+        plan,
+        output,
+        options,
+        progress,
+        resume_options,
+        devices,
+    )
 }
 
 fn convert_impl(
@@ -632,6 +847,7 @@ fn convert_impl(
     options: &Options,
     progress: &Progress,
     resume_options: &ResumeOptions,
+    devices: &[GpuDevice],
 ) -> Result<Manifest> {
     ensure!(
         cfg!(any(target_os = "linux", target_os = "macos")),
@@ -658,7 +874,7 @@ fn convert_impl(
             journal_path,
             lock_path,
             lock: Some(lock),
-            journal,
+            journal: Some(journal),
             state,
             hook: resume_options.abort_hook.clone(),
         }))
@@ -678,6 +894,7 @@ fn convert_impl(
         &expected_sources,
         &destination,
         &mut staging,
+        devices,
     );
     match result {
         Ok(manifest) => Ok(manifest),
@@ -705,6 +922,7 @@ fn run_staged(
     expected_sources: &BTreeSet<String>,
     destination: &Path,
     staging: &mut Staging,
+    devices: &[GpuDevice],
 ) -> Result<Manifest> {
     let vectors = prepare_rotations(snapshot, plan, options, progress)?;
     let stage = if progress.is_enabled() {
@@ -782,148 +1000,131 @@ fn run_staged(
                 Writer::open_continue(&path, file)?
             }
         };
-        for (index, tensor) in file.tensors.iter().enumerate() {
-            let (skip, completed_units) = match &*staging {
-                Staging::Resume(run) => (
-                    run.state
-                        .completed_tensors
-                        .get(&(file_index, index))
-                        .cloned(),
-                    run.state
-                        .partial
-                        .as_ref()
-                        .filter(|partial| {
-                            partial.file == file_index && partial.tensor == index
-                        })
-                        .map_or(0, |partial| partial.units),
-                ),
-                Staging::Fresh(_) => (None, 0),
-            };
+        // The journal, hook and staging directory are shared by the tensor
+        // loop; the pool path moves them behind mutexes, the sequential path
+        // borrows them directly.
+        let mut journal_slot: Option<resume::Journal> = match &mut *staging {
+            Staging::Resume(run) => run.journal.take(),
+            Staging::Fresh(_) => None,
+        };
+        let hook: Option<AbortHook> = match &*staging {
+            Staging::Resume(run) => run.hook.clone(),
+            Staging::Fresh(_) => None,
+        };
+        let dir = staging.path().to_path_buf();
+        if devices.is_empty() {
+            for (index, tensor) in file.tensors.iter().enumerate() {
+            let (skip, completed_units) = completed_units_for(staging, file_index, index);
             if let Some(done) = skip {
                 advance_skipped(&stage, snapshot, tensor, options)?;
                 source_hashes.extend(done.source_sha256);
                 continue;
             }
-            let base = writer.layout.entries[index].offset;
-            let source_map = {
-                let mut journal = ChunkJournal::new(
-                    staging,
-                    &mut counters,
-                    file_index,
-                    index,
-                    base,
-                    completed_units,
-                );
-                match &tensor.origin {
-                    Origin::Signs { .. } | Origin::HtScales { .. } => {
-                        let values = vectors
-                            .get(&tensor.name)
-                            .context("missing prepared rotation")?;
-                        tensor_progress::item(
-                            &stage,
-                            tensor,
-                            "write rotation",
-                            "CPU",
-                            0,
-                            values.len() as u64,
-                            "values",
-                            None,
-                        );
-                        let started = stage.start_work();
-                        let mut bytes = Vec::with_capacity(values.len() * 2);
-                        for &value in values {
-                            bytes.extend_from_slice(
-                                &half::f16::from_f32(value).to_bits().to_le_bytes(),
-                            );
-                        }
-                        writer.write_at(index, 0, &bytes)?;
-                        tensor_progress::item(
-                            &stage,
-                            tensor,
-                            "write rotation",
-                            "CPU",
-                            values.len() as u64,
-                            values.len() as u64,
-                            "values",
-                            None,
-                        );
-                        stage.advance_work(WorkClass::WriteRotation, values.len() as u64, started);
-                        BTreeMap::new()
-                    }
-                    Origin::Tensor { name } => {
-                        let info = &snapshot.tensors()[name];
-                        let hash = encode_tensor(
-                            snapshot,
-                            info,
-                            tensor,
-                            index,
-                            &mut writer,
-                            &vectors,
-                            options,
-                            &stage,
-                            &mut journal,
-                        )?;
-                        let mut map = BTreeMap::new();
-                        map.insert(name.clone(), hash);
-                        map
-                    }
-                    Origin::Ngram { shards } => {
-                        encode_table(
-                            snapshot,
-                            tensor,
-                            shards,
-                            index,
-                            &mut writer,
-                            &mut source_hashes,
-                            options,
-                            &stage,
-                            &mut journal,
-                        )?;
-                        shards
-                            .iter()
-                            .map(|name| {
-                                Ok((
-                                    name.clone(),
-                                    source_hashes
-                                        .get(name)
-                                        .context("missing n-gram shard hash")?
-                                        .clone(),
-                                ))
-                            })
-                            .collect::<Result<BTreeMap<_, _>>>()?
-                    }
-                }
+            let mut run = FileRun {
+                writer: &mut writer,
+                journal: &mut journal_slot,
+                hook: hook.as_ref(),
+                counters: &mut counters,
+                source_hashes: &mut source_hashes,
+                dir: &dir,
             };
-            if let Staging::Resume(run) = &mut *staging {
-                // Flush and checksum the completed payload before its record:
-                // a journaled tensor must survive a crash byte-for-byte.
-                writer.sync_payload()?;
-                let entry = &writer.layout.entries[index];
-                let mut handle = File::open(run.dir.join(&file.filename))?;
-                let fingerprint =
-                    container::fingerprint(&mut handle, entry.offset, entry.size)?;
-                run.journal.append(&resume::Record::Tensor {
-                    file: file_index,
-                    tensor: index,
-                    name: tensor.name.clone(),
-                    payload_offset: entry.offset,
-                    payload_size: entry.size,
-                    payload_sha256: fingerprint.sha256,
-                    source_sha256: source_map.clone(),
-                })?;
-                counters.tensors += 1;
-                if let Some(hook) = &run.hook {
-                    hook("tensor", counters.tensors)?;
-                }
+            process_tensor(
+                snapshot,
+                file,
+                file_index,
+                tensor,
+                index,
+                completed_units,
+                &mut run,
+                &vectors,
+                options,
+                &stage,
+            )?;
             }
-            source_hashes.extend(source_map);
+        } else {
+            let shared = Arc::new(PoolRun {
+                writer: Mutex::new(writer),
+                journal: Mutex::new(journal_slot.take()),
+                counters: Mutex::new(RunCounters::default()),
+                source_hashes: Mutex::new(BTreeMap::new()),
+                failure: Mutex::new(None),
+            });
+            let depth = 4 * devices.len();
+            let vectors_ref = &vectors;
+            let stage_ref = &stage;
+            std::thread::scope(|scope| -> Result<()> {
+                let pool = pool::DevicePool::new(scope, devices, depth);
+                for (index, tensor) in file.tensors.iter().enumerate() {
+                    let (skip, completed_units) = completed_units_for(staging, file_index, index);
+                    if let Some(done) = skip {
+                        advance_skipped(&stage, snapshot, tensor, options)?;
+                        shared.source_hashes.lock().unwrap().extend(done.source_sha256);
+                        continue;
+                    }
+                    let backend = devices[index % devices.len()].backend;
+                    let device_options = Options {
+                        ht_backend: backend,
+                        ..*options
+                    };
+                    let shared = shared.clone();
+                    let hook = hook.clone();
+                    let dir = dir.clone();
+                    pool.submit(move || {
+                        let mut writer_guard = shared.writer.lock().unwrap();
+                        let mut journal_guard = shared.journal.lock().unwrap();
+                        let mut counters_guard = shared.counters.lock().unwrap();
+                        let mut hashes_guard = shared.source_hashes.lock().unwrap();
+                        let mut run = FileRun {
+                            writer: &mut *writer_guard,
+                            journal: &mut *journal_guard,
+                            hook: hook.as_ref(),
+                            counters: &mut *counters_guard,
+                            source_hashes: &mut *hashes_guard,
+                            dir: &dir,
+                        };
+                        if let Err(error) = process_tensor(
+                            snapshot,
+                            file,
+                            file_index,
+                            tensor,
+                            index,
+                            completed_units,
+                            &mut run,
+                            vectors_ref,
+                            &device_options,
+                            stage_ref,
+                        ) {
+                            let mut failure = shared.failure.lock().unwrap();
+                            if failure.is_none() {
+                                *failure = Some(error);
+                            }
+                        }
+                    })?;
+                }
+                pool.join()
+            })?;
+            let shared =
+                Arc::try_unwrap(shared).map_err(|_| anyhow::anyhow!("device pool state busy"))?;
+            if let Some(error) = shared.failure.into_inner().expect("pool failure slot") {
+                return Err(error);
+            }
+            counters.tensors += shared.counters.into_inner().expect("pool counters").tensors;
+            source_hashes.extend(shared.source_hashes.into_inner().expect("pool hashes"));
+            journal_slot = shared.journal.into_inner().expect("pool journal");
+            writer = shared.writer.into_inner().expect("pool writer");
+        }
+        if let Staging::Resume(run) = &mut *staging {
+            run.journal = journal_slot.take();
         }
         if stage.is_enabled() {
             stage.set_uncounted_item(&format!("hash {}", file.filename));
         }
         let (layout, fingerprints) = writer.finish()?;
         if let Staging::Resume(run) = &mut *staging {
-            run.journal.append(&resume::Record::File {
+            run.journal
+                .as_mut()
+                .expect("resume journal")
+                .append(&resume::Record::File {
                 file: file_index,
                 filename: file.filename.clone(),
                 entries: layout
@@ -1116,6 +1317,8 @@ fn copy_assets_resumable(
     let records = copy_assets(snapshot, plan, staging.path())?;
     if let Staging::Resume(run) = staging {
         run.journal
+            .as_mut()
+            .expect("resume journal")
             .append(&resume::Record::Assets { records: records.clone() })?;
     }
     Ok(records)

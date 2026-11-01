@@ -8,7 +8,7 @@
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::cell::RefCell;
+use std::sync::Mutex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -690,7 +690,7 @@ pub struct GgufSource {
     tensors: BTreeMap<String, TensorInfo>,
     layouts: BTreeMap<String, Layout>,
     sidecars: Vec<HgnSidecar>,
-    raw_hashes: RefCell<BTreeMap<usize, String>>,
+    raw_hashes: Mutex<BTreeMap<usize, String>>,
 }
 
 /// Low-level, immutable GGUF tensor reader, without assets or auxiliary weights.
@@ -712,7 +712,7 @@ impl GgufSidecar {
             tensors,
             layouts,
             sidecars: Vec::new(),
-            raw_hashes: RefCell::new(BTreeMap::new()),
+            raw_hashes: Mutex::new(BTreeMap::new()),
         });
         source.check_unchanged()?;
         Ok(source)
@@ -881,14 +881,14 @@ impl GgufSource {
     }
 
     fn hash_physical(&self, index: usize) -> Result<()> {
-        if self.raw_hashes.borrow().contains_key(&index) {
+        if self.raw_hashes.lock().unwrap().contains_key(&index) {
             return Ok(());
         }
         let tensor = &self.physical[index];
         let hash = self.shards[tensor.shard]
             .input
             .hash_range(tensor.offset, tensor.bytes)?;
-        self.raw_hashes.borrow_mut().insert(index, hash);
+        self.raw_hashes.lock().unwrap().insert(index, hash);
         Ok(())
     }
 }
@@ -1077,7 +1077,7 @@ impl TensorSource for GgufSource {
         for index in 0..self.physical.len() {
             self.hash_physical(index)?;
         }
-        let hashes = self.raw_hashes.borrow();
+        let hashes = self.raw_hashes.lock().unwrap();
         let shards: Vec<Value> = self
             .shards
             .iter()
