@@ -181,17 +181,51 @@ fn iq3_s_golden_grid_extremes_signs_and_unrounded_scales() {
 
 #[test]
 fn decoder_rejects_unknown_partial_and_nonfinite_blocks() {
-    for unsupported in [
-        3, 9, 10, 11, 15, 16, 17, 18, 19, 22, 24, 25, 26, 27, 28, 29, 34, 35, 39,
-    ] {
+    for unsupported in [9, 15, 24, 25, 26, 27, 28, 34, 35, 39, 40, 41, 43] {
         assert!(
             GgmlType::from_code(unsupported).is_err(),
             "type {unsupported}"
         );
+    }
+    for supported in [3, 10, 11, 16, 17, 18, 19, 22, 29, 42] {
+        assert!(GgmlType::from_code(supported).is_ok(), "type {supported}");
     }
     assert!(decode(GgmlType::Q6K, &[0; 209], &mut [0.0; 256]).is_err());
     assert!(decode(GgmlType::F32, &f32::NAN.to_le_bytes(), &mut [0.0]).is_err());
     let mut bytes = block(GgmlType::Iq3S);
     bytes[..2].copy_from_slice(&[0, 0x7c]);
     assert!(decode(GgmlType::Iq3S, &bytes, &mut [0.0; 256]).is_err());
+}
+
+include!("gguf_decode_goldens.rs");
+
+fn assert_golden(ty: GgmlType, raw: &[u8], bits: &[u32]) {
+    let decoded = values(ty, raw);
+    assert_eq!(decoded.len(), bits.len());
+    for (i, (got, expect_bits)) in decoded.iter().zip(bits).enumerate() {
+        assert_eq!(
+            got.to_bits(),
+            *expect_bits,
+            "element {i}: got {got} expect {}",
+            f32::from_bits(*expect_bits)
+        );
+    }
+}
+
+#[test]
+fn ud_p0_goldens_match_gguf_py() {
+    assert_golden(GgmlType::Q2_0, Q2_0_RAW, Q2_0_BITS);
+    assert_golden(GgmlType::Iq3Xxs, IQ3_XXS_RAW, IQ3_XXS_BITS);
+    assert_golden(GgmlType::Iq2S, IQ2_S_RAW, IQ2_S_BITS);
+}
+
+#[test]
+fn ud_p1_goldens_match_gguf_py() {
+    assert_golden(GgmlType::Q4_1, Q4_1_RAW, Q4_1_BITS);
+    assert_golden(GgmlType::Q2K, Q2_K_RAW, Q2_K_BITS);
+    assert_golden(GgmlType::Q3K, Q3_K_RAW, Q3_K_BITS);
+    assert_golden(GgmlType::Iq2Xxs, IQ2_XXS_RAW, IQ2_XXS_BITS);
+    assert_golden(GgmlType::Iq2Xs, IQ2_XS_RAW, IQ2_XS_BITS);
+    assert_golden(GgmlType::Iq1S, IQ1_S_RAW, IQ1_S_BITS);
+    assert_golden(GgmlType::Iq1M, IQ1_M_RAW, IQ1_M_BITS);
 }
