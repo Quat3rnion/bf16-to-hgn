@@ -339,7 +339,7 @@ fn physical_bounds_unknown_types_names_and_metadata_are_rejected() {
     truncated.pop();
     variants.push(truncated);
     let mut unsupported = base.bytes.clone();
-    unsupported[base.type_fields[0]..base.type_fields[0] + 4].copy_from_slice(&3u32.to_le_bytes());
+    unsupported[base.type_fields[0]..base.type_fields[0] + 4].copy_from_slice(&9u32.to_le_bytes());
     variants.push(unsupported);
     let mut overlapping = base.bytes.clone();
     overlapping[base.offset_fields[1]..base.offset_fields[1] + 8]
