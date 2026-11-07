@@ -34,8 +34,16 @@ and unsupported encodings fail before output publication.
   not supported.
 
 Supported **GGUF tensor types, exhaustively**:
-`F32`, `F16`, `BF16`, `Q4_0`, `Q5_0`, `Q5_1`, `Q8_0`, `Q4_K`, `Q5_K`,
-`Q6_K`, `IQ4_NL`, `IQ3_S`, `IQ4_XS`. All other types fail.
+`F32`, `F16`, `BF16`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2_0`,
+`Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `IQ2_XXS`, `IQ2_XS`, `IQ3_XXS`,
+`IQ1_S`, `IQ4_NL`, `IQ3_S`, `IQ2_S`, `IQ4_XS`, `IQ1_M`. All other types fail.
+
+Beyond the original allowlist, this tree also decodes the remaining common
+llama.cpp / Unsloth **UD** building blocks (`Q2_0`, `Q2_K`, `Q3_K`, `Q4_1`,
+`IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`) so mixed packs such
+as Unsloth `UD-IQ4_XS` for Qwen3.8 Flash-Next import without rewriting tensor
+types. Decode is still the hand-rolled Rust path in `src/gguf_decode.rs` (plus
+`src/gguf_iq_tables.rs`); it is not linked against llama.cpp.
 
 Supported **native HGN store/variant pairs, exhaustively**:
 BF16 `0/0`, F32 `1/0`, F16 `2/0`, I64 `4/0`, Q4C-P `5/2`,
