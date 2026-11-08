@@ -4,6 +4,7 @@ use bf16_to_hgn::{
     codec::{HtBackend, I4rBackend, Q4cpBackend},
     container, conversion,
     manifest::{Options, OutputProfile},
+    pool,
     progress::Progress,
     source::{self, SourceKind, SourceOptions, TensorSource},
     verify,
@@ -62,6 +63,19 @@ enum Command {
         /// Validate and print the plan; do not create output files or read tensor payloads.
         #[arg(long)]
         dry_run: bool,
+        /// Continue an interrupted conversion from its fingerprinted staging journal.
+        /// The staging directory, journal and lock are deterministic per source,
+        /// destination and encoding options; an interrupted run keeps them, and a
+        /// rerun with --resume verifies the journal header and completed payloads
+        /// before continuing. Without --resume, behavior is unchanged.
+        #[arg(long)]
+        resume: bool,
+        /// GPU device list for concurrent tensor encoding, e.g. hip:0,cuda:0.
+        /// Each entry is backend:index (cpu, hip, or cuda); the prototype
+        /// uses index 0 per backend. Omit to encode on the single
+        /// --ht-backend device exactly as before.
+        #[arg(long)]
+        devices: Option<String>,
         #[command(flatten)]
         encoding: EncodingOptions,
     },
@@ -190,9 +204,15 @@ fn run() -> Result<()> {
             input,
             output,
             dry_run,
+            resume,
+            devices,
             encoding,
         } => {
             let options = encoding.options()?;
+            let devices = match devices.as_deref() {
+                Some(spec) => pool::parse_devices(spec)?,
+                None => Vec::new(),
+            };
             if !dry_run {
                 options.validate_for_execution()?;
             }
@@ -202,12 +222,17 @@ fn run() -> Result<()> {
             if dry_run {
                 print_json(&plan_report(snapshot.as_ref(), &plan, &options)?)?;
             } else {
-                let manifest = conversion::convert(
+                let manifest = conversion::convert_with_devices(
                     snapshot.as_ref(),
                     &plan,
                     &output,
                     &options,
                     &Progress::stderr(),
+                    &conversion::ResumeOptions {
+                        enabled: resume,
+                        abort_hook: test_abort_hook(),
+                    },
+                    &devices,
                 )?;
                 print_json(
                     &json!({ "published": true, "source_tensors": manifest.sources.len(), "output_tensors": manifest.containers.iter().map(|c| c.tensors.len()).sum::<usize>(), "manifest": "conversion-manifest.json", "source_format": manifest.source_kind, "profile": manifest.options.profile, "ht_backend": manifest.options.ht_backend, "i4r_backend": manifest.options.i4r_backend, "q4cp_backend": manifest.options.q4cp_backend, "policy": manifest.policy }),
@@ -286,4 +311,21 @@ fn print_json(value: &impl serde::Serialize) -> Result<()> {
     use std::io::Write;
     output.write_all(b"\n")?;
     Ok(())
+}
+
+/// Hidden integration-test hook: abort a conversion mid-stream after N
+/// journaled tensors so an interrupted --resume run can be simulated
+/// deterministically. Never set outside tests.
+fn test_abort_hook() -> Option<conversion::AbortHook> {
+    let limit = std::env::var("HGN_TEST_ABORT_AFTER_TENSORS")
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(std::sync::Arc::new(move |kind: &str, count: u64| {
+        if kind == "tensor" && count >= limit {
+            anyhow::bail!("test abort: reached HGN_TEST_ABORT_AFTER_TENSORS={limit}");
+        }
+        Ok(())
+    }))
 }

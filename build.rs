@@ -112,13 +112,16 @@ fn main() {
         let compiler = env::var_os("HIPCC")
             .map(PathBuf::from)
             .unwrap_or_else(|| rocm.join("bin/hipcc"));
+        let hip_arch = env::var("HGN_HIP_ARCH").unwrap_or_else(|_| "gfx1151".to_owned());
+        println!("cargo:rerun-if-env-changed=HGN_HIP_ARCH");
         cc::Build::new()
             .cpp(true)
             .compiler(compiler)
             .file("native/ht_trellis_hip.hip")
             .flag("-std=c++17")
             .flag("-O3")
-            .flag("--offload-arch=gfx1151")
+            .define("HGN_HIP_TARGET", format!("\"{hip_arch}\"").as_str())
+            .flag(&format!("--offload-arch={hip_arch}"))
             .flag("-ffp-contract=off")
             .flag("-fno-fast-math")
             .flag("-fno-gpu-flush-denormals-to-zero")

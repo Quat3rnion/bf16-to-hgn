@@ -1422,9 +1422,9 @@ struct Context {
         hipError_t error = hipGetDeviceProperties(&properties, 0);
         if (error != hipSuccess) return hip_failure(error, "query HIP device 0");
         const char *arch = properties.gcnArchName;
-        if (std::strncmp(arch, "gfx1151", 7) != 0 || (arch[7] != '\0' && arch[7] != ':')) {
+        if (std::strncmp(arch, HGN_HIP_TARGET, sizeof(HGN_HIP_TARGET) - 1) != 0 || (arch[sizeof(HGN_HIP_TARGET) - 1] != '\0' && arch[sizeof(HGN_HIP_TARGET) - 1] != ':')) {
             std::snprintf(last_error, sizeof(last_error),
-                          "HIP encoding/verification supports only gfx1151; visible device 0 is %s (%s)",
+                          "HIP encoding/verification supports only " HGN_HIP_TARGET "; visible device 0 is %s (%s)",
                           properties.name, arch);
             return -2;
         }

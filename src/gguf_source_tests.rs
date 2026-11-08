@@ -681,7 +681,7 @@ fn q6_output_projection_reads_bounded_rows_and_reorders_split_blocks() {
     assert_eq!(source.read_f32(name, 0, 6144).unwrap(), expected);
     assert_eq!(source.read_f32(name, 123, 140).unwrap(), expected[123..263]);
     assert!(
-        source.0.raw_hashes.borrow().is_empty(),
+        source.0.raw_hashes.lock().unwrap().is_empty(),
         "ordinary reads must not scan/hash the entire physical tensor"
     );
 }

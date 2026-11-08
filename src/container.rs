@@ -168,6 +168,36 @@ impl Writer {
         })
     }
 
+    /// Open a staging file for continued (resume) writes at preplanned offsets.
+    /// Unlike [`Writer::create`], an existing file of exactly the planned size
+    /// is kept: already-journaled payload spans must survive. A zero-length
+    /// file is grown to the planned size; any other existing size is rejected
+    /// (callers remove stale files before opening). Headers/tables are still
+    /// written only by [`Writer::finish`].
+    pub fn open_continue(path: &Path, plan: &ContainerPlan) -> Result<Self> {
+        let layout = layout(plan)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .with_context(|| format!("continue {}", path.display()))?;
+        let size = file.metadata()?.len();
+        ensure!(
+            size == 0 || size == layout.file_size,
+            "staging file {} has unexpected size {size} (planned {})",
+            path.display(),
+            layout.file_size
+        );
+        file.set_len(layout.file_size)?;
+        Ok(Self {
+            file,
+            layout,
+            dirty_bytes: 0,
+        })
+    }
+
     pub fn write_at(&mut self, index: usize, relative_offset: u64, bytes: &[u8]) -> Result<()> {
         let entry = self
             .layout
@@ -191,6 +221,14 @@ impl Writer {
             advise_drop(&self.file, 0, self.layout.file_size);
             self.dirty_bytes = 0;
         }
+        Ok(())
+    }
+
+    /// Flush written payload bytes to disk (no metadata sync). Resume
+    /// journaling calls this before every record so a journaled unit always
+    /// survives a crash.
+    pub fn sync_payload(&self) -> Result<()> {
+        self.file.sync_data()?;
         Ok(())
     }
 
